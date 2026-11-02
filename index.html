@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="description" content="Coordinate Ergo multi-signature commitments and signatures with Minotaur.">
+  <title>Sigma Sync</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script src="vendor/qrcode-generator-2.0.4.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#" data-nav="list">
+      <img src="favicon.svg" alt="" width="28" height="28">
+      <span>Sigma Sync</span>
+    </a>
+    <div class="topbar-user" id="user-chip" hidden>
+      <span class="user-name" id="user-name"></span>
+      <code class="user-address" id="user-address"></code>
+      <button type="button" class="btn btn-ghost btn-sm" data-action="logout">Sign out</button>
+    </div>
+  </header>
+
+  <main id="app" class="container" aria-live="polite">
+    <div class="loading" id="boot">Loading…</div>
+  </main>
+
+  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+  <dialog id="dialog" class="dialog">
+    <form method="dialog" class="dialog-body" id="dialog-form"></form>
+  </dialog>
+
+  <noscript><p class="container">Sigma Sync needs JavaScript.</p></noscript>
+</body>
+</html>

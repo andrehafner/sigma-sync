@@ -1,0 +1,121 @@
+# Sigma Sync
+
+Coordinate Ergo multi-signature transactions with your fellow signers.
+
+[Minotaur](https://github.com/minotaur-ergo/minotaur-wallet) multi-sig works in two rounds: every signer adds a
+**commitment**, then every signer adds a **signature**, each time continuing from the
+latest request. Passing those requests around a spreadsheet or a chat breaks easily: someone
+continues from an old copy and erases another signer's commitment, two people work at the same time,
+a paste picks up a stray line break, and nobody is sure whose turn it is.
+
+Sigma Sync is a small web app that keeps one source of truth for each transaction:
+
+- **Wallet sign-in, no passwords.** You prove who you are by signing a one-time request with your
+  Minotaur signing wallet (QR code for air-gapped wallets, or copy/paste).
+- **One signer at a time.** Lock a transaction, copy the latest request into Minotaur, paste your
+  output back. Submitting releases the lock. If someone walks away, two other signers can vote to
+  force-unlock it.
+- **Every paste is checked.** It must be the same Ergo transaction, keep every earlier
+  commitment and signature, and add yours. A stale or wrong paste is refused with an explanation.
+- **Clear progress.** Cards show commitments and signatures against the M-of-N threshold, who
+  holds the lock, and what is waiting on you. Each transaction has a description, comments,
+  and a full activity history.
+- **Review before you sign.** Outputs are decoded from the transaction itself (amounts,
+  destination addresses, fee, change), so you can compare them with the description.
+- **QR codes both ways.** Requests are shown as paged/animated QR codes in Minotaur's own
+  format, and the camera scanner reads Minotaur's paged QR codes back.
+- **Encrypted at rest.** Titles, descriptions, payloads and comments are stored with AES-256-GCM.
+
+| Sign in | Transactions | Your turn |
+|---|---|---|
+| ![Sign-in](docs/screenshots/signin.png) | ![Transaction list](docs/screenshots/list.png) | ![Transaction detail](docs/screenshots/detail.png) |
+
+## How it works
+
+### Sign-in
+
+1. Enter the address of your **signing wallet** (the regular wallet you sign multi-sig with,
+   not the multi-sig wallet).
+2. Sigma Sync builds a Minotaur *cold signing request* (`{"CSR": ...}`) that spends a box
+   owned by that address. The box is **made up**: it does not exist on the blockchain, and its
+   ID is derived from a random one-time challenge. The signed result can never be broadcast,
+   so no funds can move.
+3. Sign it in Minotaur (scan the QR code or paste), then paste or scan the signed result
+   (`{"CSTX": ...}`) back.
+4. The server checks the signed transaction is exactly the one it issued and verifies the
+   Schnorr signature against the address's public key (pure Perl: Blake2b-256, secp256k1 and
+   the Ergo Fiat-Shamir proof format; see [`ErgoKit.pm`](ErgoKit.pm)). If the address
+   belongs to an active signer, a session starts.
+
+Only addresses an admin has added (or that are listed in `ADMIN_ADDRESSES`) can sign in.
+
+### Rounds and statuses
+
+| Status | Meaning |
+|---|---|
+| Commitment round | Signers add commitments until M are in |
+| Signing round | Signers who committed add signatures until M are in |
+| Ready to broadcast | The final payload is complete; publish it from Minotaur |
+| Broadcast | Someone confirmed it was published (the page also checks the explorer) |
+| Cancelled | The creator or an admin stopped it, with a reason |
+
+M (signatures required) and N (keys in the wallet) are read from the first request, as is the
+final Ergo transaction ID, so the explorer link works from the start.
+
+### Checks on every paste
+
+| Problem | What happens |
+|---|---|
+| Line breaks, zero-width characters, smart quotes, BOM | Removed automatically; nothing else is changed |
+| Truncated or invalid JSON | Refused ("it may be cut off") |
+| A different Ergo transaction | Refused |
+| A commitment or signature from an earlier paste is missing or replaced | Refused ("you probably started from an older request") |
+| Nothing new added (the request pasted back) | Refused |
+| One page of a multi-page QR code | Refused, with a hint to scan every page |
+
+Each stored payload has a short SHA-256 fingerprint so signers can tell versions apart.
+
+### Locks
+
+Only the lock holder sees the latest request and can submit. Submitting or releasing frees
+the lock. If a lock is abandoned, `UNLOCK_VOTES` other signers (default 2) can vote to force it
+open, at different times, once it has been held for `UNLOCK_GRACE_MINUTES` (default 10).
+
+## Stack
+
+Perl CGI + MariaDB + vanilla HTML/CSS/JS, no build step. Two small libraries are vendored in
+[`vendor/`](vendor/README.md) (QR generation and a QR decoder fallback).
+
+| File | Purpose |
+|---|---|
+| `api.pl` | All API actions (`action=...`, POST only) |
+| `ErgoKit.pm` | Ergo addresses, sign-in request/verification, payload analysis |
+| `AppConfig.pm` | Config file, database connection, encryption at rest |
+| `app.js`, `index.html`, `style.css` | The single-page frontend |
+| `schema.sql` | Database schema |
+| `deploy/sigmasync.conf` | Apache include (CSP and security headers, access rules) |
+| `redeploy.sh` | Re-applies ownership, permissions and SELinux labels after a pull |
+| `DEPLOY.md` | Server setup, verification gates, troubleshooting |
+| `App_Summary.md` | Security and data summary for auditors |
+
+## Development
+
+Requirements: Perl with `CGI`, `DBI`, `DBD::mysql`, `CryptX` (and ideally `Math::BigInt::GMP`),
+plus MariaDB.
+
+```bash
+mysql -u root < schema.sql            # then create a user as shown at the end of schema.sql
+cp sigmasync.env.example dev.env      # fill in DB_*, DATA_KEY, ADMIN_ADDRESSES;
+                                      # set COOKIE_SECURE=0 and COOKIE_PATH=/ for local HTTP
+APP_ENV_FILE=$PWD/dev.env python3 tools/dev-server.py 8080
+prove -I. t/                          # unit tests
+```
+
+The sign-in fixture in `t/fixtures/login.json` was signed with a throwaway key by sigma-rust
+(`ergo-lib`), so the tests check the Perl verifier against the reference implementation.
+
+## Deployment
+
+See [DEPLOY.md](DEPLOY.md). In short: create the database and user, write
+`/data/AAP_Storage/secrets/sigmasync.env`, install `deploy/sigmasync.conf`, add the one-time
+SELinux rules, then run `sudo ./redeploy.sh` after every pull.
