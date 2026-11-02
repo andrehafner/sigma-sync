@@ -1,0 +1,1443 @@
+/* Sigma Sync - frontend. Vanilla JS, no build step. */
+'use strict';
+
+(() => {
+  // ------------------------------------------------------------------------
+  // State
+  // ------------------------------------------------------------------------
+  const S = {
+    me: null,
+    csrf: '',
+    config: {},
+    txs: [],
+    wallets: [],
+    versions: null,
+    filter: 'active',
+    search: '',
+    detail: null,
+    signin: null,
+    pollTimer: null,
+    qrTimers: new Set(),
+  };
+
+  const MINOTAUR_RELEASES = 'https://github.com/minotaur-ergo/minotaur-wallet/releases';
+  const MINOTAUR_API = 'https://api.github.com/repos/minotaur-ergo/minotaur-wallet/releases?per_page=100';
+  // Used when GitHub cannot be reached. Newest first.
+  const FALLBACK_VERSIONS = ['v4.2.1', 'v4.2.0', 'v4.1.0', 'v4.0.0', 'v3.4.0', 'v3.3.0', 'v3.2.0',
+    'v3.1.0', 'v3.0.1', 'v3.0.0', 'v2.5.0', 'v2.4.0', 'v2.3.0', 'v2.2.0', 'v2.1.0', 'v2.0.2'];
+  const QR_DENSITY = [1600, 900, 450]; // characters per QR page: dense, medium, light
+  const ADDRESS_KEY = 'sigmasync.address';
+
+  // ------------------------------------------------------------------------
+  // Utilities
+  // ------------------------------------------------------------------------
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  const app = () => $('#app');
+
+  function esc(value) {
+    return String(value ?? '').replace(/[&<>"']/g, (c) => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function store(key, value) {
+    try {
+      if (value === undefined) return localStorage.getItem(key);
+      localStorage.setItem(key, value);
+    } catch (e) { /* storage unavailable: convenience only */ }
+    return null;
+  }
+
+  // Server timestamps are UTC "YYYY-MM-DD HH:MM:SS[.ffffff]".
+  function parseTs(ts) { return ts ? new Date(ts.slice(0, 19).replace(' ', 'T') + 'Z') : null; }
+
+  function ago(ts) {
+    const d = parseTs(ts);
+    if (!d) return '';
+    const s = Math.max(0, (Date.now() - d.getTime()) / 1000);
+    if (s < 60) return 'just now';
+    const units = [[86400 * 365, 'y'], [86400 * 30, 'mo'], [86400, 'd'], [3600, 'h'], [60, 'm']];
+    for (const [sec, label] of units) if (s >= sec) return `${Math.floor(s / sec)}${label} ago`;
+    return '';
+  }
+
+  function fullDate(ts) {
+    const d = parseTs(ts);
+    return d ? d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '';
+  }
+
+  function timeTag(ts) {
+    return `<time datetime="${esc(parseTs(ts)?.toISOString() || '')}" title="${esc(fullDate(ts))}">${esc(ago(ts))}</time>`;
+  }
+
+  function minutesText(m) {
+    if (m < 60) return `${m} min`;
+    const h = Math.floor(m / 60);
+    return h < 48 ? `${h} h ${m % 60} min` : `${Math.floor(h / 24)} days`;
+  }
+
+  // nanoERG string -> "1,234.5678 ERG" without floating point.
+  function erg(nano) {
+    if (nano === undefined || nano === null || nano === '') return '';
+    const s = String(nano).padStart(10, '0');
+    const whole = s.slice(0, -9).replace(/^0+(?=\d)/, '');
+    const frac = s.slice(-9).replace(/0+$/, '');
+    return `${Number(whole).toLocaleString()}${frac ? '.' + frac : ''} ERG`;
+  }
+
+  const shortAddr = (a) => (a && a.length > 16 ? `${a.slice(0, 7)}…${a.slice(-5)}` : a || '');
+  const shortId = (id) => (id ? `${id.slice(0, 8)}…${id.slice(-6)}` : '');
+
+  async function copyText(text, label = 'Copied') {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(`${label} to clipboard`, 'success');
+    } catch (e) {
+      toast('Copy failed - select the text and copy it manually', 'error');
+    }
+  }
+
+  function download(filename, text) {
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function toast(message, type = '') {
+    const el = document.createElement('div');
+    el.className = `toast${type ? ' toast-' + type : ''}`;
+    el.textContent = message;
+    $('#toasts').appendChild(el);
+    setTimeout(() => el.remove(), type === 'error' ? 7000 : 3500);
+  }
+
+  // Removes characters clipboards and chat apps add that never belong in a payload.
+  // Mirrors ErgoKit::sanitize_payload on the server, which has the final say.
+  function cleanPayload(text) {
+    return String(text || '')
+      .replace(/[​-‍⁠﻿­]/g, '')
+      .replace(/[“-‟″]/g, '"')
+      .replace(/[‘-‛′]/g, "'")
+      .replace(/ /g, ' ')
+      .replace(/[\r\n\t]+/g, '')
+      .trim();
+  }
+
+  // ------------------------------------------------------------------------
+  // API
+  // ------------------------------------------------------------------------
+  async function api(action, params = {}) {
+    const form = new FormData();
+    form.append('action', action);
+    if (S.csrf) form.append('csrf', S.csrf);
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null) form.append(k, v);
+    });
+    let data;
+    try {
+      const res = await fetch('api.pl', { method: 'POST', body: form, credentials: 'same-origin' });
+      data = await res.json();
+    } catch (e) {
+      throw new Error('Could not reach the server. Check your connection and try again.');
+    }
+    if (!data.success) {
+      if (data.signed_out && S.me) {
+        S.me = null;
+        S.csrf = '';
+        renderSignIn();
+      }
+      const err = new Error(data.error || 'Unknown error');
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
+
+  // ------------------------------------------------------------------------
+  // Dialogs
+  // ------------------------------------------------------------------------
+  function dialog({ title, body = '', confirm = 'OK', cancel = 'Cancel', danger = false, input = null }) {
+    const dlg = $('#dialog');
+    const form = $('#dialog-form');
+    form.innerHTML = `
+      <h2>${esc(title)}</h2>
+      <div class="muted">${body}</div>
+      ${input ? `<div class="field"><label for="dialog-input">${esc(input.label)}</label>
+        <input type="text" id="dialog-input" maxlength="${input.max || 255}" autocomplete="off"></div>` : ''}
+      <div class="dialog-actions">
+        ${cancel ? `<button class="btn" value="cancel">${esc(cancel)}</button>` : ''}
+        <button class="btn ${danger ? 'btn-danger' : 'btn-primary'}" value="ok">${esc(confirm)}</button>
+      </div>`;
+    return new Promise((resolve) => {
+      const done = () => {
+        dlg.removeEventListener('close', done);
+        if (dlg.returnValue !== 'ok') return resolve(null);
+        resolve(input ? ($('#dialog-input').value || '').trim() : true);
+      };
+      dlg.addEventListener('close', done);
+      dlg.returnValue = '';
+      dlg.showModal();
+      (input ? $('#dialog-input') : form.querySelector('[value=ok]')).focus();
+    });
+  }
+
+  // ------------------------------------------------------------------------
+  // QR codes - compatible with Minotaur's paged format:
+  //   {"<TYPE>": "<chunk>", "p": page, "n": pages, "a": animated}
+  // ------------------------------------------------------------------------
+  function qrSvg(text) {
+    const qr = window.qrcode(0, 'L');
+    qr.addData(text, 'Byte');
+    qr.make();
+    const n = qr.getModuleCount();
+    const m = 4;
+    let path = '';
+    for (let r = 0; r < n; r++) {
+      for (let c = 0; c < n; c++) if (qr.isDark(r, c)) path += `M${c + m} ${r + m}h1v1h-1z`;
+    }
+    const size = n + m * 2;
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}" shape-rendering="crispEdges" role="img" aria-label="QR code">
+      <rect width="${size}" height="${size}" fill="#fff"/><path d="${path}" fill="#000"/></svg>`;
+  }
+
+  // Mounts a paged QR viewer into `el`. `envelope` is the full {"TYPE":"..."} text.
+  function mountQr(el, envelope) {
+    let type;
+    let inner;
+    try {
+      const obj = JSON.parse(envelope);
+      type = Object.keys(obj).find((k) => !['p', 'n', 'a'].includes(k));
+      inner = typeof obj[type] === 'string' ? obj[type] : JSON.stringify(obj[type]);
+    } catch (e) {
+      el.innerHTML = '<p class="faint small">QR code is not available for this payload.</p>';
+      return;
+    }
+    let density = inner.length > QR_DENSITY[0] ? 1 : 0;
+    let page = 0;
+    let timer = null;
+
+    const pagesFor = () => Math.max(1, Math.ceil(inner.length / QR_DENSITY[density]));
+    const stop = () => { if (timer) { clearInterval(timer); S.qrTimers.delete(timer); timer = null; } };
+
+    function draw() {
+      const pages = pagesFor();
+      page = Math.min(page, pages - 1);
+      const size = Math.ceil(inner.length / pages);
+      const value = JSON.stringify({ [type]: inner.slice(page * size, (page + 1) * size), p: page + 1, n: pages, a: timer ? 1 : 0 });
+      let svg;
+      try { svg = qrSvg(value); } catch (e) { svg = '<p class="small">Too large for one page - choose a lighter density.</p>'; }
+      el.innerHTML = `
+        <div class="qr">
+          ${svg}
+          <div class="qr-controls">
+            ${pages > 1 ? `
+              <button type="button" class="btn btn-sm" data-qr="prev" ${timer ? 'disabled' : ''} aria-label="Previous page">‹</button>
+              <span>Page ${page + 1} of ${pages}</span>
+              <button type="button" class="btn btn-sm" data-qr="next" ${timer ? 'disabled' : ''} aria-label="Next page">›</button>
+              <button type="button" class="btn btn-sm" data-qr="play">${timer ? 'Pause' : 'Auto-play'}</button>` : '<span>Single page</span>'}
+            <button type="button" class="btn btn-sm" data-qr="density" title="Change how much data each QR page holds">
+              ${['Dense', 'Medium', 'Light'][density]}</button>
+          </div>
+        </div>`;
+    }
+
+    el.onclick = (ev) => {
+      const btn = ev.target.closest('[data-qr]');
+      if (!btn) return;
+      const pages = pagesFor();
+      switch (btn.dataset.qr) {
+        case 'prev': page = (page - 1 + pages) % pages; break;
+        case 'next': page = (page + 1) % pages; break;
+        case 'play':
+          if (timer) stop();
+          else {
+            timer = setInterval(() => { page = (page + 1) % pagesFor(); draw(); }, 800);
+            S.qrTimers.add(timer);
+          }
+          break;
+        case 'density': stop(); density = (density + 1) % QR_DENSITY.length; page = 0; break;
+        default: break;
+      }
+      draw();
+    };
+    draw();
+  }
+
+  function stopQrTimers() {
+    S.qrTimers.forEach((t) => clearInterval(t));
+    S.qrTimers.clear();
+  }
+
+  // Camera scanner. Resolves with the assembled payload text, or null if closed.
+  function loadJsQr() {
+    if (window.jsQR) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'vendor/jsQR-1.4.0.js';
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('Could not load the QR scanner.'));
+      document.head.appendChild(s);
+    });
+  }
+
+  async function scanQr() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      toast('This browser cannot use the camera here. Copy and paste the text instead.', 'error');
+      return null;
+    }
+    const dlg = $('#dialog');
+    const form = $('#dialog-form');
+    form.innerHTML = `
+      <h2>Scan QR code</h2>
+      <div class="scanner"><video playsinline muted></video></div>
+      <div class="scanner-status" id="scan-status">Starting camera…</div>
+      <div class="dialog-actions"><button class="btn" value="cancel">Close</button></div>`;
+    dlg.returnValue = '';
+    dlg.showModal();
+    const video = $('video', form);
+    const status = $('#scan-status');
+    let stream;
+    let active = true;
+    const chunks = [];
+    let type = null;
+
+    const finish = (result) => {
+      active = false;
+      stream?.getTracks().forEach((t) => t.stop());
+      if (dlg.open) dlg.close(result ? 'ok' : 'cancel');
+      return result;
+    };
+
+    return new Promise(async (resolve) => {
+      dlg.addEventListener('close', () => { if (active) resolve(finish(null)); }, { once: true });
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        video.srcObject = stream;
+        await video.play();
+      } catch (e) {
+        status.textContent = 'Camera not available or permission denied.';
+        return;
+      }
+      let detector = null;
+      if ('BarcodeDetector' in window) {
+        try { detector = new window.BarcodeDetector({ formats: ['qr_code'] }); } catch (e) { detector = null; }
+      }
+      if (!detector) {
+        try { await loadJsQr(); } catch (e) { status.textContent = e.message; return; }
+      }
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      status.textContent = 'Point the camera at the QR code.';
+
+      const handle = (raw) => {
+        let obj;
+        try { obj = JSON.parse(raw); } catch (e) { resolve(finish(raw)); return; }
+        const t = Object.keys(obj).find((k) => !['p', 'n', 'a'].includes(k));
+        if (!obj.n || obj.n === 1) { resolve(finish(JSON.stringify({ [t]: obj[t] }))); return; }
+        if (type && t !== type) return;
+        type = t;
+        chunks.length = obj.n;
+        chunks[obj.p - 1] = obj[t];
+        const have = chunks.filter((c) => c !== undefined).length;
+        status.textContent = `Scanned ${have} of ${obj.n} pages…`;
+        if (have === obj.n) resolve(finish(JSON.stringify({ [type]: chunks.join('') })));
+      };
+
+      const tick = async () => {
+        if (!active) return;
+        if (video.readyState >= 2) {
+          try {
+            if (detector) {
+              const codes = await detector.detect(video);
+              if (codes[0]) handle(codes[0].rawValue);
+            } else {
+              canvas.width = video.videoWidth;
+              canvas.height = video.videoHeight;
+              ctx.drawImage(video, 0, 0);
+              const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+              const code = window.jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+              if (code) handle(code.data);
+            }
+          } catch (e) { /* keep scanning */ }
+        }
+        if (active) requestAnimationFrame(tick);
+      };
+      tick();
+    });
+  }
+
+  // ------------------------------------------------------------------------
+  // Minotaur versions (live from GitHub, cached; fallback list if offline)
+  // ------------------------------------------------------------------------
+  async function loadVersions() {
+    if (S.versions) return S.versions;
+    try {
+      const cached = JSON.parse(store('sigmasync.versions') || 'null');
+      if (cached && Date.now() - cached.at < 6 * 3600 * 1000) return (S.versions = cached.list);
+    } catch (e) { /* ignore */ }
+    try {
+      const res = await fetch(MINOTAUR_API, { headers: { Accept: 'application/vnd.github+json' } });
+      if (!res.ok) throw new Error(String(res.status));
+      const rel = await res.json();
+      const list = rel.filter((r) => !r.draft).map((r) => ({
+        tag: r.tag_name, pre: !!r.prerelease, date: (r.published_at || '').slice(0, 10), url: r.html_url,
+      }));
+      if (!list.length) throw new Error('empty');
+      store('sigmasync.versions', JSON.stringify({ at: Date.now(), list }));
+      S.versions = list;
+    } catch (e) {
+      S.versions = FALLBACK_VERSIONS.map((tag) => ({ tag, pre: false, date: '', url: `${MINOTAUR_RELEASES}/tag/${tag}` }));
+      S.versions.offline = true;
+    }
+    return S.versions;
+  }
+
+  const releaseUrl = (tag) => `${MINOTAUR_RELEASES}/tag/${encodeURIComponent(tag)}`;
+
+  function versionLabel(v) {
+    if (!v || v === 'other') return 'Not Minotaur';
+    return `Minotaur ${v}`;
+  }
+
+  // ------------------------------------------------------------------------
+  // Sign-in
+  // ------------------------------------------------------------------------
+  function renderSignIn(step = 'address', error = '') {
+    stopPolling();
+    stopQrTimers();
+    $('#user-chip').hidden = true;
+    const si = S.signin || {};
+    const stepIndex = { address: 1, sign: 2 }[step];
+    app().innerHTML = `
+      <section class="signin">
+        <div class="signin-hero">
+          <img src="favicon.svg" alt="">
+          <h1>Sign in to Sigma Sync</h1>
+          <p class="muted">Coordinate multi-sig commitments and signatures with your fellow signers.
+          Prove who you are by signing a one-time request with your Minotaur signing wallet.</p>
+        </div>
+        <ol class="steps" aria-hidden="true">
+          <li class="done"></li><li class="${stepIndex >= 2 ? 'done' : ''}"></li>
+        </ol>
+        <div class="panel" id="signin-panel"></div>
+      </section>`;
+    const panel = $('#signin-panel');
+
+    if (step === 'address') {
+      panel.innerHTML = `
+        <form id="address-form" class="stack" novalidate>
+          <div class="field">
+            <label for="address">Your signing wallet address</label>
+            <input type="text" id="address" name="address" required autocomplete="off" autocapitalize="off"
+              autocorrect="off" spellcheck="false" placeholder="9…" value="${esc(si.address || store(ADDRESS_KEY) || '')}">
+            <p class="hint">The regular address of the Minotaur wallet you sign multi-sig transactions with -
+            not the multi-sig wallet itself.</p>
+          </div>
+          ${error ? `<div class="notice notice-error">${esc(error)}</div>` : ''}
+          <button class="btn btn-primary btn-block" type="submit">Continue</button>
+        </form>`;
+      $('#address').focus();
+      $('#address-form').addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const address = $('#address').value.replace(/\s+/g, '');
+        if (!address) return;
+        const btn = ev.submitter || $('button[type=submit]', panel);
+        btn.disabled = true;
+        try {
+          const r = await api('auth_start', { address });
+          store(ADDRESS_KEY, address);
+          S.signin = { address, challenge: r.challenge, request: r.request, expires: Date.now() + r.expires_minutes * 60000 };
+          renderSignIn('sign');
+        } catch (e) {
+          renderSignIn('address', e.message);
+        }
+      });
+      return;
+    }
+
+    panel.innerHTML = `
+      <div class="stack">
+        <div class="row"><strong>Wallet</strong><code class="faint">${esc(shortAddr(si.address))}</code>
+          <span class="spacer"></span><button type="button" class="btn btn-ghost btn-sm" id="change-address">Change</button></div>
+        <div>
+          <p class="step-label"><span class="step-num">1</span> Sign this request in Minotaur</p>
+          <ol class="howto small">
+            <li>In Minotaur, tap the <strong>QR scanner</strong>. Scan the code below, or choose paste after copying the request.</li>
+            <li>Check it is your signing wallet, then <strong>Sign</strong>. Air-gapped wallets work the same way.</li>
+            <li>Copy (or show) the signed result Minotaur produces.</li>
+          </ol>
+          <div id="signin-qr"></div>
+          <div class="row mt-8">
+            <button type="button" class="btn btn-sm" id="copy-request">Copy request</button>
+            <span class="faint small" id="signin-expiry"></span>
+          </div>
+          <div class="notice notice-info small mt-12">This is a sign-in request, not a payment.
+          It spends a made-up box that does not exist on the blockchain, so the signed result can never be broadcast
+          and no funds can move.</div>
+        </div>
+        <form id="response-form" class="stack" novalidate>
+          <p class="step-label"><span class="step-num">2</span> Paste the signed result</p>
+          <textarea class="payload" id="response" required autocomplete="off" autocapitalize="off" autocorrect="off"
+            spellcheck="false" placeholder='{"CSTX":"…"}'></textarea>
+          <div id="signin-error">${error ? `<div class="notice notice-error">${esc(error)}</div>` : ''}</div>
+          <div class="row">
+            <button type="button" class="btn" id="scan-response">Scan QR</button>
+            <span class="spacer"></span>
+            <button class="btn btn-primary" type="submit">Sign in</button>
+          </div>
+        </form>
+      </div>`;
+    mountQr($('#signin-qr'), si.request);
+    $('#change-address').onclick = () => renderSignIn('address');
+    $('#copy-request').onclick = () => copyText(si.request, 'Request copied');
+    $('#scan-response').onclick = async () => {
+      const text = await scanQr();
+      if (text) $('#response').value = text;
+    };
+    const expiry = $('#signin-expiry');
+    const tickExpiry = () => {
+      const left = Math.round((si.expires - Date.now()) / 60000);
+      if (!document.body.contains(expiry)) return;
+      expiry.textContent = left > 0 ? `Expires in ${left} min` : 'Expired - start again';
+      if (left > 0) setTimeout(tickExpiry, 15000);
+    };
+    tickExpiry();
+
+    $('#response-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const response = cleanPayload($('#response').value);
+      if (!response) return;
+      const btn = $('button[type=submit]', ev.target);
+      btn.disabled = true;
+      try {
+        const r = await api('auth_finish', { challenge: si.challenge, response });
+        S.signin = null;
+        startSession(r);
+      } catch (e) {
+        btn.disabled = false;
+        const extra = e.data?.verified_address
+          ? `<div class="row small mt-8"><code>${esc(e.data.verified_address)}</code>
+             <button type="button" class="btn btn-sm" data-copy="${esc(e.data.verified_address)}">Copy address</button></div>`
+          : '';
+        $('#signin-error').innerHTML = `<div class="notice notice-error">${esc(e.message)}${extra}</div>`;
+      }
+    });
+  }
+
+  function startSession(r) {
+    S.me = r.member;
+    S.csrf = r.csrf;
+    S.config = r.config || {};
+    $('#user-name').textContent = S.me.display_name;
+    $('#user-address').textContent = shortAddr(S.me.address);
+    $('#user-address').title = S.me.address;
+    $('#user-chip').hidden = false;
+    route();
+  }
+
+  // ------------------------------------------------------------------------
+  // Routing & shell
+  // ------------------------------------------------------------------------
+  function route() {
+    if (!S.me) return renderSignIn();
+    stopPolling();
+    stopQrTimers();
+    const hash = location.hash.replace(/^#/, '');
+    const m = hash.match(/^tx\/(\d+)$/);
+    if (m) return renderDetail(Number(m[1]));
+    if (hash === 'start') return renderStart();
+    if (hash === 'signers') return renderMembers();
+    if (hash === 'activity' && S.me.is_admin) return renderActivity();
+    return renderList();
+  }
+
+  function updateTabCount() {
+    const tab = $('.tab[data-nav=sign]');
+    if (!tab) return;
+    const n = S.txs.filter((t) => t.me.awaiting).length;
+    $('.count', tab)?.remove();
+    if (n) tab.insertAdjacentHTML('beforeend', `<span class="count" aria-label="${n} waiting">${n}</span>`);
+  }
+
+  function shell(active) {
+    const awaiting = S.txs.filter((t) => t.me.awaiting).length;
+    const tabs = [
+      ['sign', 'Sign Transactions', awaiting],
+      ['start', 'Start Transaction'],
+      ['signers', 'Signers'],
+      ...(S.me.is_admin ? [['activity', 'Activity']] : []),
+    ];
+    app().innerHTML = `
+      <nav class="tabs" role="tablist">
+        ${tabs.map(([id, label, count]) => `
+          <button class="tab" role="tab" data-nav="${id}" aria-selected="${id === active}">
+            ${esc(label)}${count ? `<span class="count" aria-label="${count} waiting">${count}</span>` : ''}
+          </button>`).join('')}
+      </nav>
+      <div id="view"></div>`;
+    return $('#view');
+  }
+
+  function stopPolling() {
+    if (S.pollTimer) clearTimeout(S.pollTimer);
+    S.pollTimer = null;
+  }
+
+  function poll(fn, ms) {
+    stopPolling();
+    S.pollTimer = setTimeout(async () => {
+      if (document.visibilityState === 'visible') {
+        try { await fn(); } catch (e) { /* next tick */ }
+      }
+      poll(fn, ms);
+    }, ms);
+  }
+
+  // ------------------------------------------------------------------------
+  // Transaction list
+  // ------------------------------------------------------------------------
+  const STATUS_LABEL = {
+    commit: 'Commitment round', sign: 'Signing round', complete: 'Ready to broadcast',
+    broadcast: 'Broadcast', cancelled: 'Cancelled',
+  };
+  const isOpen = (t) => t.status === 'commit' || t.status === 'sign';
+
+  async function fetchList() {
+    const r = await api('list_transactions');
+    S.txs = r.transactions;
+    S.wallets = r.wallet_names || [];
+  }
+
+  async function renderList() {
+    const view = shell('sign');
+    if (!S.txs.length) view.innerHTML = '<div class="loading">Loading transactions…</div>';
+    try { await fetchList(); } catch (e) { view.innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`; return; }
+    if (location.hash.replace(/^#/, '') !== '' && location.hash !== '#sign') return;
+    drawList();
+    poll(async () => { await fetchList(); drawList(true); }, 30000);
+  }
+
+  function progressBars(t) {
+    const req = t.signers_required;
+    const bar = (n, cls) => {
+      const pct = Math.min(100, Math.round((n / req) * 100));
+      return `<div class="bar ${cls} ${n >= req ? 'full' : ''}"><span data-pct="${pct}"></span></div>`;
+    };
+    return `
+      <div class="progress">
+        <div class="progress-row"><span>Commitments</span>${bar(t.commits, 'commit')}<strong>${t.commits}/${req}</strong></div>
+        <div class="progress-row"><span>Signatures</span>${bar(t.signatures, 'sign')}<strong>${t.signatures}/${req}</strong></div>
+      </div>`;
+  }
+
+  // Bar widths are set through the CSSOM (allowed by the CSP, unlike style attributes).
+  function paintBars(root) {
+    $$('[data-pct]', root).forEach((el) => { el.style.width = `${el.dataset.pct}%`; });
+  }
+
+  function statusPill(status) {
+    return `<span class="pill pill-${esc(status)}">${esc(STATUS_LABEL[status] || status)}</span>`;
+  }
+
+  function myStatusText(t) {
+    if (t.me.awaiting) return t.status === 'commit' ? 'Needs your commitment' : 'Needs your signature';
+    if (t.me.signed) return 'You signed';
+    if (t.me.committed) return 'You committed';
+    return '';
+  }
+
+  function drawList(keepFocus = false) {
+    const view = $('#view');
+    if (!view) return;
+    const counts = {
+      awaiting: S.txs.filter((t) => t.me.awaiting).length,
+      active: S.txs.filter(isOpen).length,
+      complete: S.txs.filter((t) => t.status === 'complete').length,
+      done: S.txs.filter((t) => t.status === 'broadcast' && (Date.now() - parseTs(t.closed_at)) < 30 * 86400000).length,
+    };
+    const filters = {
+      awaiting: (t) => t.me.awaiting,
+      active: isOpen,
+      complete: (t) => t.status === 'complete',
+      closed: (t) => t.status === 'broadcast' || t.status === 'cancelled',
+      all: () => true,
+    };
+    const q = S.search.toLowerCase();
+    const list = S.txs.filter(filters[S.filter] || filters.active).filter((t) => !q
+      || [t.title, t.wallet_name, t.created_by, t.ergo_tx_id, `#${t.id}`].some((v) => (v || '').toLowerCase().includes(q)));
+
+    const stat = (key, value, label, attention) => `
+      <button type="button" class="stat ${attention && value ? 'attention' : ''}" data-filter="${key}" aria-pressed="${S.filter === key}">
+        <div class="stat-value">${value}</div><div class="stat-label">${label}</div>
+      </button>`;
+
+    const searchValue = $('#tx-search')?.value ?? S.search;
+    view.innerHTML = `
+      <div class="stats">
+        ${stat('awaiting', counts.awaiting, 'Waiting on you', true)}
+        ${stat('active', counts.active, 'In progress')}
+        ${stat('complete', counts.complete, 'Ready to broadcast')}
+        ${stat('closed', counts.done, 'Broadcast (30 days)')}
+      </div>
+      <div class="toolbar">
+        <input type="search" id="tx-search" placeholder="Search title, wallet, creator, TX ID…" value="${esc(searchValue)}" aria-label="Search transactions">
+        <span class="spacer"></span>
+        <select id="tx-filter" aria-label="Filter">
+          ${[['active', 'In progress'], ['awaiting', 'Waiting on you'], ['complete', 'Ready to broadcast'], ['closed', 'Closed'], ['all', 'All']]
+            .map(([v, l]) => `<option value="${v}" ${S.filter === v ? 'selected' : ''}>${l}</option>`).join('')}
+        </select>
+        <a class="btn btn-primary" href="#start">Start transaction</a>
+      </div>
+      ${list.length ? `<div class="cards">${list.map(card).join('')}</div>` : `
+        <div class="empty">${S.txs.length ? 'Nothing matches this filter.' : 'No transactions yet. Start one to get your signers going.'}</div>`}`;
+
+    paintBars(view);
+    updateTabCount();
+    if (keepFocus && document.activeElement?.id === 'tx-search') $('#tx-search').focus();
+    $('#tx-search').addEventListener('input', (ev) => { S.search = ev.target.value; drawList(true); placeCaret(); });
+    $('#tx-filter').addEventListener('change', (ev) => { S.filter = ev.target.value; drawList(); });
+  }
+
+  function placeCaret() {
+    const el = $('#tx-search');
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }
+
+  function card(t) {
+    const mine = myStatusText(t);
+    return `
+      <a class="card ${t.me.awaiting ? 'attention' : ''}" href="#tx/${t.id}">
+        ${t.me.awaiting ? `<span class="your-turn">${esc(mine)}</span>` : ''}
+        <div class="card-head">
+          <div class="grow">
+            <div class="card-title">${esc(t.title)}</div>
+            <div class="card-sub">#${t.id}${t.wallet_name ? ` · ${esc(t.wallet_name)}` : ''} · ${esc(versionLabel(t.minotaur_version))}</div>
+          </div>
+          ${statusPill(t.status)}
+        </div>
+        ${isOpen(t) || t.status === 'complete' ? progressBars(t) : ''}
+        ${t.lock ? `<div><span class="pill pill-lock">Locked by ${esc(t.lock.mine ? 'you' : t.lock.name)} · ${timeTag(t.lock.since)}</span></div>` : ''}
+        <div class="card-foot">
+          <span>By ${esc(t.created_by)} · ${timeTag(t.created_at)}</span>
+          <span>Updated ${timeTag(t.updated_at)}</span>
+          ${t.comments ? `<span>${t.comments} comment${t.comments > 1 ? 's' : ''}</span>` : ''}
+          ${!t.me.awaiting && mine ? `<span class="tick">${esc(mine)}</span>` : ''}
+        </div>
+      </a>`;
+  }
+
+  // ------------------------------------------------------------------------
+  // Start transaction
+  // ------------------------------------------------------------------------
+  async function renderStart() {
+    const view = shell('start');
+    view.innerHTML = `
+      <div class="detail">
+        <form class="panel" id="start-form" novalidate>
+          <div class="panel-title"><h2>Start a multi-sig transaction</h2></div>
+          <p class="muted small">Create the transaction in your Minotaur multi-sig wallet, press <strong>Commit</strong>,
+          then copy the request and paste it below. Your fellow signers will see it under <em>Sign Transactions</em>.</p>
+          <div class="field">
+            <label for="f-title">Transaction name</label>
+            <input type="text" id="f-title" maxlength="120" required placeholder="e.g. October hosting & meetup expenses">
+          </div>
+          <div class="field-row">
+            <div>
+              <label for="f-wallet">Multi-sig wallet <span class="faint">(optional)</span></label>
+              <input type="text" id="f-wallet" maxlength="80" list="wallet-names" placeholder="e.g. Sigmanauts Treasury 2.0">
+              <datalist id="wallet-names">${S.wallets.map((w) => `<option value="${esc(w)}">`).join('')}</datalist>
+            </div>
+            <div>
+              <label for="f-version">Minotaur version</label>
+              <select id="f-version" required><option value="">Loading releases…</option></select>
+              <p class="hint" id="version-hint"></p>
+            </div>
+            <div>
+              <label for="f-required">Signatures required</label>
+              <input type="number" id="f-required" min="1" max="50" required placeholder="M of N">
+              <p class="hint" id="required-hint">Filled in from the request when detected.</p>
+            </div>
+          </div>
+          <div class="field">
+            <label for="f-desc">What is this transaction for?</label>
+            <textarea id="f-desc" maxlength="10000" rows="5" placeholder="Who is being paid, for what, amounts, links to the vote or invoice…"></textarea>
+          </div>
+          <div class="field">
+            <label for="f-payload">Your first commitment (multi-sig request from Minotaur)</label>
+            <textarea class="payload" id="f-payload" required autocomplete="off" autocapitalize="off" autocorrect="off"
+              spellcheck="false" placeholder='{"MSR":"{\\"tx\\":\\"…"}'></textarea>
+            <div class="row mt-8"><button type="button" class="btn btn-sm" id="f-scan">Scan QR</button>
+              <span class="hint">Pasted exactly as-is. Line breaks and invisible characters are removed automatically.</span></div>
+          </div>
+          <div id="f-analysis" class="field" hidden></div>
+          <div class="field">
+            <label for="f-comment">Note to signers <span class="faint">(optional)</span></label>
+            <textarea id="f-comment" maxlength="4000" rows="2"></textarea>
+          </div>
+          <div id="f-error"></div>
+          <div class="row mt-16"><span class="spacer"></span>
+            <button class="btn btn-primary" type="submit">Start transaction</button></div>
+        </form>
+        <aside class="panel detail-side">
+          <h3>How the rounds work</h3>
+          <ol class="howto small">
+            <li><strong>Commitment round</strong> - each signer locks the transaction, copies the latest request into Minotaur,
+            commits, and pastes the new request back. Needs M commitments.</li>
+            <li><strong>Signing round</strong> - the same signers take turns again, this time pressing Sign.</li>
+            <li><strong>Broadcast</strong> - the final signer's output is the complete transaction; anyone can publish it from Minotaur.</li>
+          </ol>
+          <p class="small muted">Sigma Sync checks every paste: it must be the same transaction, keep every earlier
+          commitment, and add yours. Only one signer works at a time (the lock), so nobody's work is overwritten.</p>
+        </aside>
+      </div>`;
+
+    const versions = await loadVersions();
+    const sel = $('#f-version');
+    if (!sel) return;
+    const stable = versions.filter((v) => !v.pre);
+    const pre = versions.filter((v) => v.pre);
+    const opt = (v, i) => `<option value="${esc(v.tag)}" ${i === 0 && !v.pre ? 'selected' : ''}>${esc(v.tag)}${i === 0 && !v.pre ? ' (latest)' : ''}${v.date ? ` - ${esc(v.date)}` : ''}</option>`;
+    sel.innerHTML = `
+      <optgroup label="Releases">${stable.map(opt).join('')}</optgroup>
+      ${pre.length ? `<optgroup label="Pre-releases">${pre.map((v) => opt(v, 1)).join('')}</optgroup>` : ''}
+      <option value="other">Other / not Minotaur</option>`;
+    const hint = () => {
+      const v = sel.value;
+      $('#version-hint').innerHTML = v && v !== 'other'
+        ? `Every signer should use this version. <a href="${esc(releaseUrl(v))}" target="_blank" rel="noopener">Release notes</a>`
+        : 'No payload checks are done for non-Minotaur transactions.';
+    };
+    sel.addEventListener('change', hint);
+    hint();
+    if (versions.offline) $('#version-hint').insertAdjacentHTML('beforeend', ' (GitHub unreachable - showing known versions)');
+
+    let timer;
+    $('#f-payload').addEventListener('input', () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => analyzeInto($('#f-payload').value, $('#f-analysis'), null, (a) => {
+        if (a.valid && a.required) {
+          $('#f-required').value = a.required;
+          $('#required-hint').textContent = `This wallet needs ${a.required} of ${a.signers} signatures.`;
+        }
+      }), 350);
+    });
+    $('#f-scan').onclick = async () => {
+      const text = await scanQr();
+      if (text) { $('#f-payload').value = text; $('#f-payload').dispatchEvent(new Event('input')); }
+    };
+
+    $('#start-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const btn = $('button[type=submit]', ev.target);
+      btn.disabled = true;
+      $('#f-error').innerHTML = '';
+      try {
+        const r = await api('create_transaction', {
+          title: $('#f-title').value,
+          wallet_name: $('#f-wallet').value,
+          minotaur_version: $('#f-version').value,
+          signers_required: $('#f-required').value,
+          description: $('#f-desc').value,
+          payload: cleanPayload($('#f-payload').value),
+          comment: $('#f-comment').value,
+        });
+        toast('Transaction started - your signers can see it now', 'success');
+        S.txs = [];
+        location.hash = `#tx/${r.id}`;
+      } catch (e) {
+        btn.disabled = false;
+        $('#f-error').innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`;
+      }
+    });
+  }
+
+  // Calls the server-side analyzer and renders what it found.
+  async function analyzeInto(text, el, txId, onResult) {
+    const payload = cleanPayload(text);
+    if (!payload) { el.hidden = true; return null; }
+    let a;
+    try {
+      a = (await api('analyze', { payload, id: txId || undefined })).analysis;
+    } catch (e) {
+      el.hidden = false;
+      el.innerHTML = `<div class="analysis bad">${esc(e.message)}</div>`;
+      return null;
+    }
+    el.hidden = false;
+    const items = [];
+    let bad = !a.valid || !!a.problem;
+    if (a.format === 'MSR') {
+      items.push(`Minotaur multi-sig request${a.required ? ` · ${a.required}-of-${a.signers} wallet` : ''}`);
+      items.push(`${a.committed} commitment${a.committed === 1 ? '' : 's'}, ${a.signed} signature${a.signed === 1 ? '' : 's'}`);
+      if (a.compare) {
+        const c = a.compare;
+        if (c.new_commits) items.push(`<strong>+${c.new_commits} new commitment</strong>`);
+        if (c.new_signatures) items.push(`<strong>+${c.new_signatures} new signature</strong>`);
+        items.push('Keeps every earlier commitment and signature');
+      }
+    } else if (a.format === 'CSTX') {
+      items.push('<strong>Fully signed transaction</strong> - ready to broadcast');
+    }
+    if (a.tx_id) items.push(`Ergo TX ID <code>${esc(shortId(a.tx_id))}</code>${txId && !a.problem ? ' · matches this transaction' : ''}`);
+    if (a.outputs?.length) {
+      const sends = a.outputs.filter((o) => !o.is_fee && !o.is_change);
+      if (sends.length) items.push(`Sends ${sends.map((o) => `${esc(erg(o.value))} to <code>${esc(shortAddr(o.address))}</code>`).join(', ')}`);
+    }
+    const problem = a.problem || a.error;
+    el.innerHTML = `<div class="analysis ${bad ? 'bad' : 'ok'}">
+      ${problem ? `<strong>${esc(problem)}</strong>` : ''}
+      ${a.warning ? `<div>${esc(a.warning)}</div>` : ''}
+      ${items.length ? `<ul>${items.map((i) => `<li>${i}</li>`).join('')}</ul>` : ''}
+    </div>`;
+    if (onResult) onResult(a);
+    return a;
+  }
+
+  // ------------------------------------------------------------------------
+  // Transaction detail
+  // ------------------------------------------------------------------------
+  async function renderDetail(id) {
+    const view = shell('sign');
+    view.innerHTML = '<div class="loading">Loading…</div>';
+    try {
+      const r = await api('get_transaction', { id });
+      S.detail = r.transaction;
+    } catch (e) {
+      view.innerHTML = `<a class="back" href="#">← All transactions</a><div class="notice notice-error">${esc(e.message)}</div>`;
+      return;
+    }
+    drawDetail();
+    // Refresh while someone else holds the lock or it is idle; never while you are mid-turn.
+    poll(async () => {
+      if (S.detail?.lock?.mine || dirtyDetail()) return;
+      const r = await api('get_transaction', { id });
+      S.detail = r.transaction;
+      drawDetail();
+    }, 12000);
+  }
+
+  function dirtyDetail() {
+    return ['#comment-body'].some((sel) => ($(sel)?.value || '').trim() !== '');
+  }
+
+  function drawDetail(flash) {
+    stopQrTimers();
+    const t = S.detail;
+    const view = $('#view');
+    if (!view || !t) return;
+    const explorer = t.ergo_tx_id ? `${S.config.explorer_tx_url || ''}${t.ergo_tx_id}` : '';
+    view.innerHTML = `
+      <a class="back" href="#">← All transactions</a>
+      <div class="detail-head">
+        <div class="grow">
+          <div class="row">${statusPill(t.status)}${t.lock ? `<span class="pill pill-lock">Locked by ${esc(t.lock.mine ? 'you' : t.lock.name)}</span>` : ''}</div>
+          <h1 class="mt-8">${esc(t.title)}</h1>
+          <div class="meta">
+            <span>#${t.id}</span>
+            ${t.wallet_name ? `<span>${esc(t.wallet_name)}</span>` : ''}
+            <span>${t.minotaur_version !== 'other'
+              ? `<a href="${esc(releaseUrl(t.minotaur_version))}" target="_blank" rel="noopener">${esc(versionLabel(t.minotaur_version))}</a>`
+              : 'Not Minotaur'}</span>
+            <span>Started by ${esc(t.created_by)} · ${timeTag(t.created_at)}</span>
+            ${t.ergo_tx_id ? `<span>TX <a href="${esc(explorer)}" target="_blank" rel="noopener" class="mono">${esc(shortId(t.ergo_tx_id))}</a>
+              <button type="button" class="btn btn-ghost btn-sm" data-copy="${esc(t.ergo_tx_id)}" aria-label="Copy transaction ID">Copy</button></span>` : ''}
+          </div>
+        </div>
+      </div>
+      ${flash ? `<div class="notice notice-success mb-16">${flash}</div>` : ''}
+      <div class="detail">
+        <div>
+          <section class="panel">
+            <div class="panel-title"><h2>About this transaction</h2></div>
+            ${t.description ? `<div class="prewrap">${esc(t.description)}</div>` : '<p class="faint">No description.</p>'}
+            ${reviewHtml(t)}
+          </section>
+          <section class="panel">
+            <div class="panel-title"><h2>Progress</h2></div>
+            ${progressBars(t)}
+            ${slotsHtml(t)}
+            ${peopleHtml(t)}
+          </section>
+          <section class="panel">
+            <div class="panel-title"><h2>Activity &amp; comments</h2></div>
+            ${timelineHtml(t)}
+            <form id="comment-form" class="field mt-16">
+              <label for="comment-body">Add a comment</label>
+              <textarea id="comment-body" maxlength="4000" rows="3" placeholder="Visible to every signer"></textarea>
+              <div class="row mt-8"><span class="spacer"></span><button class="btn" type="submit">Post comment</button></div>
+            </form>
+          </section>
+        </div>
+        <aside class="detail-side">
+          <section class="panel" id="action-panel">${actionHtml(t)}</section>
+          ${t.can.cancel ? `<div class="mt-12 right">
+            <button type="button" class="btn btn-sm btn-danger" data-action="cancel">Cancel transaction</button></div>` : ''}
+        </aside>
+      </div>`;
+    paintBars(view);
+    wireDetail(t);
+  }
+
+  function reviewHtml(t) {
+    const r = t.review;
+    if (!r || !r.outputs) return '';
+    const rows = r.outputs.map((o) => `
+      <tr>
+        <td>${o.is_fee ? '<span class="tag">Network fee</span>'
+          : `${o.is_change ? '<span class="tag">Change</span> ' : ''}<span class="addr">${esc(o.address)}</span>`}
+          ${(o.tokens || []).map((tk) => `<div class="small faint">+ ${esc(tk.amount)} × token <code>${esc(shortId(tk.id))}</code></div>`).join('')}
+        </td>
+        <td>${esc(erg(o.value))}</td>
+      </tr>`).join('');
+    return `
+      <h3 class="mt-16">Where the funds go</h3>
+      <p class="small muted">Decoded from the transaction itself - compare it with the description before you commit or sign.</p>
+      <table class="outputs">${rows}</table>
+      ${r.outputs_partial ? '<p class="small faint">Some outputs could not be decoded; check them in Minotaur.</p>' : ''}
+      ${r.inputs_value ? `<p class="small muted mt-8">Total spent from the wallet: <strong>${esc(erg(r.inputs_value))}</strong></p>` : ''}`;
+  }
+
+  function slotsHtml(t) {
+    const slots = t.review?.slots;
+    if (!slots || !slots.length) return '';
+    const bySlot = {};
+    (t.participants || []).forEach((p) => { if (p.slot !== null && p.slot !== undefined) bySlot[p.slot] = p.name; });
+    const label = ['Empty', 'Committed', 'Signed', 'Not participating'];
+    return `
+      <div class="mt-16">
+        <div class="small muted mb-6">Signer key slots (${slots.length} keys in this wallet)</div>
+        <div class="slots">${slots.map((s, i) => `<span class="slot slot-${s}" title="Key ${i + 1}: ${label[s]}${bySlot[i] ? ` - ${esc(bySlot[i])}` : ''}">${
+          bySlot[i] ? esc(bySlot[i].slice(0, 2).toUpperCase()) : i + 1}</span>`).join('')}</div>
+        <div class="legend"><span>◌ empty</span><span class="info-text">● committed</span><span class="tick">● signed</span></div>
+      </div>`;
+  }
+
+  function peopleHtml(t) {
+    const ps = t.participants || [];
+    if (!ps.length) return '';
+    return `
+      <ul class="people mt-12">
+        ${ps.map((p) => `<li>
+          <strong class="grow">${esc(p.name)}</strong>
+          ${p.committed_at ? `<span class="small" title="${esc(fullDate(p.committed_at))}"><span class="tick">✓</span> committed</span>` : ''}
+          ${p.signed_at ? `<span class="small" title="${esc(fullDate(p.signed_at))}"><span class="tick">✓</span> signed</span>` : ''}
+        </li>`).join('')}
+      </ul>`;
+  }
+
+  const EVENT_TEXT = {
+    lock: 'locked the transaction',
+    release: 'released the lock',
+    unlock_vote: 'voted to force-unlock',
+    lock_override: 'force-unlock reached enough votes - lock released',
+    cancel: 'cancelled the transaction',
+    broadcast: 'marked the transaction as broadcast',
+  };
+
+  function timelineHtml(t) {
+    if (!t.timeline?.length) return '<p class="faint">Nothing yet.</p>';
+    return `<ol class="timeline">${t.timeline.map((e) => {
+      let dot = 'comment';
+      let head;
+      if (e.kind === 'submission') {
+        dot = e.round;
+        const what = { commit: 'added a commitment', sign: 'added a signature', final: 'submitted the fully signed transaction' }[e.round] || 'submitted';
+        head = `<strong>${esc(e.member)}</strong> ${what}
+          <span class="faint small">· ${e.commits} commit${e.commits === 1 ? '' : 's'}, ${e.signatures} sig${e.signatures === 1 ? '' : 's'}
+          · <span class="fingerprint" title="SHA-256 fingerprint of the stored payload">${esc(e.fingerprint)}</span></span>`;
+      } else if (e.kind === 'comment') {
+        head = `<strong>${esc(e.member)}</strong> commented`;
+      } else {
+        dot = ['lock_override', 'cancel', 'unlock_vote'].includes(e.event) ? 'alert' : 'event';
+        head = `<strong>${esc(e.member || 'Someone')}</strong> ${esc(EVENT_TEXT[e.event] || e.event)}${
+          e.event === 'cancel' && e.detail ? `: <em>${esc(e.detail)}</em>` : ''}`;
+      }
+      return `<li><span class="dot dot-${esc(dot)}"></span>
+        <div class="tl-head">${head}</div>
+        <div class="tl-time">${esc(fullDate(e.at))}</div>
+        ${e.comment ? `<div class="tl-comment">${esc(e.comment)}</div>` : ''}
+      </li>`;
+    }).join('')}</ol>`;
+  }
+
+  function actionHtml(t) {
+    const p = t.payload;
+    if (t.status === 'cancelled') return '<h2>Cancelled</h2><p class="muted">This transaction was cancelled. See the activity log for the reason.</p>';
+    if (t.status === 'complete' || t.status === 'broadcast') {
+      return `
+        <h2>${t.status === 'complete' ? 'Ready to broadcast' : 'Broadcast'}</h2>
+        <p class="small muted">${t.status === 'complete'
+          ? 'All required signatures are in. Open this in Minotaur (scan or paste) and publish it, then mark it as broadcast here.'
+          : 'This transaction has been published.'}</p>
+        ${t.ergo_tx_id ? `<div class="notice notice-info small" id="chain-status">Checking the blockchain…</div>` : ''}
+        ${p ? payloadBlock(p) : ''}
+        ${t.can.broadcast ? '<button type="button" class="btn btn-primary btn-block mt-12" data-action="broadcast">Mark as broadcast</button>' : ''}`;
+    }
+    const round = t.status === 'commit' ? 'commitment' : 'signature';
+    const needed = t.status === 'commit' ? t.signers_required - t.commits : t.signers_required - t.signatures;
+    const header = `
+      <h2>${t.status === 'commit' ? 'Commitment round' : 'Signing round'}</h2>
+      <p class="small muted">${needed} more ${round}${needed === 1 ? '' : 's'} needed.
+      ${t.me.awaiting ? '<strong>It is your turn.</strong>' : t.me.signed ? 'You have signed.' : t.me.committed && t.status === 'commit' ? 'You have committed.' : ''}
+      ${t.status === 'sign' && !t.me.committed ? 'Only signers who committed can sign this round.' : ''}</p>`;
+
+    if (!t.lock) {
+      return `${header}
+        <div class="lockbox">
+          <p class="small">Lock the transaction while you work so nobody else continues from the same request.
+          Submitting releases the lock automatically.</p>
+          <button type="button" class="btn btn-primary btn-block" data-action="lock">Lock &amp; start my turn</button>
+        </div>`;
+    }
+
+    if (!t.lock.mine) {
+      const votes = t.lock.votes || [];
+      const need = S.config.unlock_votes || 2;
+      const grace = S.config.unlock_grace_minutes ?? 10;
+      const iVoted = votes.some((v) => v.mine);
+      const canVote = t.lock.age_minutes >= grace;
+      return `${header}
+        <div class="lockbox">
+          <p><strong>${esc(t.lock.name)}</strong> is working on this - locked ${timeTag(t.lock.since)}
+          (${esc(minutesText(t.lock.age_minutes))}).</p>
+          <p class="small muted">If they walked away without submitting, ${need} other signers can force-unlock it.
+          Votes can be cast at different times.</p>
+          <p class="small"><strong>${votes.length} of ${need}</strong> override votes${votes.length
+            ? `: ${votes.map((v) => esc(v.name)).join(', ')}` : ''}</p>
+          ${iVoted ? '<p class="small tick">You voted to unlock.</p>'
+            : canVote ? '<button type="button" class="btn btn-danger btn-block" data-action="vote-unlock">Vote to unlock</button>'
+            : `<p class="small faint">Override voting opens ${grace} minutes after the lock was taken.</p>`}
+        </div>`;
+    }
+
+    return `${header}
+      <div class="stack">
+        <div>
+          <p class="step-label"><span class="step-num">1</span> Copy the latest request into Minotaur</p>
+          ${p ? payloadBlock(p) : '<p class="faint">No payload stored yet.</p>'}
+        </div>
+        <form id="submit-form" class="stack" novalidate>
+          <p class="step-label"><span class="step-num">2</span> ${t.status === 'commit' ? 'Commit' : 'Sign'} in Minotaur, then paste the new output</p>
+          <textarea class="payload" id="submit-payload" required autocomplete="off" autocapitalize="off" autocorrect="off"
+            spellcheck="false" placeholder='{"MSR":"…"} or {"CSTX":"…"}'></textarea>
+          <button type="button" class="btn btn-sm" id="submit-scan">Scan QR</button>
+          <div id="submit-analysis" hidden></div>
+          <div>
+            <label for="submit-comment">Comment for other signers <span class="faint">(optional)</span></label>
+            <textarea id="submit-comment" maxlength="4000" rows="2"></textarea>
+          </div>
+          <div id="submit-error"></div>
+          <button class="btn btn-primary btn-block" type="submit">Submit &amp; unlock</button>
+          <button type="button" class="btn btn-block" data-action="release">Release lock without submitting</button>
+        </form>
+      </div>`;
+  }
+
+  function payloadBlock(p) {
+    return `
+      <div class="stack">
+        <textarea class="payload" readonly id="latest-payload" aria-label="Latest payload">${esc(p.text)}</textarea>
+        <div class="row">
+          <button type="button" class="btn btn-sm btn-primary" data-action="copy-payload">Copy</button>
+          <button type="button" class="btn btn-sm" data-action="show-qr">Show QR</button>
+          <button type="button" class="btn btn-sm" data-action="download-payload">Download</button>
+          <span class="spacer"></span>
+          <span class="fingerprint" title="SHA-256 fingerprint">${esc(p.fingerprint)}</span>
+        </div>
+        <div id="payload-qr" hidden></div>
+        <p class="small faint">From ${esc(p.by)} · ${esc(fullDate(p.at))}</p>
+      </div>`;
+  }
+
+  function wireDetail(t) {
+    const p = t.payload;
+    const view = $('#view');
+
+    view.querySelectorAll('[data-action]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const action = btn.dataset.action;
+        if (action === 'copy-payload') return copyText(p.text, 'Payload copied');
+        if (action === 'download-payload') return download(`sigmasync-${t.id}-${p.fingerprint}.json`, p.text);
+        if (action === 'show-qr') {
+          const box = $('#payload-qr');
+          box.hidden = !box.hidden;
+          btn.textContent = box.hidden ? 'Show QR' : 'Hide QR';
+          if (!box.hidden) mountQr(box, p.text);
+          return;
+        }
+        await detailAction(action, t, btn);
+      });
+    });
+
+    const form = $('#submit-form');
+    if (form) {
+      let timer;
+      const input = $('#submit-payload');
+      input.addEventListener('input', () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => analyzeInto(input.value, $('#submit-analysis'), t.id), 350);
+      });
+      $('#submit-scan').onclick = async () => {
+        const text = await scanQr();
+        if (text) { input.value = text; input.dispatchEvent(new Event('input')); }
+      };
+      form.addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const btn = $('button[type=submit]', form);
+        btn.disabled = true;
+        $('#submit-error').innerHTML = '';
+        try {
+          const r = await api('submit', { id: t.id, payload: cleanPayload(input.value), comment: $('#submit-comment').value });
+          S.detail = r.transaction;
+          const s = r.submitted;
+          const msg = s.status === 'complete'
+            ? 'Submitted - all required signatures are in. The transaction is ready to broadcast.'
+            : s.status === 'sign' && s.round === 'commit'
+              ? 'Commitment saved. That completes the commitment round - signing can begin.'
+              : `${s.round === 'commit' ? 'Commitment' : 'Signature'} saved and the lock released. Thank you!`;
+          toast('Submitted', 'success');
+          S.txs = [];
+          drawDetail(esc(msg));
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        } catch (e) {
+          btn.disabled = false;
+          $('#submit-error').innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`;
+        }
+      });
+    }
+
+    $('#comment-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const body = $('#comment-body').value.trim();
+      if (!body) return;
+      try {
+        const r = await api('add_comment', { id: t.id, comment: body });
+        S.detail = r.transaction;
+        drawDetail();
+        toast('Comment posted', 'success');
+      } catch (e) { toast(e.message, 'error'); }
+    });
+
+    if (t.ergo_tx_id && $('#chain-status')) checkChain(t);
+  }
+
+  async function detailAction(action, t, btn) {
+    const calls = {
+      lock: () => api('lock', { id: t.id }),
+      release: async () => (await dialog({
+        title: 'Release the lock?', body: 'Nothing will be saved. Other signers can then take their turn.', confirm: 'Release lock',
+      })) && api('release_lock', { id: t.id }),
+      'vote-unlock': async () => (await dialog({
+        title: 'Vote to force-unlock?',
+        body: `Only do this if ${esc(t.lock.name)} is not actually working on it. Their unsubmitted work will be lost.`,
+        confirm: 'Vote to unlock', danger: true,
+      })) && api('vote_unlock', { id: t.id }),
+      broadcast: async () => (await dialog({
+        title: 'Mark as broadcast?', body: 'Confirm the transaction was published to the Ergo network.', confirm: 'Mark as broadcast',
+      })) && api('mark_broadcast', { id: t.id }),
+      cancel: async () => {
+        const reason = await dialog({
+          title: 'Cancel this transaction?', body: 'Signers will no longer be able to work on it. This cannot be undone.',
+          confirm: 'Cancel transaction', cancel: 'Keep it', danger: true, input: { label: 'Reason (shown to all signers)', max: 255 },
+        });
+        if (reason === null) return null;
+        if (!reason) { toast('Give a short reason', 'error'); return null; }
+        return api('cancel_transaction', { id: t.id, reason });
+      },
+    };
+    if (!calls[action]) return;
+    btn.disabled = true;
+    try {
+      const r = await calls[action]();
+      if (r) {
+        S.detail = r.transaction;
+        S.txs = [];
+        drawDetail();
+        if (action === 'lock') { toast('Locked - it is your turn', 'success'); $('#action-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+      }
+    } catch (e) {
+      toast(e.message, 'error');
+      try { S.detail = (await api('get_transaction', { id: t.id })).transaction; drawDetail(); } catch (e2) { /* ignore */ }
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function checkChain(t) {
+    const el = $('#chain-status');
+    const base = S.config.explorer_api_url;
+    if (!el || !base) return;
+    try {
+      const res = await fetch(base + t.ergo_tx_id);
+      if (!document.body.contains(el)) return;
+      if (res.ok) {
+        const tx = await res.json();
+        el.className = 'notice notice-success small';
+        el.innerHTML = `Confirmed on-chain${tx.inclusionHeight ? ` at block ${esc(tx.inclusionHeight)}` : ''}${tx.numConfirmations ? ` · ${esc(tx.numConfirmations)} confirmations` : ''}.`;
+      } else if (res.status === 404) {
+        el.className = 'notice notice-warning small';
+        el.textContent = t.status === 'complete' ? 'Not on-chain yet.' : 'Not found on the explorer yet - it may still be in the mempool.';
+      } else throw new Error();
+    } catch (e) {
+      if (el) { el.className = 'notice small'; el.textContent = 'Could not reach the blockchain explorer.'; }
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // Signers (members)
+  // ------------------------------------------------------------------------
+  async function renderMembers() {
+    const view = shell('signers');
+    view.innerHTML = '<div class="loading">Loading…</div>';
+    let members;
+    try { members = (await api('list_members')).members; } catch (e) { view.innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`; return; }
+    drawMembers(members);
+  }
+
+  function drawMembers(members) {
+    const view = $('#view');
+    const admin = S.me.is_admin;
+    view.innerHTML = `
+      ${admin ? `
+        <form class="panel" id="member-form" novalidate>
+          <div class="panel-title"><h2>Add a signer</h2></div>
+          <div class="field-row">
+            <div><label for="m-address">Signing wallet address</label>
+              <input type="text" id="m-address" required autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="9…"></div>
+            <div><label for="m-name">Display name</label>
+              <input type="text" id="m-name" required maxlength="40" placeholder="e.g. qx"></div>
+          </div>
+          <div class="row mt-12">
+            <label class="check"><input type="checkbox" id="m-admin"> Admin (can manage signers)</label>
+            <span class="spacer"></span><button class="btn btn-primary" type="submit">Add signer</button>
+          </div>
+          <div id="m-error"></div>
+        </form>` : ''}
+      <section class="panel">
+        <div class="panel-title"><h2>Signers</h2><span class="faint small">${members.filter((m) => m.is_active).length} active</span></div>
+        <div class="table-wrap"><table class="list">
+          <thead><tr><th>Name</th><th>Address</th><th>Role</th><th>Last sign-in</th>${admin ? '<th></th>' : ''}</tr></thead>
+          <tbody>${members.map((m) => `
+            <tr class="${m.is_active ? '' : 'inactive'}">
+              <td><strong>${esc(m.display_name)}</strong>${m.id === S.me.id ? ' <span class="faint">(you)</span>' : ''}</td>
+              <td><code title="${esc(m.address)}">${esc(shortAddr(m.address))}</code>
+                <button type="button" class="btn btn-ghost btn-sm" data-copy="${esc(m.address)}" aria-label="Copy address">Copy</button></td>
+              <td>${m.is_active ? (m.is_admin ? 'Admin' : 'Signer') : 'Disabled'}</td>
+              <td>${m.last_login_at ? timeTag(m.last_login_at) : '<span class="faint">never</span>'}</td>
+              ${admin ? `<td class="nowrap">${m.env_admin ? '<span class="faint small">set in config</span>' : `
+                <button type="button" class="btn btn-sm" data-member="${m.id}" data-op="rename">Rename</button>
+                ${m.id !== S.me.id ? `
+                  <button type="button" class="btn btn-sm" data-member="${m.id}" data-op="admin">${m.is_admin ? 'Remove admin' : 'Make admin'}</button>
+                  <button type="button" class="btn btn-sm ${m.is_active ? 'btn-danger' : ''}" data-member="${m.id}" data-op="active">${m.is_active ? 'Disable' : 'Enable'}</button>` : ''}`}
+              </td>` : ''}
+            </tr>`).join('')}
+          </tbody>
+        </table></div>
+      </section>`;
+
+    if (!admin) return;
+    const save = async (params) => {
+      try {
+        const r = await api('save_member', params);
+        drawMembers(r.members);
+        toast('Saved', 'success');
+      } catch (e) { toast(e.message, 'error'); }
+    };
+    $('#member-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      try {
+        const r = await api('save_member', {
+          address: $('#m-address').value.replace(/\s+/g, ''), display_name: $('#m-name').value, is_admin: $('#m-admin').checked ? 1 : 0,
+        });
+        drawMembers(r.members);
+        toast('Signer added', 'success');
+      } catch (e) { $('#m-error').innerHTML = `<div class="notice notice-error mt-12">${esc(e.message)}</div>`; }
+    });
+    view.querySelectorAll('[data-member]').forEach((btn) => btn.addEventListener('click', async () => {
+      const m = members.find((x) => x.id === Number(btn.dataset.member));
+      const base = { id: m.id, display_name: m.display_name, is_admin: m.is_admin, is_active: m.is_active };
+      if (btn.dataset.op === 'rename') {
+        const name = await dialog({ title: `Rename ${m.display_name}`, confirm: 'Save', input: { label: 'Display name', max: 40 } });
+        if (name) save({ ...base, display_name: name });
+      } else if (btn.dataset.op === 'admin') {
+        save({ ...base, is_admin: m.is_admin ? 0 : 1 });
+      } else if (btn.dataset.op === 'active') {
+        if (m.is_active && !(await dialog({ title: `Disable ${m.display_name}?`, body: 'They will be signed out and cannot sign in until re-enabled. Their history is kept.', confirm: 'Disable', danger: true }))) return;
+        save({ ...base, is_active: m.is_active ? 0 : 1 });
+      }
+    }));
+  }
+
+  // ------------------------------------------------------------------------
+  // Activity (admins)
+  // ------------------------------------------------------------------------
+  async function renderActivity() {
+    const view = shell('activity');
+    view.innerHTML = '<div class="loading">Loading…</div>';
+    let events;
+    try { events = (await api('recent_events')).events; } catch (e) { view.innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`; return; }
+    view.innerHTML = `
+      <section class="panel">
+        <div class="panel-title"><h2>Recent activity</h2><span class="faint small">last 200 events</span></div>
+        <div class="table-wrap"><table class="list">
+          <thead><tr><th>When</th><th>Who</th><th>Event</th><th>Transaction</th><th>Detail</th><th>IP</th></tr></thead>
+          <tbody>${events.map((e) => `
+            <tr>
+              <td class="nowrap" title="${esc(fullDate(e.created_at))}">${esc(fullDate(e.created_at))}</td>
+              <td>${esc(e.member || '-')}</td>
+              <td><span class="tag">${esc(e.event)}</span></td>
+              <td>${e.transaction_id ? `<a href="#tx/${esc(e.transaction_id)}">#${esc(e.transaction_id)}</a>` : ''}</td>
+              <td class="small anywhere">${esc(e.detail)}</td>
+              <td class="small faint">${esc(e.ip)}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table></div>
+      </section>`;
+  }
+
+  // ------------------------------------------------------------------------
+  // Global wiring
+  // ------------------------------------------------------------------------
+  document.addEventListener('click', async (ev) => {
+    const nav = ev.target.closest('[data-nav]');
+    if (nav) {
+      ev.preventDefault();
+      const target = nav.dataset.nav === 'list' || nav.dataset.nav === 'sign' ? '' : nav.dataset.nav;
+      if (location.hash.replace(/^#/, '') === target) route();
+      else location.hash = target;
+      return;
+    }
+    const copy = ev.target.closest('[data-copy]');
+    if (copy) { copyText(copy.dataset.copy); return; }
+    const filter = ev.target.closest('[data-filter]');
+    if (filter) { S.filter = filter.dataset.filter; drawList(); return; }
+    if (ev.target.closest('#user-chip [data-action=logout]')) {
+      try { await api('logout'); } catch (e) { /* ignore */ }
+      S.me = null;
+      S.csrf = '';
+      S.txs = [];
+      renderSignIn();
+    }
+  });
+
+  window.addEventListener('hashchange', route);
+
+  async function init() {
+    try {
+      const r = await api('session');
+      if (r.signed_in) startSession(r);
+      else renderSignIn();
+    } catch (e) {
+      app().innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`;
+    }
+  }
+
+  init();
+})();

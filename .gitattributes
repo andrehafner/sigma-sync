@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.pl  text eol=lf
+*.pm  text eol=lf
+*.cgi text eol=lf
+*.py  text eol=lf
+*.sh  text eol=lf
+*.t   text eol=lf
