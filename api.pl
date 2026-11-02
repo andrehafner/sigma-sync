@@ -421,21 +421,50 @@ sub my_key_states {
     return \%s;
 }
 
-# Where the current account stands, from the state of its own key slots.
+# Rounds the current account has submitted in, per transaction: { tx_id => { commit => 1, ... } }
+sub my_rounds {
+    my ($tx_id) = @_;
+    my $rows = dbh()->selectall_arrayref(
+        'SELECT DISTINCT transaction_id, round FROM submissions WHERE member_id = ?'
+        . ($tx_id ? ' AND transaction_id = ?' : ''), undef, $ME->{id}, ($tx_id ? $tx_id : ()));
+    my %r;
+    $r{ $_->[0] }{ $_->[1] } = 1 for @$rows;
+    return \%r;
+}
+
+# Where the current account stands, from the state of its own key slots (and, for old
+# Minotaur formats that do not mark signatures per slot, its own submissions).
+# A commitment or signature, once given, is final: `can_act` is true only while the
+# account still owes the current round its step.
 sub my_progress {
-    my ($tx, $states) = @_;
+    my ($tx, $states, $rounds) = @_;
     my @s = @{ $states || [] };
+    $rounds ||= {};
     my %p = (
-        committed => (grep { $_ == 1 || $_ == 2 } @s) ? 1 : 0,
-        signed    => (grep { $_ == 2 } @s) ? 1 : 0,
+        committed => (grep { $_ == 1 || $_ == 2 } @s) || $rounds->{commit} ? 1 : 0,
+        signed    => (grep { $_ == 2 } @s) || $rounds->{sign} || $rounds->{final} ? 1 : 0,
     );
-    $p{awaiting} = ($tx->{status} eq 'commit' && !$p{committed} && grep { $_ == 0 } @s)
-                || ($tx->{status} eq 'sign' && grep { $_ == 1 } @s) ? 1 : 0;
+    $p{can_act} = ($tx->{status} eq 'commit' && !$p{committed} && grep { $_ == 0 } @s)
+               || ($tx->{status} eq 'sign' && $p{committed} && !$p{signed}) ? 1 : 0;
+    $p{awaiting} = $p{can_act};
     return \%p;
 }
 
+# Why the current account cannot take a turn, or undef if it can.
+sub turn_refusal {
+    my ($tx, $p) = @_;
+    return 'This transaction is no longer open for signing.' unless is_open($tx);
+    return undef if $p->{can_act};
+    if ($tx->{status} eq 'commit') {
+        return 'You have already committed. Your commitment is final - the next signers build on it.' if $p->{committed};
+        return 'None of your keys has an open commitment slot in this transaction.';
+    }
+    return 'You have already signed. Your signature is final.' if $p->{signed};
+    return 'Signing has started, and only signers who committed can sign. Commitments are closed.';
+}
+
 sub tx_brief {
-    my ($tx, $names, $states, $comment_count) = @_;
+    my ($tx, $names, $states, $comment_count, $rounds) = @_;
     return {
         id               => $tx->{id} + 0,
         title            => unseal($tx->{title_enc}, 'transaction.title'),
@@ -456,7 +485,7 @@ sub tx_brief {
                 mine => $tx->{lock_member_id} == $ME->{id} ? 1 : 0 }
             : undef,
         comments => $comment_count // 0,
-        me       => my_progress($tx, $states),
+        me       => my_progress($tx, $states, $rounds),
     };
 }
 
@@ -477,11 +506,12 @@ sub act_list_transactions {
             . ') GROUP BY transaction_id', undef, @ids) };
     }
     my $states = my_key_states();
+    my $rounds = my_rounds();
     my $names = member_names([ map { ($_->{created_by}, $_->{lock_member_id}) } @$txs ]);
     my %wallets;
     my @wallets = grep { length && !$wallets{$_}++ } map { $_->{wallet_name} } @$txs;
     return {
-        transactions => [ map { tx_brief($_, $names, $states->{ $_->{id} }, $comments{ $_->{id} }) } @$txs ],
+        transactions => [ map { tx_brief($_, $names, $states->{ $_->{id} }, $comments{ $_->{id} }, $rounds->{ $_->{id} }) } @$txs ],
         wallet_names => [ @wallets[0 .. ($#wallets < 19 ? $#wallets : 19)] ],
     };
 }
@@ -535,7 +565,7 @@ sub act_get_transaction {
     }
     @timeline = sort { $a->{at} cmp $b->{at} } @timeline;
 
-    my $brief = tx_brief($tx, $names, my_key_states($id)->{$id}, scalar @$comments);
+    my $brief = tx_brief($tx, $names, my_key_states($id)->{$id}, scalar @$comments, my_rounds($id)->{$id});
     $brief->{description} = unseal($tx->{description_enc}, 'transaction.description');
     $brief->{timeline}    = \@timeline;
     $brief->{signers}     = [ map { {
@@ -577,6 +607,7 @@ sub act_get_transaction {
     }
 
     $brief->{can} = {
+        lock      => !$tx->{lock_member_id} && !turn_refusal($tx, $brief->{me}) ? 1 : 0,
         cancel    => ($tx->{created_by} == $ME->{id} || $ME->{is_admin}) && $tx->{status} ne 'broadcast' && $tx->{status} ne 'cancelled' ? 1 : 0,
         broadcast => $tx->{status} eq 'complete' ? 1 : 0,
     };
@@ -746,6 +777,9 @@ sub insert_comment {
 sub act_lock {
     my $id = int_param('id');
     my $tx = load_tx($id);
+    if (my $why = turn_refusal($tx, my_progress($tx, my_key_states($id)->{$id}, my_rounds($id)->{$id}))) {
+        fail($why);
+    }
     my $n = dbh()->do(q{
         UPDATE transactions SET lock_member_id = ?, lock_seq = lock_seq + 1, locked_at = UTC_TIMESTAMP()
          WHERE id = ? AND lock_member_id IS NULL AND status IN ('commit','sign')
@@ -804,6 +838,7 @@ sub act_submit {
     fail('Lock the transaction before submitting.') unless ($tx->{lock_member_id} // 0) == $ME->{id};
 
     my ($a, $cmp) = check_payload($tx, $payload, latest_submission($id));
+    check_ownership($tx, $a, $cmp);
 
     my $required = $tx->{signers_required};
     my ($commits, $signatures, $round, $status);
@@ -827,6 +862,31 @@ sub act_submit {
     my $result = act_get_transaction();
     $result->{submitted} = { round => $round, status => $status, commits => $commits, signatures => $signatures };
     return $result;
+}
+
+# A submission may only add the submitter's own step for the current round: a
+# commitment in the commitment round, a signature in the signing round, in a slot
+# that belongs to one of the submitter's keys.
+sub check_ownership {
+    my ($tx, $a, $cmp) = @_;
+    if ($tx->{status} eq 'commit' && $a->{format} eq 'CSTX') {
+        fail('A fully signed transaction cannot be submitted during the commitment round.');
+    }
+    return unless $cmp;
+    if ($tx->{status} eq 'sign' && $cmp->{new_commits}) {
+        fail('Signing has started, so commitments are closed. Only signers who committed can sign.');
+    }
+    if ($tx->{status} eq 'commit' && $cmp->{new_signatures} && $a->{committed} < $tx->{signers_required}) {
+        fail('This adds a signature before enough commitments are in. Commit only, then submit.');
+    }
+    my $keys = $a->{input_keys} ? $a->{input_keys}[0] : undef;
+    return unless $keys && @{ $cmp->{slots} };    # old formats: slots cannot be attributed
+    my %mine = map { $_ => 1 } @{ my_pks() };
+    my @others = grep { !$mine{ $keys->[$_] // '' } } @{ $cmp->{slots} };
+    fail('This adds a ' . ($tx->{status} eq 'commit' ? 'commitment' : 'signature') . " for another signer's key. "
+       . 'Each signer submits their own - ask them to sign in and take their turn.') if @others;
+    fail('This adds more than one step at once. Submit only your own commitment or signature.')
+        if @{ $cmp->{slots} } > 1;
 }
 
 sub act_add_comment {

@@ -1095,13 +1095,23 @@
       <h2>${t.status === 'commit' ? 'Commitment round' : 'Signing round'}</h2>
       <p class="small muted">${needed} more ${round}${needed === 1 ? '' : 's'} needed.
       ${t.me.awaiting ? '<strong>It is your turn.</strong>' : t.me.signed ? 'You have signed.' : t.me.committed && t.status === 'commit' ? 'You have committed.' : ''}
-      ${t.status === 'sign' && !t.me.committed ? 'Only signers who committed can sign this round.' : ''}</p>`;
+      </p>`;
 
     if (!t.lock) {
+      if (!t.can.lock) {
+        const why = t.status === 'commit'
+          ? (t.me.committed ? 'Your commitment is in and final - the next signers build on it. Nothing more to do until signing starts.'
+            : 'None of your keys has an open commitment slot.')
+          : (t.me.signed ? 'Your signature is in and final.'
+            : t.me.committed ? '' : 'Commitments are closed, and only signers who committed can sign.');
+        const done = t.status === 'commit' ? t.me.committed : t.me.signed;
+        return `${header}<div class="lockbox"><p class="small">${done ? '<span class="tick">✓</span> ' : ''}${esc(why)}</p></div>`;
+      }
       return `${header}
         <div class="lockbox">
           <p class="small">Lock the transaction while you work so nobody else continues from the same request.
-          Submitting releases the lock automatically.</p>
+          Submitting releases the lock automatically. You can only add your own
+          ${t.status === 'commit' ? 'commitment' : 'signature'}, and once submitted it is final.</p>
           <button type="button" class="btn btn-primary btn-block" data-action="lock">Lock &amp; start my turn</button>
         </div>`;
     }
