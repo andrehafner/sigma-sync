@@ -10,15 +10,19 @@ a paste picks up a stray line break, and nobody is sure whose turn it is.
 
 Sigma Sync is a small web app that keeps one source of truth for each transaction:
 
-- **Wallet sign-in, no passwords.** You prove who you are by signing a one-time request with your
-  Minotaur signing wallet (QR code for air-gapped wallets, or copy/paste).
+- **Wallet sign-in, no passwords, no sign-up.** Anyone proves who they are by signing a one-time
+  request with their Minotaur signing wallet (QR code for air-gapped wallets, or copy/paste).
+- **You only see your own transactions.** Every multi-sig request lists the public keys of its
+  signers. A transaction is visible only to accounts holding one of those keys, so access follows
+  the wallet itself, not a list someone maintains.
 - **One signer at a time.** Lock a transaction, copy the latest request into Minotaur, paste your
   output back. Submitting releases the lock. If someone walks away, two other signers can vote to
   force-unlock it.
 - **Every paste is checked.** It must be the same Ergo transaction, keep every earlier
   commitment and signature, and add yours. A stale or wrong paste is refused with an explanation.
 - **Clear progress.** Cards show commitments and signatures against the M-of-N threshold, who
-  holds the lock, and what is waiting on you. Each transaction has a description, comments,
+  holds the lock, and what is waiting on you. Each signer key shows whether its owner has
+  committed or signed. Each transaction has a description, comments,
   and a full activity history.
 - **Review before you sign.** Outputs are decoded from the transaction itself (amounts,
   destination addresses, fee, change), so you can compare them with the description.
@@ -44,10 +48,26 @@ Sigma Sync is a small web app that keeps one source of truth for each transactio
    (`{"CSTX": ...}`) back.
 4. The server checks the signed transaction is exactly the one it issued and verifies the
    Schnorr signature against the address's public key (pure Perl: Blake2b-256, secp256k1 and
-   the Ergo Fiat-Shamir proof format; see [`ErgoKit.pm`](ErgoKit.pm)). If the address
-   belongs to an active signer, a session starts.
+   the Ergo Fiat-Shamir proof format; see [`ErgoKit.pm`](ErgoKit.pm)). The first sign-in creates
+   an account; you then pick the name your co-signers see.
 
-Only addresses an admin has added (or that are listed in `ADMIN_ADDRESSES`) can sign in.
+### Who sees what
+
+- When a transaction is started, Sigma Sync reads the signer public keys out of the transaction
+  (the `atLeast(M, keys)` proposition of each input) and stores them with it.
+- An account sees, locks, signs, comments on or cancels a transaction **only if one of its proven
+  addresses is one of those keys**. Anyone else gets "Transaction not found". Admins are no exception.
+- Only a signer of the wallet can start a transaction for it, and their own commitment must
+  already be in the request.
+- Minotaur derives each multi-sig key from every signer's wallet at the same address index, so a
+  multi-sig's first address uses each signer's first address. If you sign with several wallets,
+  or a multi-sig uses a later address, link those addresses on the **Account** tab (each one is
+  proven with its own signature).
+- Signers who have not signed in yet are listed as "Not on Sigma Sync yet"; the transaction appears
+  for them the moment they do.
+
+Admins (from `ADMIN_ADDRESSES`, or promoted by another admin) can disable accounts and read the
+audit log. That is all.
 
 ### Rounds and statuses
 

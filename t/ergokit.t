@@ -83,9 +83,9 @@ sub msr {
     my ($k, $n, $states, $seed) = @_;
     my $addr = '9f3AaAirSTGYKWqDcw8hEa4Pk4hYiS96VC3Kpcr7CKTuqTiwjCy';
     my $req  = build_login_request(address => $addr, nonce => "synthetic-tx-$seed-0123456789");
-    my $pk   = address_decode($addr)->{pk};
+    my @pks  = map { "\x02" . chr(0x10 + $_) x 32 } 0 .. $n - 1;    # distinct, already sorted
     my $reduced = ErgoKit::vlq(length $req->{message}) . $req->{message}
-                . "\x98" . chr($k) . ErgoKit::vlq($n) . (("\xcd" . $pk) x $n) . "\x00\x00";
+                . "\x98" . chr($k) . ErgoKit::vlq($n) . join('', map { "\xcd" . $_ } @pks) . "\x00\x00";
     my @row = map {
         my $s = $states->[$_];
         my $commit = "\x02" . chr($_) x 32;
@@ -108,6 +108,9 @@ sub msr {
     is($a->{committed}, 2, '... commitments');
     is($a->{signed}, 0, '... signatures');
     is_deeply($a->{slots}, [1, 0, 1, 0, 0], '... slot states');
+    is(scalar @{ $a->{input_keys}[0] }, 5, '... lists the signer keys of each input');
+    is_deeply($a->{input_keys}[0], [ sort @{ $a->{input_keys}[0] } ], '... in sorted (slot) order');
+    is(scalar(grep { $_ == 1 } values %{ $a->{key_states} }), 2, '... with a state per key');
     is($a->{outputs}[0]{address}, '9f3AaAirSTGYKWqDcw8hEa4Pk4hYiS96VC3Kpcr7CKTuqTiwjCy', '... decodes outputs');
 
     my $signing = analyze_payload((msr(3, 5, [2, 3, 2, 3, 1], 'a'))[0]);

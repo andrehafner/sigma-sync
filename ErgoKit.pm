@@ -457,14 +457,34 @@ sub _parse_reduced {
         die "context extensions are not supported\n" if _u8($m);
     }
 
-    # Threshold of the first input's proposition, e.g. atLeast(4, 7 keys).
-    my $op = _u8($r);
-    if ($op == 0x98) {
-        $tx{required} = _u8($r);
-        $tx{signers}  = _vlq($r);
-    } elsif ($op == 0xcd) {
-        @tx{qw(required signers)} = (1, 1);
+    # Each input's reduced proposition: a threshold atLeast(M, keys) for multi-sig boxes,
+    # or a single key. Keys are listed in sorted order, which is also the order of
+    # Minotaur's hint slots.
+    my @input_keys;
+    my $readable = 1;
+    for my $i (1 .. $n_in) {
+        my $op = _u8($r);
+        my @keys;
+        if ($op == 0x98) {
+            my $k = _u8($r);
+            my $n = _vlq($r);
+            for (1 .. $n) {
+                if (_u8($r) != 0xcd) { $readable = 0; last }
+                push @keys, unpack 'H*', _take($r, 33);
+            }
+            last unless $readable;
+            @tx{qw(required signers)} = ($k, $n) if $i == 1;
+        } elsif ($op == 0xcd) {
+            push @keys, unpack 'H*', _take($r, 33);
+            @tx{qw(required signers)} = (1, 1) if $i == 1;
+        } else {
+            $readable = 0;
+            last;
+        }
+        _vlq($r);    # cost
+        push @input_keys, [ sort @keys ];
     }
+    $tx{input_keys} = \@input_keys if $readable;
 
     # Outputs (best effort - stops quietly on layouts we do not decode).
     eval {
@@ -546,7 +566,8 @@ sub analyze_payload {
 
     my $tx = eval { _parse_reduced(decode_base64($d->{tx})) };
     unless ($tx) { $res{error} = 'The transaction inside the payload could not be read. It may be truncated.'; return \%res }
-    @res{qw(tx_id required signers outputs outputs_partial)} = @$tx{qw(tx_id required signers outputs outputs_partial)};
+    @res{qw(tx_id required signers outputs outputs_partial input_keys)}
+        = @$tx{qw(tx_id required signers outputs outputs_partial input_keys)};
 
     # Hints: current builds use "hints" (matrix input x signer slot); the oldest builds
     # used "commitments" + "signed".
@@ -564,6 +585,18 @@ sub analyze_payload {
         $signed    = $s if !defined $signed    || $s < $signed;
     }
     $res{slots} = [ map { _hint_state($_) } @{ $hints[0] || [] } ];
+
+    # State per signer key (hex): slot j of input i belongs to the j-th key of that input.
+    if ($res{input_keys}) {
+        my %state;
+        for my $i (0 .. $#{ $res{input_keys} }) {
+            my $keys = $res{input_keys}[$i];
+            for my $j (0 .. $#$keys) {
+                $state{ $keys->[$j] } //= _hint_state($hints[$i][$j]);
+            }
+        }
+        $res{key_states} = \%state;
+    }
     if (!exists $d->{hints} && ref $d->{signed} eq 'ARRAY') {
         $signed = scalar @{ $d->{signed} };
     }

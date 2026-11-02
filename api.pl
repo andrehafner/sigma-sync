@@ -3,6 +3,13 @@
 # Sigma Sync API - every request is a POST with an "action" field.
 # Responses: { "success": 1, ... } or { "success": 0, "error": "..." }.
 #
+# Access model
+#   * Anyone can create an account by signing a challenge with an Ergo wallet.
+#   * An account holds one or more proven wallet keys (member_keys).
+#   * A transaction's signer keys are read from the transaction itself
+#     (transaction_keys). An account can see and act on a transaction only if it
+#     holds one of those keys. There is no other way in - admins included.
+#
 use strict;
 use warnings;
 
@@ -14,7 +21,7 @@ use Digest::SHA qw(sha256_hex);
 use JSON::PP ();
 
 use AppConfig qw(cfg dbh seal unseal random_hex client_ip);
-use ErgoKit qw(address_decode build_login_request verify_login_response
+use ErgoKit qw(address_decode address_from_tree build_login_request verify_login_response
                sanitize_payload analyze_payload compare_hints);
 
 $CGI::POST_MAX = 4 * 1024 * 1024;
@@ -26,6 +33,11 @@ my ($ME, $SESSION);
 
 my %LIMIT = (title => 120, description => 10_000, comment => 4000, payload => 1_000_000,
              wallet => 80, name => 40);
+
+# A transaction is visible to the current account when it holds one of its signer keys.
+# Used as "... FROM transactions t WHERE ... AND $VISIBLE" with $ME->{id} bound.
+my $VISIBLE = q{EXISTS (SELECT 1 FROM transaction_keys tk JOIN member_keys mk ON mk.pk = tk.pk
+                         WHERE tk.transaction_id = t.id AND mk.member_id = ?)};
 
 # ---------------------------------------------------------------------------
 # Routing
@@ -48,11 +60,14 @@ my %MEMBER = (
     add_comment        => \&act_add_comment,
     cancel_transaction => \&act_cancel_transaction,
     mark_broadcast     => \&act_mark_broadcast,
-    list_members       => \&act_list_members,
+    get_account        => \&act_get_account,
+    update_account     => \&act_update_account,
+    unlink_address     => \&act_unlink_address,
 );
 my %ADMIN = (
-    save_member   => \&act_save_member,
-    recent_events => \&act_recent_events,
+    admin_members  => \&act_admin_members,
+    admin_update   => \&act_admin_update,
+    recent_events  => \&act_recent_events,
 );
 
 my $response = eval {
@@ -113,14 +128,12 @@ sub log_event {
         substr($detail // '', 0, 255), client_ip());
 }
 
-sub cookie_path { return cfg('COOKIE_PATH', '/apps/sigmasync/') }
-
 sub session_cookie {
     my ($value, $expires) = @_;
     return $cgi->cookie(
         -name     => 'sigmasync_sid',
         -value    => $value,
-        -path     => cookie_path(),
+        -path     => cfg('COOKIE_PATH', '/apps/sigmasync/'),
         -expires  => $expires,
         -secure   => cfg('COOKIE_SECURE', '1') eq '1' ? 1 : 0,
         -httponly => 1,
@@ -132,22 +145,43 @@ sub admin_addresses {
     return map { s/^\s+|\s+$//gr } grep { length } split /,/, cfg('ADMIN_ADDRESSES', '');
 }
 
+sub member_addresses {
+    my ($member_id) = @_;
+    return dbh()->selectcol_arrayref('SELECT address FROM member_keys WHERE member_id = ? ORDER BY id', undef, $member_id);
+}
+
+sub is_env_admin {
+    my ($addresses) = @_;
+    my %env = map { $_ => 1 } admin_addresses();
+    return (grep { $env{$_} } @$addresses) ? 1 : 0;
+}
+
 sub load_session {
     return if $SESSION;
     my $token = $cgi->cookie('sigmasync_sid') // '';
     return unless $token =~ /^[0-9a-f]{64}$/;
     my $idle = cfg('SESSION_IDLE_MINUTES', 120) + 0;
     my $row = dbh()->selectrow_hashref(q{
-        SELECT s.id AS session_id, s.csrf_token, m.id, m.address, m.display_name, m.is_admin
+        SELECT s.id AS session_id, s.csrf_token, m.id, m.display_name, m.name_chosen, m.is_admin
           FROM sessions s JOIN members m ON m.id = s.member_id
          WHERE s.token_hash = ? AND s.expires_at > UTC_TIMESTAMP()
            AND s.last_seen_at > UTC_TIMESTAMP() - INTERVAL ? MINUTE
            AND m.is_active = 1
     }, undef, sha256_hex($token), $idle) or return;
-    $row->{is_admin} = 1 if grep { $_ eq $row->{address} } admin_addresses();
     dbh()->do('UPDATE sessions SET last_seen_at = UTC_TIMESTAMP() WHERE id = ?', undef, $row->{session_id});
     $SESSION = $row;
-    $ME = { map { $_ => $row->{$_} } qw(id address display_name is_admin) };
+    $ME = load_member($row->{id});
+}
+
+sub load_member {
+    my ($id) = @_;
+    my $m = dbh()->selectrow_hashref('SELECT id, display_name, name_chosen, is_admin, is_active FROM members WHERE id = ?', undef, $id)
+        or return;
+    $m->{addresses} = member_addresses($id);
+    $m->{env_admin} = is_env_admin($m->{addresses});
+    $m->{is_admin}  = 1 if $m->{env_admin};
+    $m->{$_} += 0 for qw(id name_chosen is_admin is_active);
+    return $m;
 }
 
 sub require_member {
@@ -158,7 +192,10 @@ sub require_member {
         unless length $csrf && $csrf eq $SESSION->{csrf_token};
 }
 
-sub public_member { my $m = shift; return { map { $_ => $m->{$_} } qw(id address display_name is_admin) } }
+sub public_member {
+    my ($m) = @_;
+    return { map { $_ => $m->{$_} } qw(id display_name name_chosen is_admin addresses) };
+}
 
 sub client_config {
     return {
@@ -169,8 +206,18 @@ sub client_config {
     };
 }
 
+sub valid_address {
+    my ($address) = @_;
+    my $info = address_decode($address);
+    fail('That is not a valid Ergo address.') unless $info;
+    fail('Use the regular (P2PK) address of your signing wallet, not a multi-sig or contract address.')
+        unless $info->{type} eq 'P2PK';
+    fail("Use a $info->{network} address.") if $info->{network} ne cfg('NETWORK', 'mainnet');
+    return $info;
+}
+
 # ---------------------------------------------------------------------------
-# Sign-in
+# Sign-in and address linking
 # ---------------------------------------------------------------------------
 sub act_session {
     load_session();
@@ -179,13 +226,17 @@ sub act_session {
              config => client_config() };
 }
 
+# purpose=login (default) starts a sign-in; purpose=link (signed in) proves an extra address.
 sub act_auth_start {
     my $address = param('address') =~ s/\s+//gr;
-    my $info = address_decode($address);
-    fail('That is not a valid Ergo address.') unless $info;
-    fail('Use the regular (P2PK) address of your signing wallet, not a multi-sig or contract address.')
-        unless $info->{type} eq 'P2PK';
-    fail("Use a $info->{network} address.") if $info->{network} ne cfg('NETWORK', 'mainnet');
+    my $link = param('purpose') eq 'link';
+    if ($link) {
+        require_member();
+        my ($owner) = dbh()->selectrow_array('SELECT member_id FROM member_keys WHERE address = ?', undef, $address);
+        fail('That address is already linked to your account.') if $owner && $owner == $ME->{id};
+        fail('That address is already linked to another account.') if $owner;
+    }
+    valid_address($address);
 
     my $db = dbh();
     $db->do('DELETE FROM auth_challenges WHERE expires_at < UTC_TIMESTAMP() - INTERVAL 1 DAY');
@@ -197,9 +248,10 @@ sub act_auth_start {
     my $token = random_hex(32);
     my $req = build_login_request(address => $address, nonce => pack('H*', random_hex(32)));
     my $ttl = cfg('CHALLENGE_MINUTES', 15) + 0;
-    $db->do(q{INSERT INTO auth_challenges (token_hash, address, message_hex, ip, expires_at)
-              VALUES (?,?,?,?, UTC_TIMESTAMP() + INTERVAL ? MINUTE)},
-        undef, sha256_hex($token), $address, unpack('H*', $req->{message}), client_ip(), $ttl);
+    $db->do(q{INSERT INTO auth_challenges (token_hash, address, member_id, message_hex, ip, expires_at)
+              VALUES (?,?,?,?,?, UTC_TIMESTAMP() + INTERVAL ? MINUTE)},
+        undef, sha256_hex($token), $address, ($link ? $ME->{id} : undef), unpack('H*', $req->{message}),
+        client_ip(), $ttl);
 
     return { challenge => $token, request => $req->{request}, expires_minutes => $ttl };
 }
@@ -209,36 +261,54 @@ sub act_auth_finish {
     fail('Sign-in request not found. Start again.') unless $token =~ /^[0-9a-f]{64}$/;
     my $db = dbh();
     my $ch = $db->selectrow_hashref(q{
-        SELECT id, address, message_hex FROM auth_challenges
+        SELECT id, address, member_id, message_hex FROM auth_challenges
          WHERE token_hash = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()
     }, undef, sha256_hex($token));
-    fail('This sign-in request has expired or was already used. Start again.') unless $ch;
+    fail('This request has expired or was already used. Start again.') unless $ch;
 
     my $response = param('response');
     fail('Paste the signed result from Minotaur.') unless length $response;
-    fail('That is far too long to be a sign-in response.') if length $response > 200_000;
+    fail('That is far too long to be a signed result.') if length $response > 200_000;
 
     my $info = address_decode($ch->{address});
     my ($ok, $why) = verify_login_response(
         response => $response, expected_message => pack('H*', $ch->{message_hex}), pk => $info->{pk});
     unless ($ok) {
-        # A wrong paste (e.g. the request itself) should not burn the challenge.
+        # A wrong paste (e.g. the request itself) does not burn the challenge.
         log_event('login_failed', "$ch->{address}: $why");
         fail($why);
     }
     $db->do('UPDATE auth_challenges SET used_at = UTC_TIMESTAMP() WHERE id = ? AND used_at IS NULL', undef, $ch->{id}) > 0
-        or fail('This sign-in request was already used. Start again.');
+        or fail('This request was already used. Start again.');
+    my $pk_hex = unpack 'H*', $info->{pk};
 
-    my $member = $db->selectrow_hashref('SELECT * FROM members WHERE address = ?', undef, $ch->{address});
-    if (!$member && grep { $_ eq $ch->{address} } admin_addresses()) {
-        $db->do('INSERT INTO members (address, display_name, is_admin) VALUES (?,?,1)',
-            undef, $ch->{address}, 'Admin ' . substr($ch->{address}, 0, 6));
-        $member = $db->selectrow_hashref('SELECT * FROM members WHERE address = ?', undef, $ch->{address});
+    # Linking an extra address to the signed-in account.
+    if ($ch->{member_id}) {
+        require_member();
+        fail('This request belongs to another session. Start again.') unless $ch->{member_id} == $ME->{id};
+        my ($owner) = $db->selectrow_array('SELECT member_id FROM member_keys WHERE pk = ?', undef, $pk_hex);
+        fail('That address is already linked to another account.') if $owner && $owner != $ME->{id};
+        $db->do('INSERT IGNORE INTO member_keys (member_id, address, pk) VALUES (?,?,?)', undef, $ME->{id}, $ch->{address}, $pk_hex);
+        log_event('address_linked', $ch->{address});
+        return { linked => $ch->{address}, member => public_member(load_member($ME->{id})) };
     }
-    unless ($member && $member->{is_active}) {
-        log_event('login_denied', $ch->{address});
-        fail('Signature verified, but this wallet is not a registered signer. Send your address to an admin to be added.',
-            { verified_address => $ch->{address} });
+
+    # Sign-in: find the account holding this key, or create one.
+    my ($member_id) = $db->selectrow_array('SELECT member_id FROM member_keys WHERE pk = ?', undef, $pk_hex);
+    my $created = 0;
+    unless ($member_id) {
+        $db->begin_work;
+        $db->do('INSERT INTO members (display_name) VALUES (?)', undef, 'Signer ' . substr($ch->{address}, 0, 8));
+        $member_id = $db->last_insert_id(undef, undef, 'members', 'id');
+        $db->do('INSERT INTO member_keys (member_id, address, pk) VALUES (?,?,?)', undef, $member_id, $ch->{address}, $pk_hex);
+        $db->commit;
+        $created = 1;
+        log_event('account_created', $ch->{address}, undef, $member_id);
+    }
+    my $member = load_member($member_id);
+    unless ($member->{is_active}) {
+        log_event('login_denied', $ch->{address}, undef, $member_id);
+        fail('This account has been disabled. Contact an administrator if you think this is a mistake.');
     }
 
     my $session = random_hex(32);
@@ -247,13 +317,13 @@ sub act_auth_finish {
     $db->do('DELETE FROM sessions WHERE expires_at < UTC_TIMESTAMP()');
     $db->do(q{INSERT INTO sessions (token_hash, csrf_token, member_id, ip, expires_at)
               VALUES (?,?,?,?, UTC_TIMESTAMP() + INTERVAL ? HOUR)},
-        undef, sha256_hex($session), $csrf, $member->{id}, client_ip(), $hours);
-    $db->do('UPDATE members SET last_login_at = UTC_TIMESTAMP() WHERE id = ?', undef, $member->{id});
+        undef, sha256_hex($session), $csrf, $member_id, client_ip(), $hours);
+    $db->do('UPDATE members SET last_login_at = UTC_TIMESTAMP() WHERE id = ?', undef, $member_id);
     push @cookies, session_cookie($session, "+${hours}h");
 
-    $member->{is_admin} = 1 if grep { $_ eq $member->{address} } admin_addresses();
-    log_event('login', '', undef, $member->{id});
-    return { signed_in => 1, member => public_member($member), csrf => $csrf, config => client_config() };
+    log_event('login', $ch->{address}, undef, $member_id);
+    return { signed_in => 1, created => $created, member => public_member($member), csrf => $csrf,
+             config => client_config() };
 }
 
 sub act_logout {
@@ -267,12 +337,54 @@ sub act_logout {
 }
 
 # ---------------------------------------------------------------------------
+# Account
+# ---------------------------------------------------------------------------
+sub act_get_account {
+    my $keys = dbh()->selectall_arrayref(q{
+        SELECT mk.address, mk.created_at,
+               (SELECT COUNT(DISTINCT tk.transaction_id) FROM transaction_keys tk WHERE tk.pk = mk.pk) AS transactions
+          FROM member_keys mk WHERE mk.member_id = ? ORDER BY mk.id}, { Slice => {} }, $ME->{id});
+    $_->{transactions} += 0 for @$keys;
+    return { member => public_member($ME), addresses => $keys };
+}
+
+sub name_param {
+    my $name = clean_text(param('display_name'), $LIMIT{name}, 'Name');
+    fail('Use 2 to 40 characters for your name.') if length $name < 2;
+    return $name;
+}
+
+sub act_update_account {
+    my $name = name_param();
+    my ($taken) = dbh()->selectrow_array(
+        'SELECT id FROM members WHERE LOWER(display_name) = LOWER(?) AND id <> ?', undef, $name, $ME->{id});
+    fail('That name is already in use. Pick another so co-signers can tell you apart.') if $taken;
+    dbh()->do('UPDATE members SET display_name = ?, name_chosen = 1 WHERE id = ?', undef, $name, $ME->{id});
+    log_event('name_changed', $name);
+    $ME = load_member($ME->{id});
+    return act_get_account();
+}
+
+sub act_unlink_address {
+    my $address = param('address');
+    my $n = dbh()->selectrow_array('SELECT COUNT(*) FROM member_keys WHERE member_id = ?', undef, $ME->{id});
+    fail('You cannot remove your only address.') if $n <= 1;
+    dbh()->do('DELETE FROM member_keys WHERE member_id = ? AND address = ?', undef, $ME->{id}, $address) > 0
+        or fail('That address is not linked to your account.');
+    log_event('address_unlinked', $address);
+    $ME = load_member($ME->{id});
+    return act_get_account();
+}
+
+# ---------------------------------------------------------------------------
 # Transactions
 # ---------------------------------------------------------------------------
 sub load_tx {
     my ($id, $for_update) = @_;
-    my $sql = 'SELECT * FROM transactions WHERE id = ?' . ($for_update ? ' FOR UPDATE' : '');
-    my $tx = dbh()->selectrow_hashref($sql, undef, $id) or fail('Transaction not found.');
+    my $tx = dbh()->selectrow_hashref(
+        "SELECT t.* FROM transactions t WHERE t.id = ? AND $VISIBLE" . ($for_update ? ' FOR UPDATE' : ''),
+        undef, $id, $ME->{id});
+    fail('Transaction not found.') unless $tx;    # same answer whether it exists or not
     return $tx;
 }
 
@@ -287,21 +399,43 @@ sub latest_submission {
 sub is_open { return $_[0]{status} eq 'commit' || $_[0]{status} eq 'sign' }
 
 sub member_names {
-    my $rows = dbh()->selectall_arrayref('SELECT id, display_name FROM members', { Slice => {} });
+    my ($ids) = @_;
+    my %seen;
+    my @ids = grep { defined && !$seen{$_}++ } @$ids;
+    return {} unless @ids;
+    my $rows = dbh()->selectall_arrayref(
+        'SELECT id, display_name FROM members WHERE id IN (' . join(',', ('?') x @ids) . ')',
+        { Slice => {} }, @ids);
     return { map { $_->{id} => $_->{display_name} } @$rows };
 }
 
-# Where a member stands on a transaction: did they commit / sign, is it their turn?
+# Slot states of the current account's keys, per transaction: { tx_id => [state, ...] }
+sub my_key_states {
+    my ($tx_id) = @_;
+    my $rows = dbh()->selectall_arrayref(q{
+        SELECT tk.transaction_id, tk.state FROM transaction_keys tk JOIN member_keys mk ON mk.pk = tk.pk
+         WHERE mk.member_id = ?} . ($tx_id ? ' AND tk.transaction_id = ?' : ''),
+        undef, $ME->{id}, ($tx_id ? $tx_id : ()));
+    my %s;
+    push @{ $s{ $_->[0] } }, $_->[1] for @$rows;
+    return \%s;
+}
+
+# Where the current account stands, from the state of its own key slots.
 sub my_progress {
-    my ($tx, $mine) = @_;
-    my %p = (committed => $mine->{commit} ? 1 : 0, signed => $mine->{sign} || $mine->{final} ? 1 : 0);
-    $p{awaiting} = ($tx->{status} eq 'commit' && !$p{committed})
-                || ($tx->{status} eq 'sign' && $p{committed} && !$p{signed}) ? 1 : 0;
+    my ($tx, $states) = @_;
+    my @s = @{ $states || [] };
+    my %p = (
+        committed => (grep { $_ == 1 || $_ == 2 } @s) ? 1 : 0,
+        signed    => (grep { $_ == 2 } @s) ? 1 : 0,
+    );
+    $p{awaiting} = ($tx->{status} eq 'commit' && !$p{committed} && grep { $_ == 0 } @s)
+                || ($tx->{status} eq 'sign' && grep { $_ == 1 } @s) ? 1 : 0;
     return \%p;
 }
 
 sub tx_brief {
-    my ($tx, $names, $mine, $comment_count) = @_;
+    my ($tx, $names, $states, $comment_count) = @_;
     return {
         id               => $tx->{id} + 0,
         title            => unseal($tx->{title_enc}, 'transaction.title'),
@@ -309,46 +443,46 @@ sub tx_brief {
         minotaur_version => $tx->{minotaur_version},
         status           => $tx->{status},
         signers_required => $tx->{signers_required} + 0,
-        signers_total    => defined $tx->{signers_total} ? $tx->{signers_total} + 0 : undef,
+        signers_total    => $tx->{signers_total} + 0,
         commits          => $tx->{commits} + 0,
         signatures       => $tx->{signatures} + 0,
         ergo_tx_id       => $tx->{ergo_tx_id},
         created_by       => $names->{ $tx->{created_by} },
-        created_by_id    => $tx->{created_by} + 0,
         created_at       => $tx->{created_at},
         updated_at       => $tx->{updated_at},
         closed_at        => $tx->{closed_at},
         lock             => $tx->{lock_member_id}
-            ? { member_id => $tx->{lock_member_id} + 0, name => $names->{ $tx->{lock_member_id} },
-                since => $tx->{locked_at}, mine => $tx->{lock_member_id} == $ME->{id} ? 1 : 0 }
+            ? { name => $names->{ $tx->{lock_member_id} }, since => $tx->{locked_at},
+                mine => $tx->{lock_member_id} == $ME->{id} ? 1 : 0 }
             : undef,
         comments => $comment_count // 0,
-        me       => my_progress($tx, $mine || {}),
+        me       => my_progress($tx, $states),
     };
 }
 
 sub act_list_transactions {
     my $db = dbh();
-    my $txs = $db->selectall_arrayref(q{
-        SELECT * FROM transactions
-         WHERE status IN ('commit','sign','complete')
-            OR closed_at > UTC_TIMESTAMP() - INTERVAL 180 DAY
-         ORDER BY FIELD(status,'commit','sign','complete','broadcast','cancelled'), updated_at DESC
+    my $txs = $db->selectall_arrayref(qq{
+        SELECT t.* FROM transactions t
+         WHERE $VISIBLE
+           AND (t.status IN ('commit','sign','complete') OR t.closed_at > UTC_TIMESTAMP() - INTERVAL 180 DAY)
+         ORDER BY FIELD(t.status,'commit','sign','complete','broadcast','cancelled'), t.updated_at DESC
          LIMIT 500
-    }, { Slice => {} });
-    my %mine;
-    for my $r (@{ $db->selectall_arrayref(
-        'SELECT DISTINCT transaction_id, round FROM submissions WHERE member_id = ?', undef, $ME->{id}) }) {
-        $mine{ $r->[0] }{ $r->[1] } = 1;
+    }, { Slice => {} }, $ME->{id});
+    my @ids = map { $_->{id} } @$txs;
+    my %comments;
+    if (@ids) {
+        %comments = map { $_->[0] => $_->[1] } @{ $db->selectall_arrayref(
+            'SELECT transaction_id, COUNT(*) FROM comments WHERE transaction_id IN (' . join(',', ('?') x @ids)
+            . ') GROUP BY transaction_id', undef, @ids) };
     }
-    my %comments = map { $_->[0] => $_->[1] } @{ $db->selectall_arrayref(
-        'SELECT transaction_id, COUNT(*) FROM comments GROUP BY transaction_id') };
-    my $names = member_names();
-    my $wallets = $db->selectcol_arrayref(
-        q{SELECT wallet_name FROM transactions WHERE wallet_name <> '' GROUP BY wallet_name ORDER BY MAX(id) DESC LIMIT 20});
+    my $states = my_key_states();
+    my $names = member_names([ map { ($_->{created_by}, $_->{lock_member_id}) } @$txs ]);
+    my %wallets;
+    my @wallets = grep { length && !$wallets{$_}++ } map { $_->{wallet_name} } @$txs;
     return {
-        transactions => [ map { tx_brief($_, $names, $mine{ $_->{id} }, $comments{ $_->{id} }) } @$txs ],
-        wallet_names => $wallets,
+        transactions => [ map { tx_brief($_, $names, $states->{ $_->{id} }, $comments{ $_->{id} }) } @$txs ],
+        wallet_names => [ @wallets[0 .. ($#wallets < 19 ? $#wallets : 19)] ],
     };
 }
 
@@ -356,10 +490,9 @@ sub act_get_transaction {
     my $id = int_param('id');
     my $db = dbh();
     my $tx = load_tx($id);
-    my $names = member_names();
 
     my $subs = $db->selectall_arrayref(
-        'SELECT id, member_id, round, payload_sha256, commits, signatures, slot_index, created_at FROM submissions WHERE transaction_id = ? ORDER BY id',
+        'SELECT id, member_id, round, payload_sha256, commits, signatures, created_at FROM submissions WHERE transaction_id = ? ORDER BY id',
         { Slice => {} }, $id);
     my $comments = $db->selectall_arrayref(
         'SELECT id, member_id, submission_id, body_enc, created_at FROM comments WHERE transaction_id = ? ORDER BY id',
@@ -368,15 +501,18 @@ sub act_get_transaction {
         SELECT id, member_id, event, detail, created_at FROM events
          WHERE transaction_id = ? AND event IN ('lock','release','unlock_vote','lock_override','cancel','broadcast')
          ORDER BY id}, { Slice => {} }, $id);
+    my $votes = $tx->{lock_member_id} ? $db->selectall_arrayref(
+        'SELECT member_id, created_at FROM unlock_votes WHERE transaction_id = ? AND lock_seq = ? ORDER BY created_at',
+        { Slice => {} }, $id, $tx->{lock_seq}) : [];
 
-    my %mine;
-    my %participants;
-    for my $s (@$subs) {
-        $mine{ $s->{round} } = 1 if $s->{member_id} == $ME->{id};
-        my $p = $participants{ $s->{member_id} } ||= { member_id => $s->{member_id} + 0, name => $names->{ $s->{member_id} } };
-        $p->{ $s->{round} eq 'commit' ? 'committed_at' : 'signed_at' } //= $s->{created_at};
-        $p->{slot} //= $s->{slot_index};
-    }
+    # The signers of this transaction: every key, whether or not its owner uses Sigma Sync.
+    my $keys = $db->selectall_arrayref(q{
+        SELECT tk.pk, tk.slot, tk.state, mk.member_id, mk.address
+          FROM transaction_keys tk LEFT JOIN member_keys mk ON mk.pk = tk.pk
+         WHERE tk.transaction_id = ? ORDER BY tk.slot}, { Slice => {} }, $id);
+
+    my $names = member_names([ $tx->{created_by}, $tx->{lock_member_id},
+        map { $_->{member_id} } @$subs, @$comments, @$events, @$votes, @$keys ]);
 
     my @timeline;
     my %comment_for = map { $_->{submission_id} ? ($_->{submission_id} => $_) : () } @$comments;
@@ -399,37 +535,37 @@ sub act_get_transaction {
     }
     @timeline = sort { $a->{at} cmp $b->{at} } @timeline;
 
-    my $brief = tx_brief($tx, $names, \%mine, scalar @$comments);
+    my $brief = tx_brief($tx, $names, my_key_states($id)->{$id}, scalar @$comments);
     $brief->{description} = unseal($tx->{description_enc}, 'transaction.description');
     $brief->{timeline}    = \@timeline;
-    $brief->{participants} = [ sort { ($a->{committed_at} // '9') cmp ($b->{committed_at} // '9') } values %participants ];
+    $brief->{signers}     = [ map { {
+        slot    => $_->{slot} + 0,
+        state   => $_->{state} + 0,
+        name    => $_->{member_id} ? $names->{ $_->{member_id} } : undef,
+        address => $_->{address} // address_from_tree("\x00\x08\xcd" . pack('H*', $_->{pk}), cfg('NETWORK', 'mainnet')),
+        mine    => ($_->{member_id} // 0) == $ME->{id} ? 1 : 0,
+    } } @$keys ];
 
-    # Override votes for the current lock.
     if ($tx->{lock_member_id}) {
-        my $votes = $db->selectall_arrayref(
-            'SELECT member_id, created_at FROM unlock_votes WHERE transaction_id = ? AND lock_seq = ? ORDER BY created_at',
-            { Slice => {} }, $id, $tx->{lock_seq});
         $brief->{lock}{votes} = [ map { { name => $names->{ $_->{member_id} }, at => $_->{created_at},
                                           mine => $_->{member_id} == $ME->{id} ? 1 : 0 } } @$votes ];
         my ($age) = $db->selectrow_array('SELECT TIMESTAMPDIFF(MINUTE, locked_at, UTC_TIMESTAMP()) FROM transactions WHERE id = ?', undef, $id);
         $brief->{lock}{age_minutes} = $age + 0;
     }
 
-    # Review data from the latest payload: what the transaction does, and the current
-    # slot picture. The payload text itself is only handed to the lock holder (to
-    # continue from it) or once the transaction is complete (to broadcast it).
+    # What the transaction does, decoded from the latest payload. The payload text itself
+    # is only handed to the lock holder (to continue from it) or once the transaction is
+    # complete (to broadcast it).
     my $latest = latest_submission($id);
     if ($latest) {
         my $a = analyze_payload($latest->{payload});
         $brief->{review} = {
-            format       => $a->{format},
-            outputs      => $a->{outputs},
+            format          => $a->{format},
+            outputs         => $a->{outputs},
             outputs_partial => $a->{outputs_partial} ? 1 : 0,
-            inputs_value => $a->{inputs_value},
-            slots        => $a->{slots},
+            inputs_value    => $a->{inputs_value},
         };
-        my $show = ($brief->{lock} && $brief->{lock}{mine}) || $tx->{status} eq 'complete' || $tx->{status} eq 'broadcast';
-        if ($show) {
+        if (($brief->{lock} && $brief->{lock}{mine}) || $tx->{status} eq 'complete' || $tx->{status} eq 'broadcast') {
             $brief->{payload} = {
                 text        => $latest->{payload},
                 type        => $a->{format},
@@ -441,8 +577,7 @@ sub act_get_transaction {
     }
 
     $brief->{can} = {
-        lock   => is_open($tx) && !$tx->{lock_member_id} ? 1 : 0,
-        cancel => ($tx->{created_by} == $ME->{id} || $ME->{is_admin}) && ($tx->{status} ne 'broadcast' && $tx->{status} ne 'cancelled') ? 1 : 0,
+        cancel    => ($tx->{created_by} == $ME->{id} || $ME->{is_admin}) && $tx->{status} ne 'broadcast' && $tx->{status} ne 'cancelled' ? 1 : 0,
         broadcast => $tx->{status} eq 'complete' ? 1 : 0,
     };
     return { transaction => $brief };
@@ -454,13 +589,7 @@ sub act_get_transaction {
 sub check_payload {
     my ($tx, $payload, $latest) = @_;
     my $a = analyze_payload($payload);
-    my $generic = $tx && !$tx->{ergo_tx_id};
-
-    if (!$generic) {
-        fail($a->{error}) unless $a->{valid};
-    }
-    return ($a, undef) if $generic || !$tx;
-
+    fail($a->{error}) unless $a->{valid};
     if ($a->{tx_id} && $a->{tx_id} ne $tx->{ergo_tx_id}) {
         fail('This payload belongs to a different Ergo transaction (ID ' . substr($a->{tx_id}, 0, 10)
            . '...). Make sure you opened the request from this page in Minotaur.');
@@ -496,10 +625,34 @@ sub payload_param {
     return $p;
 }
 
+# Signer keys of a transaction (hex), in display order: sorted and de-duplicated.
+sub tx_keys {
+    my ($a) = @_;
+    my %seen;
+    return [ grep { !$seen{$_}++ } sort map { @$_ } @{ $a->{input_keys} || [] } ];
+}
+
+sub my_pks {
+    return dbh()->selectcol_arrayref('SELECT pk FROM member_keys WHERE member_id = ?', undef, $ME->{id});
+}
+
+sub update_key_states {
+    my ($tx_id, $a) = @_;
+    my $states = $a->{key_states} or return;
+    my $sth = dbh()->prepare('UPDATE transaction_keys SET state = ? WHERE transaction_id = ? AND pk = ?');
+    $sth->execute($states->{$_}, $tx_id, $_) for keys %$states;
+}
+
 sub act_analyze {
     my $payload = sanitize_payload(param('payload'));
     my $a = analyze_payload($payload);
-    my %out = map { $_ => $a->{$_} } qw(format valid error warning tx_id required signers committed signed slots outputs outputs_partial inputs_value);
+    my %out = map { $_ => $a->{$_} } qw(format valid error warning tx_id required signers committed signed outputs outputs_partial inputs_value);
+    if ($a->{input_keys}) {
+        my %mine = map { $_ => 1 } @{ my_pks() };
+        my @my_keys = grep { $mine{$_} } @{ tx_keys($a) };
+        $out{is_signer} = @my_keys ? 1 : 0;
+        $out{my_committed} = (grep { ($a->{key_states}{$_} // 0) =~ /^[12]$/ } @my_keys) ? 1 : 0;
+    }
     my $tx_id = param('id');
     if ($tx_id =~ /^\d+$/ && length $payload) {
         my $tx = load_tx($tx_id);
@@ -513,60 +666,74 @@ sub act_analyze {
 sub version_param {
     my $v = param('minotaur_version');
     fail('Choose the Minotaur version everyone should use.')
-        unless $v =~ /^(?:[a-z]+-)?v?\d+(?:\.\d+){1,3}(?:-[\w.]+)?$|^other$/;
+        unless $v =~ /^(?:[a-z]+-)?v?\d+(?:\.\d+){1,3}(?:-[\w.]+)?$/;
     return $v;
 }
 
 sub act_create_transaction {
     my $title = clean_text(param('title'), $LIMIT{title}, 'Title');
     fail('Give the transaction a name.') unless length $title;
-    my $desc   = clean_text(param('description'), $LIMIT{description}, 'Description', 1);
-    my $wallet = clean_text(param('wallet_name'), $LIMIT{wallet}, 'Wallet name');
+    my $desc    = clean_text(param('description'), $LIMIT{description}, 'Description', 1);
+    my $wallet  = clean_text(param('wallet_name'), $LIMIT{wallet}, 'Wallet name');
     my $version = version_param();
     my $required = param('signers_required');
     fail('Set how many signatures are required (1-50).') unless $required =~ /^\d{1,2}$/ && $required >= 1 && $required <= 50;
     my $comment = clean_text(param('comment'), $LIMIT{comment}, 'Comment', 1);
     my $payload = payload_param();
 
-    my ($ergo_tx_id, $total, $commits) = (undef, undef, 1);
-    if ($version ne 'other' || $payload =~ /^\{/) {
-        my $a = analyze_payload($payload);
-        fail($a->{error}) unless $a->{valid};
-        fail('Start a transaction with the multi-sig request (MSR) from Minotaur, after you have committed.')
-            unless $a->{format} eq 'MSR';
-        fail('This request has no commitment yet. In Minotaur, press Commit first, then copy the new request.')
-            unless $a->{committed};
-        if ($a->{required} && $a->{required} != $required) {
-            fail("This multi-sig wallet needs $a->{required} of $a->{signers} signatures. Set \"Signatures required\" to $a->{required}.");
-        }
-        my ($dupe) = dbh()->selectrow_array(
-            q{SELECT id FROM transactions WHERE ergo_tx_id = ? AND status <> 'cancelled'}, undef, $a->{tx_id});
-        fail("This Ergo transaction is already being tracked (#$dupe).") if $dupe;
-        ($ergo_tx_id, $total, $commits) = ($a->{tx_id}, $a->{signers}, $a->{committed});
+    my $db = dbh();
+    my ($recent) = $db->selectrow_array(
+        'SELECT COUNT(*) FROM transactions WHERE created_by = ? AND created_at > UTC_TIMESTAMP() - INTERVAL 1 DAY',
+        undef, $ME->{id});
+    fail('You have started a lot of transactions today. Try again tomorrow.') if $recent >= cfg('DAILY_TX_LIMIT', 20);
+
+    my $a = analyze_payload($payload);
+    fail($a->{error}) unless $a->{valid};
+    fail('Start a transaction with the multi-sig request (MSR) from Minotaur, after you have committed.')
+        unless $a->{format} eq 'MSR';
+    fail('Sigma Sync could not read the signer keys from this transaction.') unless $a->{input_keys};
+
+    # Only a signer of the wallet can start a transaction for it, and their own
+    # commitment must already be in the request.
+    my $keys = tx_keys($a);
+    my %mine = map { $_ => 1 } @{ my_pks() };
+    my @my_keys = grep { $mine{$_} } @$keys;
+    fail('None of the addresses on your account is a signer of this multi-sig wallet. If you sign with another '
+       . 'wallet or address, link it on the Account tab first.') unless @my_keys;
+    fail('Your commitment is not in this request yet. In Minotaur, press Commit first, then copy the new request.')
+        unless grep { ($a->{key_states}{$_} // 0) =~ /^[12]$/ } @my_keys;
+    if ($a->{required} && $a->{required} != $required) {
+        fail("This multi-sig wallet needs $a->{required} of $a->{signers} signatures. Set \"Signatures required\" to $a->{required}.");
     }
+    my ($dupe) = $db->selectrow_array(
+        q{SELECT id FROM transactions WHERE ergo_tx_id = ? AND status <> 'cancelled'}, undef, $a->{tx_id});
+    fail("This Ergo transaction is already being tracked (#$dupe).") if $dupe;
+
+    my $commits = $a->{committed};
     my $status = $commits >= $required ? 'sign' : 'commit';
 
-    my $db = dbh();
     $db->begin_work;
     $db->do(q{INSERT INTO transactions (title_enc, description_enc, wallet_name, minotaur_version,
                 signers_required, signers_total, ergo_tx_id, status, commits, created_by)
               VALUES (?,?,?,?,?,?,?,?,?,?)}, undef,
         seal($title, 'transaction.title'), seal($desc, 'transaction.description'), $wallet, $version,
-        $required, $total, $ergo_tx_id, $status, $commits, $ME->{id});
+        $required, scalar @$keys, $a->{tx_id}, $status, $commits, $ME->{id});
     my $tx_id = $db->last_insert_id(undef, undef, 'transactions', 'id');
-    my $sub_id = insert_submission($tx_id, 'commit', $payload, $commits, 0, undef);
+    my $sth = $db->prepare('INSERT INTO transaction_keys (transaction_id, pk, slot, state) VALUES (?,?,?,?)');
+    $sth->execute($tx_id, $keys->[$_], $_, $a->{key_states}{ $keys->[$_] } // 0) for 0 .. $#$keys;
+    my $sub_id = insert_submission($tx_id, 'commit', $payload, $commits, 0);
     insert_comment($tx_id, $comment, $sub_id) if length $comment;
-    log_event('create', $ergo_tx_id ? "ergo tx $ergo_tx_id" : 'generic', $tx_id);
+    log_event('create', '', $tx_id);
     $db->commit;
     return { id => $tx_id + 0 };
 }
 
 sub insert_submission {
-    my ($tx_id, $round, $payload, $commits, $signatures, $slot) = @_;
+    my ($tx_id, $round, $payload, $commits, $signatures) = @_;
     dbh()->do(q{INSERT INTO submissions (transaction_id, member_id, round, payload_enc, payload_sha256,
-                commits, signatures, slot_index) VALUES (?,?,?,?,?,?,?,?)}, undef,
+                commits, signatures) VALUES (?,?,?,?,?,?,?)}, undef,
         $tx_id, $ME->{id}, $round, seal($payload, 'submission.payload'), sha256_hex($payload),
-        $commits, $signatures, $slot);
+        $commits, $signatures);
     return dbh()->last_insert_id(undef, undef, 'submissions', 'id');
 }
 
@@ -578,13 +745,13 @@ sub insert_comment {
 
 sub act_lock {
     my $id = int_param('id');
+    my $tx = load_tx($id);
     my $n = dbh()->do(q{
         UPDATE transactions SET lock_member_id = ?, lock_seq = lock_seq + 1, locked_at = UTC_TIMESTAMP()
          WHERE id = ? AND lock_member_id IS NULL AND status IN ('commit','sign')
     }, undef, $ME->{id}, $id);
     unless ($n > 0) {
-        my $tx = load_tx($id);
-        fail('This transaction is no longer open for signing.') unless is_open($tx);
+        fail('This transaction is no longer open for signing.') unless is_open(load_tx($id));
         fail('Someone else locked this transaction a moment ago. Refresh to see who.');
     }
     log_event('lock', '', $id);
@@ -593,6 +760,7 @@ sub act_lock {
 
 sub act_release_lock {
     my $id = int_param('id');
+    load_tx($id);
     my $n = dbh()->do('UPDATE transactions SET lock_member_id = NULL, locked_at = NULL WHERE id = ? AND lock_member_id = ?',
         undef, $id, $ME->{id});
     fail('You do not hold the lock on this transaction.') unless $n > 0;
@@ -635,26 +803,20 @@ sub act_submit {
     fail('This transaction is no longer open for signing.') unless is_open($tx);
     fail('Lock the transaction before submitting.') unless ($tx->{lock_member_id} // 0) == $ME->{id};
 
-    my $latest = latest_submission($id);
-    my ($a, $cmp) = check_payload($tx, $payload, $latest);
+    my ($a, $cmp) = check_payload($tx, $payload, latest_submission($id));
 
-    my ($commits, $signatures, $round, $status);
     my $required = $tx->{signers_required};
-    if ($tx->{ergo_tx_id} && $a->{format} eq 'CSTX') {
+    my ($commits, $signatures, $round, $status);
+    if ($a->{format} eq 'CSTX') {
         ($commits, $signatures, $round, $status) = ($tx->{commits}, $required, 'final', 'complete');
-    } elsif ($tx->{ergo_tx_id}) {
+    } else {
         ($commits, $signatures) = ($a->{committed}, $a->{signed});
         $round = !$cmp ? $tx->{status} : $cmp->{new_commits} ? 'commit' : 'sign';
-    } else {
-        # Generic (non-Minotaur) transaction: each paste is one step of the current round.
-        $round = $tx->{status};
-        ($commits, $signatures) = ($tx->{commits}, $tx->{signatures});
-        $round eq 'commit' ? $commits++ : $signatures++;
+        $status = $signatures >= $required ? 'complete' : $commits >= $required ? 'sign' : 'commit';
+        update_key_states($id, $a);
     }
-    $status //= $signatures >= $required ? 'complete' : $commits >= $required ? 'sign' : 'commit';
 
-    my $slot = $cmp && @{ $cmp->{slots} } == 1 ? $cmp->{slots}[0] : undef;
-    my $sub_id = insert_submission($id, $round, $payload, $commits, $signatures, $slot);
+    my $sub_id = insert_submission($id, $round, $payload, $commits, $signatures);
     insert_comment($id, $comment, $sub_id) if length $comment;
     $db->do(q{UPDATE transactions SET commits = ?, signatures = ?, status = ?, lock_member_id = NULL,
                 locked_at = NULL, updated_at = UTC_TIMESTAMP() WHERE id = ?},
@@ -696,55 +858,46 @@ sub act_mark_broadcast {
     fail('Only a fully signed transaction can be marked as broadcast.') unless $tx->{status} eq 'complete';
     dbh()->do(q{UPDATE transactions SET status = 'broadcast', closed_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP()
                 WHERE id = ? AND status = 'complete'}, undef, $id);
-    log_event('broadcast', $tx->{ergo_tx_id} // '', $id);
+    log_event('broadcast', '', $id);
     return act_get_transaction();
 }
 
 # ---------------------------------------------------------------------------
-# Members
+# Administration: account moderation and the audit log. Admins get no extra
+# visibility into transactions.
 # ---------------------------------------------------------------------------
-sub act_list_members {
-    my $rows = dbh()->selectall_arrayref(
-        'SELECT id, address, display_name, is_admin, is_active, created_at, last_login_at FROM members ORDER BY is_active DESC, display_name',
+sub act_admin_members {
+    my $db = dbh();
+    my $rows = $db->selectall_arrayref(
+        'SELECT id, display_name, is_admin, is_active, created_at, last_login_at FROM members ORDER BY is_active DESC, last_login_at DESC',
         { Slice => {} });
-    my %env_admin = map { $_ => 1 } admin_addresses();
+    my %addr;
+    push @{ $addr{ $_->[0] } }, $_->[1]
+        for @{ $db->selectall_arrayref('SELECT member_id, address FROM member_keys ORDER BY id') };
     for my $m (@$rows) {
         $m->{$_} += 0 for qw(id is_admin is_active);
-        $m->{env_admin} = $env_admin{ $m->{address} } ? 1 : 0;
-        $m->{is_admin} = 1 if $m->{env_admin};
+        $m->{addresses} = $addr{ $m->{id} } || [];
+        $m->{env_admin} = is_env_admin($m->{addresses});
+        $m->{is_admin}  = 1 if $m->{env_admin};
     }
     return { members => $rows };
 }
 
-sub act_save_member {
-    my $id = param('id');
-    my $name = clean_text(param('display_name'), $LIMIT{name}, 'Name');
-    fail('Enter a display name.') unless length $name;
-    my $is_admin  = param('is_admin') ? 1 : 0;
-    my $is_active = param('is_active') eq '0' ? 0 : 1;
-    my $db = dbh();
+sub act_admin_update {
+    my $id = int_param('id');
+    my $m = load_member($id) or fail('Account not found.');
+    my $is_admin  = param('is_admin')  eq '' ? $m->{is_admin}  : (param('is_admin')  ? 1 : 0);
+    my $is_active = param('is_active') eq '' ? $m->{is_active} : (param('is_active') ? 1 : 0);
+    fail('You cannot remove your own access.') if $id == $ME->{id} && (!$is_active || !$is_admin);
+    fail('This admin is set in the server config (ADMIN_ADDRESSES); change it there.')
+        if $m->{env_admin} && (!$is_active || !$is_admin);
+    my $name = param('display_name') eq '' ? $m->{display_name} : name_param();
 
-    if ($id =~ /^\d+$/) {
-        my $m = $db->selectrow_hashref('SELECT * FROM members WHERE id = ?', undef, $id) or fail('Member not found.');
-        fail('You cannot remove your own access.') if $m->{id} == $ME->{id} && (!$is_active || !$is_admin);
-        fail('This admin is set in the server config (ADMIN_ADDRESSES); change it there.')
-            if (!$is_active || !$is_admin) && grep { $_ eq $m->{address} } admin_addresses();
-        $db->do('UPDATE members SET display_name = ?, is_admin = ?, is_active = ? WHERE id = ?',
-            undef, $name, $is_admin, $is_active, $id);
-        $db->do('DELETE FROM sessions WHERE member_id = ?', undef, $id) unless $is_active;
-        log_event('member_update', "$m->{address}: name=$name admin=$is_admin active=$is_active");
-    } else {
-        my $address = param('address') =~ s/\s+//gr;
-        my $info = address_decode($address);
-        fail('That is not a valid Ergo address.') unless $info;
-        fail('Members sign in with a regular (P2PK) wallet address.') unless $info->{type} eq 'P2PK';
-        my ($exists) = $db->selectrow_array('SELECT id FROM members WHERE address = ?', undef, $address);
-        fail('That address is already a member.') if $exists;
-        $db->do('INSERT INTO members (address, display_name, is_admin, is_active, created_by) VALUES (?,?,?,?,?)',
-            undef, $address, $name, $is_admin, $is_active, $ME->{id});
-        log_event('member_add', "$address: name=$name admin=$is_admin");
-    }
-    return act_list_members();
+    dbh()->do('UPDATE members SET display_name = ?, is_admin = ?, is_active = ? WHERE id = ?',
+        undef, $name, $is_admin, $is_active, $id);
+    dbh()->do('DELETE FROM sessions WHERE member_id = ?', undef, $id) unless $is_active;
+    log_event('member_update', "#$id: name=$name admin=$is_admin active=$is_active");
+    return act_admin_members();
 }
 
 sub act_recent_events {
