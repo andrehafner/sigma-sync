@@ -134,8 +134,23 @@ git pull
 sudo ./redeploy.sh               # ALWAYS - a pull resets labels/ownership of changed files
 ```
 
-If a release changes `schema.sql`, its notes say which `ALTER TABLE` to run. (Before the first
-production deploy the schema may still change freely: drop and re-create the database.)
+If a release changes `schema.sql`, it ships a migration in `tools/` - see below.
+
+### Migration 001 - key-scoped access (databases created before open sign-in)
+
+```bash
+sudo mysqldump sigmasync > ~/sigmasync-before-001.sql     # backup
+cd /data/AAP_Storage/apps/sigmasync
+git pull && sudo ./redeploy.sh
+sudo APP_ENV_FILE=/data/AAP_Storage/secrets/sigmasync.env perl tools/migrate-001-key-scoping.pl --dry-run
+sudo APP_ENV_FILE=/data/AAP_Storage/secrets/sigmasync.env perl tools/migrate-001-key-scoping.pl
+```
+
+Keeps every account, name, admin flag, transaction, comment and session; moves addresses
+to `member_keys` and reads each transaction's signer keys from its stored request. Transactions
+without Minotaur signer keys (the old "Other / not Minotaur" mode) are cancelled. Re-running it
+is harmless. To undo: `sudo mysql -e 'DROP DATABASE sigmasync; CREATE DATABASE sigmasync'` then
+`sudo mysql sigmasync < ~/sigmasync-before-001.sql` and check out the previous release.
 
 ## Backups
 
