@@ -62,8 +62,9 @@ sudo chown root:apache /data/AAP_Storage/secrets/sigmasync.env
 sudo chmod 640 /data/AAP_Storage/secrets/sigmasync.env
 ```
 
-- `ADMIN_ADDRESSES`: comma-separated **wallet addresses** (the P2PK address of each admin's
-  Minotaur signing wallet). They can sign in immediately and add everyone else.
+- `ADMIN_ADDRESSES`: comma-separated **wallet addresses** (P2PK) of the people who may disable
+  accounts and read the audit log. Anyone can sign in; admins get no access to other people's
+  transactions.
 - **Back up `DATA_KEY` separately** (password manager / sealed envelope). Without it, encrypted
   data in the database and in every backup is unreadable.
 
@@ -123,7 +124,7 @@ curl -sI https://public.aap.cornell.edu/apps/sigmasync/AppConfig.pm | head -1   
 curl -sI https://public.aap.cornell.edu/apps/sigmasync/ | grep -i content-security-policy
 ```
 
-Then sign in with an admin wallet and add the other signers on the **Signers** tab.
+Then sign in with your wallet. Fellow signers simply sign in with theirs.
 
 ## Updating
 
@@ -133,7 +134,8 @@ git pull
 sudo ./redeploy.sh               # ALWAYS - a pull resets labels/ownership of changed files
 ```
 
-If a release changes `schema.sql`, its notes say which `ALTER TABLE` to run.
+If a release changes `schema.sql`, its notes say which `ALTER TABLE` to run. (Before the first
+production deploy the schema may still change freely: drop and re-create the database.)
 
 ## Backups
 
@@ -164,8 +166,9 @@ Browser shows an error / blank page
 │  └─ "Can't connect ... (13)"          -> setsebool -P httpd_can_network_connect_db 1
 ├─ Sign-in: "Signature check failed"
 │  └─ The address entered is not the wallet that signed. Use the signing wallet's own address.
-├─ Sign-in: "not a registered signer"
-│  └─ Add the address on the Signers tab (or ADMIN_ADDRESSES for admins).
+├─ Signed in but a transaction is missing
+│  └─ None of your addresses is one of its signer keys. Link the address you sign that
+│     multi-sig with (Account tab). Multi-sig address #N uses each signer's address #N.
 └─ Sign-in works but you are immediately signed out
    └─ Cookie not stored: COOKIE_PATH must be /apps/sigmasync/ and COOKIE_SECURE=1 over HTTPS.
 ```

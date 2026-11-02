@@ -399,9 +399,81 @@
 
   const releaseUrl = (tag) => `${MINOTAUR_RELEASES}/tag/${encodeURIComponent(tag)}`;
 
-  function versionLabel(v) {
-    if (!v || v === 'other') return 'Not Minotaur';
-    return `Minotaur ${v}`;
+  const versionLabel = (v) => `Minotaur ${v}`;
+
+  // ------------------------------------------------------------------------
+  // Wallet challenges (sign-in and linking an extra address)
+  // ------------------------------------------------------------------------
+
+  // Renders "sign this request in Minotaur, paste the result" into `el`.
+  // `ch` = { address, challenge, request, expires }. onDone receives the API result.
+  function mountChallenge(el, ch, { submitLabel, onDone, onRestart, error = '' }) {
+    el.innerHTML = `
+      <div class="stack">
+        <div class="row"><strong>Wallet</strong><code class="faint">${esc(shortAddr(ch.address))}</code>
+          <span class="spacer"></span><button type="button" class="btn btn-ghost btn-sm" data-ch="restart">Change</button></div>
+        <div>
+          <p class="step-label"><span class="step-num">1</span> Sign this request in Minotaur</p>
+          <ol class="howto small">
+            <li>In Minotaur, tap the <strong>QR scanner</strong>. Scan the code below, or choose paste after copying the request.</li>
+            <li>Check it is the wallet for this address, then <strong>Sign</strong>. Air-gapped wallets work the same way.</li>
+            <li>Copy (or show) the signed result Minotaur produces.</li>
+          </ol>
+          <div data-ch="qr"></div>
+          <div class="row mt-8">
+            <button type="button" class="btn btn-sm" data-ch="copy">Copy request</button>
+            <span class="faint small" data-ch="expiry"></span>
+          </div>
+          <div class="notice notice-info small mt-12">This only proves you control the wallet - it is not a payment.
+          The request spends a made-up box that does not exist on the blockchain, so the signed result can never be
+          broadcast and no funds can move.</div>
+        </div>
+        <form class="stack" novalidate data-ch="form">
+          <p class="step-label"><span class="step-num">2</span> Paste the signed result</p>
+          <textarea class="payload" required autocomplete="off" autocapitalize="off" autocorrect="off"
+            spellcheck="false" placeholder='{"CSTX":"…"}' aria-label="Signed result"></textarea>
+          <div data-ch="error">${error ? `<div class="notice notice-error">${esc(error)}</div>` : ''}</div>
+          <div class="row">
+            <button type="button" class="btn" data-ch="scan">Scan QR</button>
+            <span class="spacer"></span>
+            <button class="btn btn-primary" type="submit">${esc(submitLabel)}</button>
+          </div>
+        </form>
+      </div>`;
+    const part = (name) => $(`[data-ch=${name}]`, el);
+    const input = $('textarea', el);
+    mountQr(part('qr'), ch.request);
+    part('restart').onclick = onRestart;
+    part('copy').onclick = () => copyText(ch.request, 'Request copied');
+    part('scan').onclick = async () => { const text = await scanQr(); if (text) input.value = text; };
+
+    const expiry = part('expiry');
+    const tick = () => {
+      if (!document.body.contains(expiry)) return;
+      const left = Math.round((ch.expires - Date.now()) / 60000);
+      expiry.textContent = left > 0 ? `Expires in ${left} min` : 'Expired - start again';
+      if (left > 0) setTimeout(tick, 15000);
+    };
+    tick();
+
+    part('form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const response = cleanPayload(input.value);
+      if (!response) return;
+      const btn = $('button[type=submit]', ev.target);
+      btn.disabled = true;
+      try {
+        onDone(await api('auth_finish', { challenge: ch.challenge, response }));
+      } catch (e) {
+        btn.disabled = false;
+        part('error').innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`;
+      }
+    });
+  }
+
+  async function startChallenge(address, purpose) {
+    const r = await api('auth_start', { address, purpose });
+    return { address, challenge: r.challenge, request: r.request, expires: Date.now() + r.expires_minutes * 60000 };
   }
 
   // ------------------------------------------------------------------------
@@ -412,132 +484,76 @@
     stopQrTimers();
     $('#user-chip').hidden = true;
     const si = S.signin || {};
-    const stepIndex = { address: 1, sign: 2 }[step];
     app().innerHTML = `
       <section class="signin">
         <div class="signin-hero">
           <img src="favicon.svg" alt="">
           <h1>Sign in to Sigma Sync</h1>
           <p class="muted">Coordinate multi-sig commitments and signatures with your fellow signers.
-          Prove who you are by signing a one-time request with your Minotaur signing wallet.</p>
+          Sign in with the Minotaur wallet you sign multi-sig transactions with - no password, no sign-up.
+          You will see the transactions of every multi-sig wallet that wallet is a signer of.</p>
         </div>
         <ol class="steps" aria-hidden="true">
-          <li class="done"></li><li class="${stepIndex >= 2 ? 'done' : ''}"></li>
+          <li class="done"></li><li class="${step === 'sign' ? 'done' : ''}"></li>
         </ol>
         <div class="panel" id="signin-panel"></div>
       </section>`;
     const panel = $('#signin-panel');
 
-    if (step === 'address') {
-      panel.innerHTML = `
-        <form id="address-form" class="stack" novalidate>
-          <div class="field">
-            <label for="address">Your signing wallet address</label>
-            <input type="text" id="address" name="address" required autocomplete="off" autocapitalize="off"
-              autocorrect="off" spellcheck="false" placeholder="9…" value="${esc(si.address || store(ADDRESS_KEY) || '')}">
-            <p class="hint">The regular address of the Minotaur wallet you sign multi-sig transactions with -
-            not the multi-sig wallet itself.</p>
-          </div>
-          ${error ? `<div class="notice notice-error">${esc(error)}</div>` : ''}
-          <button class="btn btn-primary btn-block" type="submit">Continue</button>
-        </form>`;
-      $('#address').focus();
-      $('#address-form').addEventListener('submit', async (ev) => {
-        ev.preventDefault();
-        const address = $('#address').value.replace(/\s+/g, '');
-        if (!address) return;
-        const btn = ev.submitter || $('button[type=submit]', panel);
-        btn.disabled = true;
-        try {
-          const r = await api('auth_start', { address });
-          store(ADDRESS_KEY, address);
-          S.signin = { address, challenge: r.challenge, request: r.request, expires: Date.now() + r.expires_minutes * 60000 };
-          renderSignIn('sign');
-        } catch (e) {
-          renderSignIn('address', e.message);
-        }
+    if (step === 'sign') {
+      mountChallenge(panel, si, {
+        submitLabel: 'Sign in',
+        error,
+        onRestart: () => renderSignIn('address'),
+        onDone: (r) => { S.signin = null; startSession(r); },
       });
       return;
     }
 
     panel.innerHTML = `
-      <div class="stack">
-        <div class="row"><strong>Wallet</strong><code class="faint">${esc(shortAddr(si.address))}</code>
-          <span class="spacer"></span><button type="button" class="btn btn-ghost btn-sm" id="change-address">Change</button></div>
-        <div>
-          <p class="step-label"><span class="step-num">1</span> Sign this request in Minotaur</p>
-          <ol class="howto small">
-            <li>In Minotaur, tap the <strong>QR scanner</strong>. Scan the code below, or choose paste after copying the request.</li>
-            <li>Check it is your signing wallet, then <strong>Sign</strong>. Air-gapped wallets work the same way.</li>
-            <li>Copy (or show) the signed result Minotaur produces.</li>
-          </ol>
-          <div id="signin-qr"></div>
-          <div class="row mt-8">
-            <button type="button" class="btn btn-sm" id="copy-request">Copy request</button>
-            <span class="faint small" id="signin-expiry"></span>
-          </div>
-          <div class="notice notice-info small mt-12">This is a sign-in request, not a payment.
-          It spends a made-up box that does not exist on the blockchain, so the signed result can never be broadcast
-          and no funds can move.</div>
+      <form id="address-form" class="stack" novalidate>
+        <div class="field">
+          <label for="address">Your signing wallet address</label>
+          <input type="text" id="address" name="address" required autocomplete="off" autocapitalize="off"
+            autocorrect="off" spellcheck="false" placeholder="9…" value="${esc(si.address || store(ADDRESS_KEY) || '')}">
+          <p class="hint">The first address of the Minotaur wallet you sign multi-sig transactions with -
+          not the multi-sig wallet itself. You can link more addresses later.</p>
         </div>
-        <form id="response-form" class="stack" novalidate>
-          <p class="step-label"><span class="step-num">2</span> Paste the signed result</p>
-          <textarea class="payload" id="response" required autocomplete="off" autocapitalize="off" autocorrect="off"
-            spellcheck="false" placeholder='{"CSTX":"…"}'></textarea>
-          <div id="signin-error">${error ? `<div class="notice notice-error">${esc(error)}</div>` : ''}</div>
-          <div class="row">
-            <button type="button" class="btn" id="scan-response">Scan QR</button>
-            <span class="spacer"></span>
-            <button class="btn btn-primary" type="submit">Sign in</button>
-          </div>
-        </form>
-      </div>`;
-    mountQr($('#signin-qr'), si.request);
-    $('#change-address').onclick = () => renderSignIn('address');
-    $('#copy-request').onclick = () => copyText(si.request, 'Request copied');
-    $('#scan-response').onclick = async () => {
-      const text = await scanQr();
-      if (text) $('#response').value = text;
-    };
-    const expiry = $('#signin-expiry');
-    const tickExpiry = () => {
-      const left = Math.round((si.expires - Date.now()) / 60000);
-      if (!document.body.contains(expiry)) return;
-      expiry.textContent = left > 0 ? `Expires in ${left} min` : 'Expired - start again';
-      if (left > 0) setTimeout(tickExpiry, 15000);
-    };
-    tickExpiry();
-
-    $('#response-form').addEventListener('submit', async (ev) => {
+        ${error ? `<div class="notice notice-error">${esc(error)}</div>` : ''}
+        <button class="btn btn-primary btn-block" type="submit">Continue</button>
+      </form>`;
+    $('#address').focus();
+    $('#address-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
-      const response = cleanPayload($('#response').value);
-      if (!response) return;
-      const btn = $('button[type=submit]', ev.target);
-      btn.disabled = true;
+      const address = $('#address').value.replace(/\s+/g, '');
+      if (!address) return;
+      $('button[type=submit]', panel).disabled = true;
       try {
-        const r = await api('auth_finish', { challenge: si.challenge, response });
-        S.signin = null;
-        startSession(r);
+        S.signin = await startChallenge(address, 'login');
+        store(ADDRESS_KEY, address);
+        renderSignIn('sign');
       } catch (e) {
-        btn.disabled = false;
-        const extra = e.data?.verified_address
-          ? `<div class="row small mt-8"><code>${esc(e.data.verified_address)}</code>
-             <button type="button" class="btn btn-sm" data-copy="${esc(e.data.verified_address)}">Copy address</button></div>`
-          : '';
-        $('#signin-error').innerHTML = `<div class="notice notice-error">${esc(e.message)}${extra}</div>`;
+        renderSignIn('address', e.message);
       }
     });
   }
 
+  function setMe(member) {
+    S.me = member;
+    $('#user-name').textContent = member.display_name;
+    const first = member.addresses?.[0] || '';
+    $('#user-address').textContent = shortAddr(first);
+    $('#user-address').title = (member.addresses || []).join('\n');
+    $('#user-chip').hidden = false;
+  }
+
   function startSession(r) {
-    S.me = r.member;
     S.csrf = r.csrf;
     S.config = r.config || {};
-    $('#user-name').textContent = S.me.display_name;
-    $('#user-address').textContent = shortAddr(S.me.address);
-    $('#user-address').title = S.me.address;
-    $('#user-chip').hidden = false;
-    route();
+    setMe(r.member);
+    // New accounts pick a name first so co-signers can recognise them.
+    if (!r.member.name_chosen && location.hash !== '#account') location.hash = 'account';
+    else route();
   }
 
   // ------------------------------------------------------------------------
@@ -551,8 +567,8 @@
     const m = hash.match(/^tx\/(\d+)$/);
     if (m) return renderDetail(Number(m[1]));
     if (hash === 'start') return renderStart();
-    if (hash === 'signers') return renderMembers();
-    if (hash === 'activity' && S.me.is_admin) return renderActivity();
+    if (hash === 'account') return renderAccount();
+    if (hash === 'admin' && S.me.is_admin) return renderAdmin();
     return renderList();
   }
 
@@ -569,8 +585,8 @@
     const tabs = [
       ['sign', 'Sign Transactions', awaiting],
       ['start', 'Start Transaction'],
-      ['signers', 'Signers'],
-      ...(S.me.is_admin ? [['activity', 'Activity']] : []),
+      ['account', 'Account'],
+      ...(S.me.is_admin ? [['admin', 'Admin']] : []),
     ];
     app().innerHTML = `
       <nav class="tabs" role="tablist">
@@ -694,7 +710,7 @@
         <a class="btn btn-primary" href="#start">Start transaction</a>
       </div>
       ${list.length ? `<div class="cards">${list.map(card).join('')}</div>` : `
-        <div class="empty">${S.txs.length ? 'Nothing matches this filter.' : 'No transactions yet. Start one to get your signers going.'}</div>`}`;
+        <div class="empty">${S.txs.length ? 'Nothing matches this filter.' : 'No transactions for your wallets yet. They appear here when someone starts one for a multi-sig wallet one of your addresses signs for.'}</div>`}`;
 
     paintBars(view);
     updateTabCount();
@@ -806,13 +822,12 @@
     const opt = (v, i) => `<option value="${esc(v.tag)}" ${i === 0 && !v.pre ? 'selected' : ''}>${esc(v.tag)}${i === 0 && !v.pre ? ' (latest)' : ''}${v.date ? ` - ${esc(v.date)}` : ''}</option>`;
     sel.innerHTML = `
       <optgroup label="Releases">${stable.map(opt).join('')}</optgroup>
-      ${pre.length ? `<optgroup label="Pre-releases">${pre.map((v) => opt(v, 1)).join('')}</optgroup>` : ''}
-      <option value="other">Other / not Minotaur</option>`;
+      ${pre.length ? `<optgroup label="Pre-releases">${pre.map((v) => opt(v, 1)).join('')}</optgroup>` : ''}`;
     const hint = () => {
       const v = sel.value;
-      $('#version-hint').innerHTML = v && v !== 'other'
+      $('#version-hint').innerHTML = v
         ? `Every signer should use this version. <a href="${esc(releaseUrl(v))}" target="_blank" rel="noopener">Release notes</a>`
-        : 'No payload checks are done for non-Minotaur transactions.';
+        : '';
     };
     sel.addEventListener('change', hint);
     hint();
@@ -872,7 +887,11 @@
     }
     el.hidden = false;
     const items = [];
-    let bad = !a.valid || !!a.problem;
+    if (!txId && a.valid && a.format === 'MSR' && a.is_signer !== undefined) {
+      if (!a.is_signer) a.problem = 'None of your addresses is a signer of this multi-sig wallet. Link the address you sign with on the Account tab.';
+      else if (!a.my_committed) a.problem = 'Your commitment is not in this request yet. Press Commit in Minotaur first, then copy the new request.';
+    }
+    const bad = !a.valid || !!a.problem;
     if (a.format === 'MSR') {
       items.push(`Minotaur multi-sig request${a.required ? ` · ${a.required}-of-${a.signers} wallet` : ''}`);
       items.push(`${a.committed} commitment${a.committed === 1 ? '' : 's'}, ${a.signed} signature${a.signed === 1 ? '' : 's'}`);
@@ -942,9 +961,7 @@
           <div class="meta">
             <span>#${t.id}</span>
             ${t.wallet_name ? `<span>${esc(t.wallet_name)}</span>` : ''}
-            <span>${t.minotaur_version !== 'other'
-              ? `<a href="${esc(releaseUrl(t.minotaur_version))}" target="_blank" rel="noopener">${esc(versionLabel(t.minotaur_version))}</a>`
-              : 'Not Minotaur'}</span>
+            <span><a href="${esc(releaseUrl(t.minotaur_version))}" target="_blank" rel="noopener">${esc(versionLabel(t.minotaur_version))}</a></span>
             <span>Started by ${esc(t.created_by)} · ${timeTag(t.created_at)}</span>
             ${t.ergo_tx_id ? `<span>TX <a href="${esc(explorer)}" target="_blank" rel="noopener" class="mono">${esc(shortId(t.ergo_tx_id))}</a>
               <button type="button" class="btn btn-ghost btn-sm" data-copy="${esc(t.ergo_tx_id)}" aria-label="Copy transaction ID">Copy</button></span>` : ''}
@@ -962,8 +979,7 @@
           <section class="panel">
             <div class="panel-title"><h2>Progress</h2></div>
             ${progressBars(t)}
-            ${slotsHtml(t)}
-            ${peopleHtml(t)}
+            ${signersHtml(t)}
           </section>
           <section class="panel">
             <div class="panel-title"><h2>Activity &amp; comments</h2></div>
@@ -1004,30 +1020,23 @@
       ${r.inputs_value ? `<p class="small muted mt-8">Total spent from the wallet: <strong>${esc(erg(r.inputs_value))}</strong></p>` : ''}`;
   }
 
-  function slotsHtml(t) {
-    const slots = t.review?.slots;
-    if (!slots || !slots.length) return '';
-    const bySlot = {};
-    (t.participants || []).forEach((p) => { if (p.slot !== null && p.slot !== undefined) bySlot[p.slot] = p.name; });
-    const label = ['Empty', 'Committed', 'Signed', 'Not participating'];
+  // Every key of the multi-sig wallet, read from the transaction itself.
+  function signersHtml(t) {
+    const list = t.signers || [];
+    if (!list.length) return '';
+    const label = ['Waiting', 'Committed', 'Signed', 'Not taking part'];
+    const initials = (name) => (name || '?').replace(/[^\p{L}\p{N}]/gu, '').slice(0, 2).toUpperCase() || '?';
     return `
-      <div class="mt-16">
-        <div class="small muted mb-6">Signer key slots (${slots.length} keys in this wallet)</div>
-        <div class="slots">${slots.map((s, i) => `<span class="slot slot-${s}" title="Key ${i + 1}: ${label[s]}${bySlot[i] ? ` - ${esc(bySlot[i])}` : ''}">${
-          bySlot[i] ? esc(bySlot[i].slice(0, 2).toUpperCase()) : i + 1}</span>`).join('')}</div>
-        <div class="legend"><span>◌ empty</span><span class="info-text">● committed</span><span class="tick">● signed</span></div>
-      </div>`;
-  }
-
-  function peopleHtml(t) {
-    const ps = t.participants || [];
-    if (!ps.length) return '';
-    return `
-      <ul class="people mt-12">
-        ${ps.map((p) => `<li>
-          <strong class="grow">${esc(p.name)}</strong>
-          ${p.committed_at ? `<span class="small" title="${esc(fullDate(p.committed_at))}"><span class="tick">✓</span> committed</span>` : ''}
-          ${p.signed_at ? `<span class="small" title="${esc(fullDate(p.signed_at))}"><span class="tick">✓</span> signed</span>` : ''}
+      <h3 class="mt-16">Signers <span class="faint small">${t.signers_required} of ${list.length} needed</span></h3>
+      <ul class="people">
+        ${list.map((k) => `<li>
+          <span class="slot slot-${k.state}" aria-hidden="true">${esc(k.name ? initials(k.name) : k.slot + 1)}</span>
+          <span class="grow">
+            ${k.name ? `<strong>${esc(k.name)}</strong>${k.mine ? ' <span class="faint">(you)</span>' : ''}`
+              : '<span class="faint">Not on Sigma Sync yet</span>'}
+            <div><code class="small faint" title="${esc(k.address)}">${esc(shortAddr(k.address))}</code></div>
+          </span>
+          <span class="small ${k.state === 1 || k.state === 2 ? 'tick' : 'faint'}">${label[k.state] || ''}</span>
         </li>`).join('')}
       </ul>`;
   }
@@ -1291,115 +1300,178 @@
   }
 
   // ------------------------------------------------------------------------
-  // Signers (members)
+  // Account
   // ------------------------------------------------------------------------
-  async function renderMembers() {
-    const view = shell('signers');
+  async function renderAccount() {
+    const view = shell('account');
     view.innerHTML = '<div class="loading">Loading…</div>';
-    let members;
-    try { members = (await api('list_members')).members; } catch (e) { view.innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`; return; }
-    drawMembers(members);
+    let data;
+    try { data = await api('get_account'); } catch (e) { view.innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`; return; }
+    drawAccount(data);
   }
 
-  function drawMembers(members) {
+  function drawAccount(data) {
     const view = $('#view');
-    const admin = S.me.is_admin;
+    const me = data.member;
+    setMe(me);
     view.innerHTML = `
-      ${admin ? `
-        <form class="panel" id="member-form" novalidate>
-          <div class="panel-title"><h2>Add a signer</h2></div>
-          <div class="field-row">
-            <div><label for="m-address">Signing wallet address</label>
-              <input type="text" id="m-address" required autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="9…"></div>
-            <div><label for="m-name">Display name</label>
-              <input type="text" id="m-name" required maxlength="40" placeholder="e.g. qx"></div>
-          </div>
-          <div class="row mt-12">
-            <label class="check"><input type="checkbox" id="m-admin"> Admin (can manage signers)</label>
-            <span class="spacer"></span><button class="btn btn-primary" type="submit">Add signer</button>
-          </div>
-          <div id="m-error"></div>
-        </form>` : ''}
+      ${me.name_chosen ? '' : `<div class="notice notice-info mb-16"><strong>Welcome to Sigma Sync.</strong>
+        Choose the name your co-signers will see. You will find transactions under <em>Sign Transactions</em>
+        as soon as someone starts one for a multi-sig wallet your address signs for.</div>`}
+      <div class="detail">
+        <div>
+          <form class="panel" id="name-form" novalidate>
+            <div class="panel-title"><h2>Your name</h2></div>
+            <div class="field">
+              <label for="a-name">Display name</label>
+              <input type="text" id="a-name" maxlength="40" required value="${me.name_chosen ? esc(me.display_name) : ''}"
+                placeholder="${esc(me.display_name)}">
+              <p class="hint">Shown to the people you sign with. Must be unique.</p>
+            </div>
+            <div id="a-name-error"></div>
+            <div class="row mt-12"><span class="spacer"></span><button class="btn btn-primary" type="submit">Save name</button></div>
+          </form>
+          <section class="panel">
+            <div class="panel-title"><h2>Your signing addresses</h2></div>
+            <p class="small muted">You see a transaction when one of these addresses is a signer of its multi-sig wallet.</p>
+            <div class="table-wrap"><table class="list">
+              <thead><tr><th>Address</th><th>Transactions</th><th>Linked</th><th></th></tr></thead>
+              <tbody>${data.addresses.map((a) => `
+                <tr>
+                  <td><code title="${esc(a.address)}">${esc(shortAddr(a.address))}</code>
+                    <button type="button" class="btn btn-ghost btn-sm" data-copy="${esc(a.address)}" aria-label="Copy address">Copy</button></td>
+                  <td>${a.transactions}</td>
+                  <td>${timeTag(a.created_at)}</td>
+                  <td class="right">${data.addresses.length > 1
+                    ? `<button type="button" class="btn btn-sm btn-danger" data-unlink="${esc(a.address)}">Remove</button>` : ''}</td>
+                </tr>`).join('')}
+              </tbody>
+            </table></div>
+          </section>
+        </div>
+        <aside class="panel detail-side" id="link-panel"></aside>
+      </div>`;
+
+    $('#name-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      try {
+        const r = await api('update_account', { display_name: $('#a-name').value });
+        toast('Name saved', 'success');
+        if (!me.name_chosen) { setMe(r.member); location.hash = ''; return; }
+        drawAccount(r);
+      } catch (e) { $('#a-name-error').innerHTML = `<div class="notice notice-error mt-12">${esc(e.message)}</div>`; }
+    });
+    $$('[data-unlink]', view).forEach((btn) => btn.addEventListener('click', async () => {
+      const ok = await dialog({
+        title: 'Remove this address?',
+        body: 'Transactions for multi-sig wallets that only this address signs for will disappear from your list. You can link it again later.',
+        confirm: 'Remove', danger: true,
+      });
+      if (!ok) return;
+      try { drawAccount(await api('unlink_address', { address: btn.dataset.unlink })); } catch (e) { toast(e.message, 'error'); }
+    }));
+    drawLinkPanel();
+  }
+
+  function drawLinkPanel(error = '') {
+    const panel = $('#link-panel');
+    if (!panel) return;
+    panel.innerHTML = `
+      <h2>Link another address</h2>
+      <p class="small muted">Sign with a different wallet for another multi-sig, or does your multi-sig use a later
+      address? Prove that address too and its transactions appear in your list.</p>
+      <form id="link-form" class="stack" novalidate>
+        <input type="text" id="link-address" required autocomplete="off" autocapitalize="off" autocorrect="off"
+          spellcheck="false" placeholder="9…" aria-label="Address to link">
+        ${error ? `<div class="notice notice-error">${esc(error)}</div>` : ''}
+        <button class="btn btn-block" type="submit">Continue</button>
+      </form>`;
+    $('#link-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const address = $('#link-address').value.replace(/\s+/g, '');
+      if (!address) return;
+      try {
+        const ch = await startChallenge(address, 'link');
+        mountChallenge(panel, ch, {
+          submitLabel: 'Link address',
+          onRestart: () => drawLinkPanel(),
+          onDone: async () => { toast('Address linked', 'success'); S.txs = []; drawAccount(await api('get_account')); },
+        });
+      } catch (e) { drawLinkPanel(e.message); }
+    });
+  }
+
+  // ------------------------------------------------------------------------
+  // Admin: account moderation and the audit log. No access to transactions.
+  // ------------------------------------------------------------------------
+  async function renderAdmin() {
+    const view = shell('admin');
+    view.innerHTML = '<div class="loading">Loading…</div>';
+    let members;
+    let events;
+    try {
+      [members, events] = await Promise.all([api('admin_members'), api('recent_events')]);
+    } catch (e) { view.innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`; return; }
+    drawAdmin(members.members, events.events);
+  }
+
+  function drawAdmin(members, events) {
+    const view = $('#view');
+    view.innerHTML = `
       <section class="panel">
-        <div class="panel-title"><h2>Signers</h2><span class="faint small">${members.filter((m) => m.is_active).length} active</span></div>
+        <div class="panel-title"><h2>Accounts</h2><span class="faint small">${members.filter((m) => m.is_active).length} active</span></div>
+        <p class="small muted">Anyone can sign in with a wallet. Admins can disable abusive accounts and see the audit log,
+        but cannot see transactions they are not a signer of.</p>
         <div class="table-wrap"><table class="list">
-          <thead><tr><th>Name</th><th>Address</th><th>Role</th><th>Last sign-in</th>${admin ? '<th></th>' : ''}</tr></thead>
+          <thead><tr><th>Name</th><th>Addresses</th><th>Role</th><th>Last sign-in</th><th></th></tr></thead>
           <tbody>${members.map((m) => `
             <tr class="${m.is_active ? '' : 'inactive'}">
               <td><strong>${esc(m.display_name)}</strong>${m.id === S.me.id ? ' <span class="faint">(you)</span>' : ''}</td>
-              <td><code title="${esc(m.address)}">${esc(shortAddr(m.address))}</code>
-                <button type="button" class="btn btn-ghost btn-sm" data-copy="${esc(m.address)}" aria-label="Copy address">Copy</button></td>
+              <td>${m.addresses.map((a) => `<div><code title="${esc(a)}">${esc(shortAddr(a))}</code></div>`).join('')}</td>
               <td>${m.is_active ? (m.is_admin ? 'Admin' : 'Signer') : 'Disabled'}</td>
               <td>${m.last_login_at ? timeTag(m.last_login_at) : '<span class="faint">never</span>'}</td>
-              ${admin ? `<td class="nowrap">${m.env_admin ? '<span class="faint small">set in config</span>' : `
-                <button type="button" class="btn btn-sm" data-member="${m.id}" data-op="rename">Rename</button>
-                ${m.id !== S.me.id ? `
-                  <button type="button" class="btn btn-sm" data-member="${m.id}" data-op="admin">${m.is_admin ? 'Remove admin' : 'Make admin'}</button>
-                  <button type="button" class="btn btn-sm ${m.is_active ? 'btn-danger' : ''}" data-member="${m.id}" data-op="active">${m.is_active ? 'Disable' : 'Enable'}</button>` : ''}`}
-              </td>` : ''}
+              <td class="nowrap right">${m.env_admin ? '<span class="faint small">set in config</span>' : m.id === S.me.id ? '' : `
+                <button type="button" class="btn btn-sm" data-member="${m.id}" data-op="admin">${m.is_admin ? 'Remove admin' : 'Make admin'}</button>
+                <button type="button" class="btn btn-sm ${m.is_active ? 'btn-danger' : ''}" data-member="${m.id}" data-op="active">${m.is_active ? 'Disable' : 'Enable'}</button>`}
+              </td>
             </tr>`).join('')}
           </tbody>
         </table></div>
-      </section>`;
-
-    if (!admin) return;
-    const save = async (params) => {
-      try {
-        const r = await api('save_member', params);
-        drawMembers(r.members);
-        toast('Saved', 'success');
-      } catch (e) { toast(e.message, 'error'); }
-    };
-    $('#member-form').addEventListener('submit', async (ev) => {
-      ev.preventDefault();
-      try {
-        const r = await api('save_member', {
-          address: $('#m-address').value.replace(/\s+/g, ''), display_name: $('#m-name').value, is_admin: $('#m-admin').checked ? 1 : 0,
-        });
-        drawMembers(r.members);
-        toast('Signer added', 'success');
-      } catch (e) { $('#m-error').innerHTML = `<div class="notice notice-error mt-12">${esc(e.message)}</div>`; }
-    });
-    view.querySelectorAll('[data-member]').forEach((btn) => btn.addEventListener('click', async () => {
-      const m = members.find((x) => x.id === Number(btn.dataset.member));
-      const base = { id: m.id, display_name: m.display_name, is_admin: m.is_admin, is_active: m.is_active };
-      if (btn.dataset.op === 'rename') {
-        const name = await dialog({ title: `Rename ${m.display_name}`, confirm: 'Save', input: { label: 'Display name', max: 40 } });
-        if (name) save({ ...base, display_name: name });
-      } else if (btn.dataset.op === 'admin') {
-        save({ ...base, is_admin: m.is_admin ? 0 : 1 });
-      } else if (btn.dataset.op === 'active') {
-        if (m.is_active && !(await dialog({ title: `Disable ${m.display_name}?`, body: 'They will be signed out and cannot sign in until re-enabled. Their history is kept.', confirm: 'Disable', danger: true }))) return;
-        save({ ...base, is_active: m.is_active ? 0 : 1 });
-      }
-    }));
-  }
-
-  // ------------------------------------------------------------------------
-  // Activity (admins)
-  // ------------------------------------------------------------------------
-  async function renderActivity() {
-    const view = shell('activity');
-    view.innerHTML = '<div class="loading">Loading…</div>';
-    let events;
-    try { events = (await api('recent_events')).events; } catch (e) { view.innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`; return; }
-    view.innerHTML = `
+      </section>
       <section class="panel">
         <div class="panel-title"><h2>Recent activity</h2><span class="faint small">last 200 events</span></div>
         <div class="table-wrap"><table class="list">
-          <thead><tr><th>When</th><th>Who</th><th>Event</th><th>Transaction</th><th>Detail</th><th>IP</th></tr></thead>
+          <thead><tr><th>When</th><th>Who</th><th>Event</th><th>TX</th><th>Detail</th><th>IP</th></tr></thead>
           <tbody>${events.map((e) => `
             <tr>
-              <td class="nowrap" title="${esc(fullDate(e.created_at))}">${esc(fullDate(e.created_at))}</td>
+              <td class="nowrap">${esc(fullDate(e.created_at))}</td>
               <td>${esc(e.member || '-')}</td>
               <td><span class="tag">${esc(e.event)}</span></td>
-              <td>${e.transaction_id ? `<a href="#tx/${esc(e.transaction_id)}">#${esc(e.transaction_id)}</a>` : ''}</td>
+              <td>${e.transaction_id ? `#${esc(e.transaction_id)}` : ''}</td>
               <td class="small anywhere">${esc(e.detail)}</td>
               <td class="small faint">${esc(e.ip)}</td>
             </tr>`).join('')}
           </tbody>
         </table></div>
       </section>`;
+
+    $$('[data-member]', view).forEach((btn) => btn.addEventListener('click', async () => {
+      const m = members.find((x) => x.id === Number(btn.dataset.member));
+      const params = { id: m.id };
+      if (btn.dataset.op === 'admin') params.is_admin = m.is_admin ? 0 : 1;
+      else {
+        if (m.is_active && !(await dialog({
+          title: `Disable ${m.display_name}?`, body: 'They are signed out and cannot sign in until re-enabled. Their history is kept.',
+          confirm: 'Disable', danger: true,
+        }))) return;
+        params.is_active = m.is_active ? 0 : 1;
+      }
+      try {
+        const r = await api('admin_update', params);
+        drawAdmin(r.members, events);
+        toast('Saved', 'success');
+      } catch (e) { toast(e.message, 'error'); }
+    }));
   }
 
   // ------------------------------------------------------------------------

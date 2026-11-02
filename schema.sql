@@ -6,17 +6,29 @@
 CREATE DATABASE IF NOT EXISTS sigmasync CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE sigmasync;
 
--- Signers allowed to use the app. Identified by their Ergo wallet (P2PK) address.
+-- Accounts. Anyone who proves control of an Ergo wallet key gets one; what they can see
+-- is decided by the keys they hold (see member_keys / transaction_keys).
 CREATE TABLE IF NOT EXISTS members (
     id             INT AUTO_INCREMENT PRIMARY KEY,
-    address        VARCHAR(64)  NOT NULL,
     display_name   VARCHAR(64)  NOT NULL,
+    name_chosen    TINYINT(1)   NOT NULL DEFAULT 0,
     is_admin       TINYINT(1)   NOT NULL DEFAULT 0,
     is_active      TINYINT(1)   NOT NULL DEFAULT 1,
-    created_by     INT          NULL,
     created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_login_at  DATETIME     NULL,
-    UNIQUE KEY uq_members_address (address)
+    last_login_at  DATETIME     NULL
+) ENGINE=InnoDB;
+
+-- Wallet addresses (P2PK) an account has proven it controls, by signing a challenge.
+CREATE TABLE IF NOT EXISTS member_keys (
+    id             INT AUTO_INCREMENT PRIMARY KEY,
+    member_id      INT          NOT NULL,
+    address        VARCHAR(64)  NOT NULL,
+    pk             CHAR(66)     NOT NULL,          -- compressed public key, hex
+    created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_key_address (address),
+    UNIQUE KEY uq_key_pk (pk),
+    KEY ix_key_member (member_id),
+    CONSTRAINT fk_key_member FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 -- One-time sign-in challenges (a Minotaur cold-signing request per attempt).
@@ -24,6 +36,7 @@ CREATE TABLE IF NOT EXISTS auth_challenges (
     id             INT AUTO_INCREMENT PRIMARY KEY,
     token_hash     CHAR(64)     NOT NULL,
     address        VARCHAR(64)  NOT NULL,
+    member_id      INT          NULL,              -- set when linking an extra address
     message_hex    TEXT         NOT NULL,
     ip             VARCHAR(45)  NOT NULL,
     created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -57,8 +70,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     wallet_name       VARCHAR(80)  NOT NULL DEFAULT '',
     minotaur_version  VARCHAR(40)  NOT NULL,
     signers_required  TINYINT UNSIGNED NOT NULL,
-    signers_total     TINYINT UNSIGNED NULL,
-    ergo_tx_id        CHAR(64)     NULL,
+    signers_total     TINYINT UNSIGNED NOT NULL,
+    ergo_tx_id        CHAR(64)     NOT NULL,
     status            VARCHAR(12)  NOT NULL DEFAULT 'commit',
     commits           TINYINT UNSIGNED NOT NULL DEFAULT 0,
     signatures        TINYINT UNSIGNED NOT NULL DEFAULT 0,
@@ -74,6 +87,19 @@ CREATE TABLE IF NOT EXISTS transactions (
     CONSTRAINT fk_tx_lock FOREIGN KEY (lock_member_id) REFERENCES members(id)
 ) ENGINE=InnoDB;
 
+-- The signer keys of each transaction, read from the transaction itself, with the
+-- latest state of each key's slot: 0 empty, 1 committed, 2 signed, 3 not participating.
+-- An account can see a transaction only if it holds one of these keys.
+CREATE TABLE IF NOT EXISTS transaction_keys (
+    transaction_id  INT          NOT NULL,
+    pk              CHAR(66)     NOT NULL,
+    slot            TINYINT UNSIGNED NOT NULL,
+    state           TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    PRIMARY KEY (transaction_id, pk),
+    KEY ix_txkey_pk (pk),
+    CONSTRAINT fk_txkey_tx FOREIGN KEY (transaction_id) REFERENCES transactions(id)
+) ENGINE=InnoDB;
+
 -- Every payload pasted into a transaction, in order. The newest row is the one the
 -- next signer must continue from.
 CREATE TABLE IF NOT EXISTS submissions (
@@ -85,7 +111,6 @@ CREATE TABLE IF NOT EXISTS submissions (
     payload_sha256  CHAR(64)     NOT NULL,
     commits         TINYINT UNSIGNED NOT NULL DEFAULT 0,
     signatures      TINYINT UNSIGNED NOT NULL DEFAULT 0,
-    slot_index      TINYINT UNSIGNED NULL,           -- signer key position, when detected
     created_at      DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     KEY ix_sub_tx (transaction_id, id),
     CONSTRAINT fk_sub_tx FOREIGN KEY (transaction_id) REFERENCES transactions(id),
