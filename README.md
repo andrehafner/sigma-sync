@@ -92,8 +92,17 @@ final Ergo transaction ID, so the explorer link works from the start.
 | A commitment or signature from an earlier paste is missing or replaced | Refused ("you probably started from an older request") |
 | Nothing new added (the request pasted back) | Refused |
 | One page of a multi-page QR code | Refused, with a hint to scan every page |
+| A commitment or signature for someone else's key | Refused: each signer submits their own |
+| A new commitment after signing has started | Refused: commitments are closed |
 
 Each stored payload has a short SHA-256 fingerprint so signers can tell versions apart.
+
+### Your step is final
+
+Once your commitment (or signature) is in, the next signers build on it, so it cannot be redone.
+You can only lock a transaction while it still needs **your** step: in the commitment round if
+none of your keys has committed, in the signing round if you committed and have not signed.
+Signers who did not commit cannot join once signing has started.
 
 ### Locks
 

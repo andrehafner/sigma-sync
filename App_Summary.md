@@ -81,6 +81,10 @@
   if the account holds one of the transaction's signer keys (`transaction_keys` joined to
   `member_keys`). The list query uses the same condition. Unauthorized and non-existent IDs get
   the same "Transaction not found" answer.
+- Turn rules are enforced server-side: an account can lock only while it owes the current round
+  its step (commitment round: none of its keys committed; signing round: committed, not yet
+  signed). A submission may only add the submitter's own commitment/signature, in one of the
+  submitter's key slots, for the current round. Given commitments and signatures are final.
 - Record-level rules are enforced server-side: only the lock holder may submit or release;
   the holder cannot vote on their own lock; only the creator or an admin (who is also a signer)
   may cancel.
