@@ -133,6 +133,41 @@ sub msr {
     is($cmp2->{lost} + $cmp2->{changed}, 0, '... with simulated slots for non-participants allowed');
 }
 
+# Output decoding: a Minotaur multi-sig address, the miner fee, and a P2PK output that
+# carries a token and registers must all decode, with amounts and token ids.
+{
+    my $vlq = \&ErgoKit::vlq;
+    my @pks = map { "\x02" . chr(0x30 + $_) x 32 } 0 .. 2;
+    my $ms_tree = "\x10" . $vlq->(4) . "\x04" . $vlq->(4)          # 2-of-3 (zig-zag 2 = 4)
+                . join('', map { "\x08\xcd" . $_ } @pks)
+                . "\x98\x73\x00\x83" . $vlq->(3) . "\x08" . join('', map { "\x73" . $vlq->($_) } 1 .. 3);
+    my $fee_tree = pack 'H*', '1005040004000e36100204a00b08cd0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ea02d192a39a8cc7a701730073011001020402d19683030193a38cc7b2a57300000193c2b2a57301007473027303830108cdeeac93b1a57304';
+    my $p2pk = address_decode('9f3AaAirSTGYKWqDcw8hEa4Pk4hYiS96VC3Kpcr7CKTuqTiwjCy')->{tree};
+    my $token = "\xab" x 32;
+    my $registers = "\x03"
+        . "\x0e" . $vlq->(3) . 'abc'                              # R4: Coll[Byte]
+        . "\x04" . $vlq->(84)                                     # R5: Int 42
+        . "\x08\xcd" . $pks[0];                                   # R6: SigmaProp
+    my $msg = $vlq->(1) . ("\x11" x 32) . "\x00\x00"              # one input
+            . $vlq->(0)                                           # no data inputs
+            . $vlq->(1) . $token                                  # token table
+            . $vlq->(3)
+            . $vlq->(5_000_000_000) . $p2pk . $vlq->(100) . "\x01" . $vlq->(0) . $vlq->(7) . $registers
+            . $vlq->(2_000_000_000) . $ms_tree . $vlq->(100) . "\x00\x00"
+            . $vlq->(1_100_000) . $fee_tree . $vlq->(100) . "\x00\x00";
+    my $reduced = $vlq->(length $msg) . $msg . "\x98\x02" . $vlq->(3) . join('', map { "\xcd" . $_ } @pks) . "\x00\x00";
+    my $payload = encode_json({ MSR => encode_json({ tx => encode_base64($reduced, ''), boxes => [], hints => [[ '', '', '' ]] }) });
+    my $a = analyze_payload($payload);
+    ok(!$a->{outputs_partial}, 'decodes every output (multi-sig, fee, registers)');
+    is(scalar @{ $a->{outputs} }, 3, '... all three');
+    is($a->{outputs}[0]{value}, '5000000000', '... payment amount');
+    is_deeply($a->{outputs}[0]{tokens}, [ { id => unpack('H*', $token), amount => '7' } ], '... payment token');
+    ok($a->{outputs}[1]{is_multisig}, '... multi-sig destination recognised');
+    like($a->{outputs}[1]{address}, qr/^[1-9A-HJ-NP-Za-km-z]{60,}$/, '... with its P2S address');
+    ok($a->{outputs}[2]{is_fee}, '... miner fee recognised');
+    is($a->{minotaur_format}, '3', 'hints layout reported as Minotaur 3.0+');
+}
+
 {
     my $a = analyze_payload('{"MSR":"{\"tx\":\"AAAA');
     ok(!$a->{valid}, 'rejects truncated JSON');

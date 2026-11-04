@@ -430,15 +430,111 @@ sub _hint_state {
 # P2PK trees; anything else stops the (best-effort) walk.
 sub _read_tree {
     my ($r) = @_;
+    my $start  = $r->{p};
     my $header = _u8($r);
-    if ($header & 0x08) {
+    if ($header & 0x08) {                                   # size flag: length is given
         my $size = _vlq($r);
         return chr($header) . vlq($size) . _take($r, $size);
     }
-    if ($header == 0x00 && substr($r->{b}, $r->{p}, 2) eq "\x08\xcd") {
+    if ($header == 0x00 && substr($r->{b}, $r->{p}, 2) eq "\x08\xcd") {    # P2PK
         return chr($header) . _take($r, 35);
     }
+    if ($header == 0x10) {
+        my $fee = pack 'H*', $FEE_TREE_HEX;
+        if (substr($r->{b}, $start, length $fee) eq $fee) {             # miner fee contract
+            $r->{p} = $start + length $fee;
+            return $fee;
+        }
+        _skip_minotaur_multisig_body($r);                                 # Minotaur multi-sig wallet
+        return substr($r->{b}, $start, $r->{p} - $start);
+    }
     die "unsupported tree layout\n";
+}
+
+# Minotaur multi-sig address (constant-segregated, no size flag):
+#   10 <n+1> 04 <M> (08 cd <key>) x n  98 73 00  83 <n> 08  (73 <i>) for i = 1..n
+sub _skip_minotaur_multisig_body {
+    my ($r) = @_;
+    my $count = _vlq($r);
+    die "not a multi-sig tree\n" unless $count >= 2 && _u8($r) == 0x04;
+    _vlq($r);                                               # M (zig-zag int)
+    for (2 .. $count) {
+        die "not a multi-sig tree\n" unless _take($r, 2) eq "\x08\xcd";
+        _take($r, 33);
+    }
+    my $n = $count - 1;
+    die "not a multi-sig tree\n" unless _take($r, 4) eq "\x98\x73\x00\x83" && _vlq($r) == $n && _u8($r) == 0x08;
+    for my $i (1 .. $n) {
+        die "not a multi-sig tree\n" unless _u8($r) == 0x73 && _vlq($r) == $i;
+    }
+}
+
+# --- Register values (sigma constants), read only to skip over them -------------
+# Type codes follow sigmastate's TypeSerializer: primitives 1-9, then Coll, nested
+# Coll, Option, Option[Coll] and pair constructors in blocks of 12, tuples at 96.
+sub _read_type {
+    my ($r) = @_;
+    my $c = _u8($r);
+    return { prim => $c } if $c >= 1 && $c <= 11;
+    my ($block, $p) = (int($c / 12), $c % 12);
+    my $elem = sub { $p ? { prim => $p } : _read_type($r) };
+    return { coll => $elem->() }                          if $block == 1;
+    return { coll => { coll => $elem->() } }              if $block == 2;
+    return { option => $elem->() }                        if $block == 3;
+    return { option => { coll => $elem->() } }            if $block == 4;
+    if ($block == 5) {                                    # (prim, T) or (T, T)
+        my $first = $p ? { prim => $p } : _read_type($r);
+        return { tuple => [ $first, _read_type($r) ] };
+    }
+    if ($block == 6) {                                    # (T, prim), or a triple
+        return { tuple => [ map { _read_type($r) } 1 .. 3 ] } unless $p;
+        return { tuple => [ _read_type($r), { prim => $p } ] };
+    }
+    if ($block == 7) {                                    # (prim, prim), or a quadruple
+        return { tuple => [ map { _read_type($r) } 1 .. 4 ] } unless $p;
+        return { tuple => [ { prim => $p }, { prim => $p } ] };
+    }
+    return { tuple => [ map { _read_type($r) } 1 .. _u8($r) ] } if $c == 96;
+    return { unit => 1 }   if $c == 98;
+    return { string => 1 } if $c == 102;
+    die "unsupported register type $c\n";
+}
+
+sub _skip_sigma_boolean {
+    my ($r) = @_;
+    my $op = _u8($r);
+    if    ($op == 0xcd) { _take($r, 33) }
+    elsif ($op == 0xce) { _take($r, 132) }
+    elsif ($op == 0x96 || $op == 0x97) { _skip_sigma_boolean($r) for 1 .. _vlq($r) }
+    elsif ($op == 0x98) { _vlq($r); _skip_sigma_boolean($r) for 1 .. _vlq($r) }
+    elsif ($op != 0x7e && $op != 0x7f) { die "unsupported sigma proposition\n" }
+}
+
+sub _skip_value {
+    my ($r, $t) = @_;
+    if (defined(my $p = $t->{prim})) {
+        if    ($p == 1 || $p == 2) { _take($r, 1) }            # Boolean, Byte
+        elsif ($p >= 3 && $p <= 5) { _vlq($r) }                # Short, Int, Long
+        elsif ($p == 6 || $p == 9) { _take($r, _vlq($r)) }     # BigInt, UnsignedBigInt
+        elsif ($p == 7)            { _take($r, 33) }           # GroupElement
+        elsif ($p == 8)            { _skip_sigma_boolean($r) } # SigmaProp
+        else                       { die "unsupported primitive $p\n" }
+    }
+    elsif (my $e = $t->{coll}) {
+        my $len = _vlq($r);
+        if    (($e->{prim} // 0) == 1) { _take($r, int(($len + 7) / 8)) }   # bit-packed
+        elsif (($e->{prim} // 0) == 2) { _take($r, $len) }
+        else  { _skip_value($r, $e) for 1 .. $len }
+    }
+    elsif ($t->{option}) { _skip_value($r, $t->{option}) if _u8($r) }
+    elsif ($t->{tuple})  { _skip_value($r, $_) for @{ $t->{tuple} } }
+    elsif ($t->{string}) { _take($r, _vlq($r)) }
+    elsif (!$t->{unit})  { die "unsupported value\n" }
+}
+
+sub _skip_registers {
+    my ($r) = @_;
+    _skip_value($r, _read_type($r)) for 1 .. _u8($r);
 }
 
 sub _parse_reduced {
@@ -499,14 +595,15 @@ sub _parse_reduced {
             $o{tree}    = unpack 'H*', $tree;
             $o{address} = address_from_tree($tree);
             $o{is_fee}  = $o{tree} eq $FEE_TREE_HEX ? 1 : 0;
+            $o{is_multisig} = !$o{is_fee} && substr($tree, 0, 1) eq "\x10" ? 1 : 0;
             _vlq($m);    # creation height
             my $nt = _u8($m);
             for (1 .. $nt) {
                 my $idx = _vlq($m);
                 push @{ $o{tokens} }, { id => $token_ids[$idx], amount => '' . _vlq($m) };
             }
+            _skip_registers($m);
             push @{ $tx{outputs} }, \%o;
-            die "registers\n" if _u8($m);    # cannot skip registers safely
         }
         1;
     } or $tx{outputs_partial} = 1;
@@ -514,12 +611,17 @@ sub _parse_reduced {
     return \%tx;
 }
 
+# Value, address and tokens of a serialized input box (registers are not needed).
 sub _parse_box_summary {
     my ($b64) = @_;
     my $r = _reader(decode_base64($b64));
     my %b = (value => _vlq($r));
-    my $tree = _read_tree($r);
-    $b{address} = address_from_tree($tree);
+    $b{address} = address_from_tree(_read_tree($r));
+    _vlq($r);    # creation height
+    for (1 .. _u8($r)) {
+        my $id = unpack 'H*', _take($r, 32);
+        $b{tokens}{$id} += _vlq($r);
+    }
     return \%b;
 }
 
@@ -571,6 +673,9 @@ sub analyze_payload {
 
     # Hints: current builds use "hints" (matrix input x signer slot); the oldest builds
     # used "commitments" + "signed".
+    # Payload layout reveals the Minotaur generation: 3.0+ writes "hints", 2.x wrote
+    # "commitments"/"signed"/"simulated". Versions within a generation are identical.
+    $res{minotaur_format} = exists $d->{hints} ? '3' : '2';
     my $matrix = _as_list(exists $d->{hints} ? $d->{hints} : $d->{commitments});
     my @hints = map { [ map { defined $_ && !ref $_ ? $_ : '' } @{ _as_list($_) } ] } @$matrix;
     $res{hints} = \@hints;
@@ -606,14 +711,22 @@ sub analyze_payload {
 
     # Input value (best effort) from the serialized input boxes.
     my $boxes = _as_list($d->{boxes});
-    my ($total, @in_addr) = (0);
+    my ($total, %in_tokens, @in_addr, %by_addr) = (0);
     for my $b (@$boxes) {
         my $s = eval { _parse_box_summary($b) } or do { $total = undef; last };
         $total += $s->{value};
-        push @in_addr, $s->{address};
+        $in_tokens{$_} += $s->{tokens}{$_} for keys %{ $s->{tokens} || {} };
+        push @in_addr, $s->{address} unless $by_addr{ $s->{address} };
+        my $a = $by_addr{ $s->{address} } ||= { address => $s->{address}, value => 0, boxes => 0, tokens => {} };
+        $a->{value} += $s->{value};
+        $a->{boxes}++;
+        $a->{tokens}{$_} = 1 for keys %{ $s->{tokens} || {} };
     }
     if (defined $total && @$boxes) {
-        $res{inputs_value} = "$total";
+        $res{inputs_value}  = "$total";
+        $res{inputs_tokens} = [ map { { id => $_, amount => "$in_tokens{$_}" } } sort keys %in_tokens ];
+        $res{inputs} = [ map { { address => $_->{address}, value => "$_->{value}", boxes => $_->{boxes},
+                                tokens => scalar keys %{ $_->{tokens} } } } @by_addr{@in_addr} ];
         my %mine = map { $_ => 1 } @in_addr;
         $_->{is_change} = $mine{ $_->{address} } ? 1 : 0 for @{ $res{outputs} || [] };
     }

@@ -93,7 +93,8 @@
 ## 6. External integrations
 
 - None from the server. The server makes no outbound connections besides MariaDB on 127.0.0.1.
-- From the browser: `api.github.com` (list of Minotaur releases, cached 6 h, with a built-in
+- From the browser: token names/decimals from `api.ergoplatform.com/api/v1/tokens/` (public
+  data, cached per browser); `api.github.com` (list of Minotaur releases, cached 6 h, with a built-in
   fallback list) and `api.ergoplatform.com` (on-chain status of completed transactions). Both are
   allowed explicitly in the Content-Security-Policy `connect-src`.
 - No SMTP and no Oracle.
