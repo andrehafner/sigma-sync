@@ -974,7 +974,6 @@
           <section class="panel">
             <div class="panel-title"><h2>About this transaction</h2></div>
             ${t.description ? `<div class="prewrap">${esc(t.description)}</div>` : '<p class="faint">No description.</p>'}
-            ${reviewHtml(t)}
           </section>
           <section class="panel">
             <div class="panel-title"><h2>Progress</h2></div>
@@ -995,29 +994,124 @@
           <section class="panel" id="action-panel">${actionHtml(t)}</section>
           ${t.can.cancel ? `<div class="mt-12 right">
             <button type="button" class="btn btn-sm btn-danger" data-action="cancel">Cancel transaction</button></div>` : ''}
+          ${detailsHtml(t)}
         </aside>
       </div>`;
     paintBars(view);
+    fillTokenNames(view);
+    $$('details[data-tokens-lazy]', view).forEach((d) => d.addEventListener('toggle', () => { if (d.open) fillTokenNames(d); }));
     wireDetail(t);
   }
 
-  function reviewHtml(t) {
+  // What the transaction does, decoded from the transaction itself.
+  function detailsHtml(t) {
     const r = t.review;
     if (!r || !r.outputs) return '';
-    const rows = r.outputs.map((o) => `
-      <tr>
-        <td>${o.is_fee ? '<span class="tag">Network fee</span>'
-          : `${o.is_change ? '<span class="tag">Change</span> ' : ''}<span class="addr">${esc(o.address)}</span>`}
-          ${(o.tokens || []).map((tk) => `<div class="small faint">+ ${esc(tk.amount)} × token <code>${esc(shortId(tk.id))}</code></div>`).join('')}
-        </td>
-        <td>${esc(erg(o.value))}</td>
-      </tr>`).join('');
+    const sends = r.outputs.filter((o) => !o.is_fee && !o.is_change);
+    const fee = r.outputs.filter((o) => o.is_fee);
+    const change = r.outputs.filter((o) => o.is_change);
+    const sum = (list) => list.reduce((acc, o) => acc + BigInt(o.value), 0n).toString();
+    const addrText = (a) => (a.length > 60 ? `${a.slice(0, 14)}…${a.slice(-10)}` : a);
+    const addrLink = (a) => `<a class="addr" href="${esc((S.config.explorer_address_url || '') + a)}" target="_blank" rel="noopener" title="${esc(a)}">${esc(addrText(a))}</a>
+      <button type="button" class="btn btn-ghost btn-sm" data-copy="${esc(a)}" aria-label="Copy address">Copy</button>`;
+    const tokenLines = (tokens) => (tokens || []).map((tk) => `
+      <div class="token-line">${tokenHtml(tk.id, tk.amount)}</div>`).join('');
+    const changeTokens = change.reduce((n, o) => n + (o.tokens?.length || 0), 0);
+    const inputs = r.inputs || [];
+
     return `
-      <h3 class="mt-16">Where the funds go</h3>
-      <p class="small muted">Decoded from the transaction itself - compare it with the description before you commit or sign.</p>
-      <table class="outputs">${rows}</table>
-      ${r.outputs_partial ? '<p class="small faint">Some outputs could not be decoded; check them in Minotaur.</p>' : ''}
-      ${r.inputs_value ? `<p class="small muted mt-8">Total spent from the wallet: <strong>${esc(erg(r.inputs_value))}</strong></p>` : ''}`;
+      <section class="panel mt-12 tx-details" aria-labelledby="details-title">
+        <h2 id="details-title">Transaction details</h2>
+        <p class="small muted">Decoded from the transaction itself.</p>
+
+        <h3 class="mt-16">Sending</h3>
+        ${sends.length ? sends.map((o) => `
+          <div class="send">
+            <div class="send-amount">${esc(erg(o.value))}</div>
+            ${tokenLines(o.tokens)}
+            <div class="small muted mt-8">to ${o.is_multisig ? '<span class="tag">multi-sig address</span>' : ''}</div>
+            <div>${addrLink(o.address)}</div>
+          </div>`).join('') : '<p class="small faint">Nothing leaves the wallet except the fee.</p>'}
+
+        <dl class="kv mt-12">
+          <dt>Network fee</dt><dd>${esc(erg(sum(fee)))}</dd>
+          ${change.length ? `<dt>Change back to the spending address</dt><dd>${esc(erg(sum(change)))}</dd>` : ''}
+          <dt><strong>Total sent (incl. fee)</strong></dt><dd><strong>${esc(erg(sum([...sends, ...fee])))}</strong></dd>
+        </dl>
+        ${changeTokens ? `
+          <details class="small mt-8" data-tokens-lazy>
+            <summary>${changeTokens} token${changeTokens === 1 ? '' : 's'} stay at the spending address</summary>
+            ${change.map((o) => tokenLines(o.tokens)).join('')}
+          </details>` : ''}
+        ${!change.length && sends.length ? `<div class="notice notice-warning small mt-8">No output goes back to the address
+          being spent from. If the wallet holds more than is being sent, check where the rest goes.</div>` : ''}
+
+        ${inputs.length ? `
+          <h3 class="mt-16">Spending from</h3>
+          ${inputs.length > 1 ? `<div class="notice notice-warning small">This spends from <strong>${inputs.length} different
+            addresses</strong>. Minotaur can pick boxes from every address of the wallet - make sure that is intended.</div>` : ''}
+          ${inputs.map((i) => `
+            <div class="mt-8">
+              <div>${addrLink(i.address)}</div>
+              <div class="small muted">${esc(erg(i.value))} in ${i.boxes} box${i.boxes === 1 ? '' : 'es'}${
+                i.tokens ? ` · ${i.tokens} token type${i.tokens === 1 ? '' : 's'}` : ''}</div>
+            </div>`).join('')}` : ''}
+
+        ${r.outputs_partial ? '<p class="small faint mt-8">Some outputs could not be decoded - check them in Minotaur.</p>' : ''}
+        ${r.minotaur_format ? `<p class="small faint mt-12">Request format: Minotaur ${r.minotaur_format === '3' ? '3.0 or later' : '2.x'}.</p>` : ''}
+
+        <div class="notice notice-warning verify mt-12">Please verify this for yourself when signing on Minotaur!</div>
+      </section>`;
+  }
+
+  // Token amounts are shown raw until the explorer supplies the name and decimals.
+  function tokenHtml(id, amount) {
+    return `<span data-token="${esc(id)}" data-amount="${esc(amount)}"><strong>${esc(amount)}</strong>
+      <span class="faint">token</span> <code class="small">${esc(shortId(id))}</code></span>`;
+  }
+
+  // Formats a raw integer amount with `decimals` places, without floating point.
+  function units(raw, decimals) {
+    const d = Number(decimals) || 0;
+    const s = String(raw).padStart(d + 1, '0');
+    const whole = d ? s.slice(0, -d) : s;
+    const frac = d ? s.slice(-d).replace(/0+$/, '') : '';
+    return `${BigInt(whole).toLocaleString()}${frac ? '.' + frac : ''}`;
+  }
+
+  async function tokenInfo(id) {
+    if (!S.tokens) {
+      try { S.tokens = JSON.parse(store('sigmasync.tokens') || '{}'); } catch (e) { S.tokens = {}; }
+    }
+    if (S.tokens[id]) return S.tokens[id];
+    const base = S.config.explorer_token_url;
+    if (!base) return null;
+    try {
+      const res = await fetch(base + encodeURIComponent(id));
+      if (!res.ok) return null;
+      const j = await res.json();
+      S.tokens[id] = { name: String(j.name || '').slice(0, 60), decimals: Number(j.decimals) || 0 };
+      store('sigmasync.tokens', JSON.stringify(S.tokens));
+      return S.tokens[id];
+    } catch (e) { return null; }
+  }
+
+  // Fills in token names as text, never HTML: names come from the blockchain.
+  function fillTokenNames(root) {
+    $$('[data-token]', root).forEach(async (el) => {
+      if (el.closest('details:not([open])')) return;
+      const info = await tokenInfo(el.dataset.token);
+      if (!info || !document.body.contains(el)) return;
+      const amount = document.createElement('strong');
+      amount.textContent = units(el.dataset.amount, info.decimals);
+      const name = document.createElement('span');
+      name.textContent = ` ${info.name || 'Unnamed token'} `;
+      const id = document.createElement('code');
+      id.className = 'small faint';
+      id.textContent = shortId(el.dataset.token);
+      id.title = el.dataset.token;
+      el.replaceChildren(amount, name, id);
+    });
   }
 
   // Every key of the multi-sig wallet, read from the transaction itself.

@@ -203,6 +203,8 @@ sub client_config {
         unlock_grace_minutes => cfg('UNLOCK_GRACE_MINUTES', 10) + 0,
         explorer_tx_url      => cfg('EXPLORER_TX_URL', 'https://explorer.ergoplatform.com/en/transactions/'),
         explorer_api_url     => cfg('EXPLORER_API_URL', 'https://api.ergoplatform.com/api/v1/transactions/'),
+        explorer_token_url   => cfg('EXPLORER_TOKEN_API_URL', 'https://api.ergoplatform.com/api/v1/tokens/'),
+        explorer_address_url => cfg('EXPLORER_ADDRESS_URL', 'https://explorer.ergoplatform.com/en/addresses/'),
     };
 }
 
@@ -589,11 +591,22 @@ sub act_get_transaction {
     my $latest = latest_submission($id);
     if ($latest) {
         my $a = analyze_payload($latest->{payload});
+        # The latest MSR describes the transaction; a final CSTX does not carry boxes.
+        my $d = $a;
+        if ($a->{format} ne 'MSR') {
+            my ($msr) = grep { $_->{format} eq 'MSR' }
+                map { analyze_payload(unseal($_->[0], 'submission.payload')) }
+                @{ $db->selectall_arrayref('SELECT payload_enc FROM submissions WHERE transaction_id = ? ORDER BY id DESC LIMIT 5', undef, $id) };
+            $d = $msr if $msr;
+        }
         $brief->{review} = {
             format          => $a->{format},
-            outputs         => $a->{outputs},
-            outputs_partial => $a->{outputs_partial} ? 1 : 0,
-            inputs_value    => $a->{inputs_value},
+            outputs         => $d->{outputs},
+            outputs_partial => $d->{outputs_partial} ? 1 : 0,
+            inputs          => $d->{inputs},
+            inputs_value    => $d->{inputs_value},
+            inputs_tokens   => $d->{inputs_tokens},
+            minotaur_format => $d->{minotaur_format},
         };
         if (($brief->{lock} && $brief->{lock}{mine}) || $tx->{status} eq 'complete' || $tx->{status} eq 'broadcast') {
             $brief->{payload} = {
@@ -649,6 +662,23 @@ sub check_payload {
     return ($a, $cmp);
 }
 
+# Minotaur 3.0+ writes and reads the "hints" layout; 2.x used another one. The two
+# generations cannot continue each other's requests.
+sub version_major { my ($v) = @_; return $v =~ /(\d+)\./ ? $1 + 0 : undef }
+
+sub check_generation {
+    my ($version, $a) = @_;
+    my $major = version_major($version);
+    return unless $a->{minotaur_format} && defined $major;
+    my $want = $major >= 3 ? '3' : '2';
+    return if $a->{minotaur_format} eq $want;
+    fail($a->{minotaur_format} eq '2'
+        ? "This request was made with Minotaur 2.x, but this transaction uses Minotaur $version. "
+          . 'Minotaur 3.0 and later cannot read 2.x requests - update Minotaur and start again from the latest request.'
+        : "This request was made with Minotaur 3.0 or later, but this transaction uses Minotaur $version. "
+          . 'Use the version the transaction was started with.');
+}
+
 sub payload_param {
     my $p = sanitize_payload(param('payload'));
     fail('Paste the payload from Minotaur.') unless length $p;
@@ -677,7 +707,7 @@ sub update_key_states {
 sub act_analyze {
     my $payload = sanitize_payload(param('payload'));
     my $a = analyze_payload($payload);
-    my %out = map { $_ => $a->{$_} } qw(format valid error warning tx_id required signers committed signed outputs outputs_partial inputs_value);
+    my %out = map { $_ => $a->{$_} } qw(format valid error warning tx_id required signers committed signed outputs outputs_partial inputs_value minotaur_format);
     if ($a->{input_keys}) {
         my %mine = map { $_ => 1 } @{ my_pks() };
         my @my_keys = grep { $mine{$_} } @{ tx_keys($a) };
@@ -688,7 +718,8 @@ sub act_analyze {
     if ($tx_id =~ /^\d+$/ && length $payload) {
         my $tx = load_tx($tx_id);
         my $latest = latest_submission($tx_id);
-        eval { my (undef, $cmp) = check_payload($tx, $payload, $latest); $out{compare} = $cmp; 1 }
+        eval { my (undef, $cmp) = check_payload($tx, $payload, $latest); check_generation($tx->{minotaur_version}, $a);
+               $out{compare} = $cmp; 1 }
             or do { my $e = $@; die $e unless ref $e eq 'HASH'; $out{problem} = $e->{public} };
     }
     return { analysis => \%out };
@@ -723,6 +754,11 @@ sub act_create_transaction {
     fail('Start a transaction with the multi-sig request (MSR) from Minotaur, after you have committed.')
         unless $a->{format} eq 'MSR';
     fail('Sigma Sync could not read the signer keys from this transaction.') unless $a->{input_keys};
+    if ($a->{minotaur_format} && version_major($version) && ($a->{minotaur_format} eq '2') != (version_major($version) < 3)) {
+        fail($a->{minotaur_format} eq '2'
+            ? 'This request was made with Minotaur 2.x. Pick a 2.x version, or (better) redo it with the latest Minotaur.'
+            : 'This request was made with Minotaur 3.0 or later, but you picked a 2.x version. Pick the version you actually used.');
+    }
 
     # Only a signer of the wallet can start a transaction for it, and their own
     # commitment must already be in the request.
@@ -839,6 +875,7 @@ sub act_submit {
 
     my ($a, $cmp) = check_payload($tx, $payload, latest_submission($id));
     check_ownership($tx, $a, $cmp);
+    check_generation($tx->{minotaur_version}, $a);
 
     my $required = $tx->{signers_required};
     my ($commits, $signatures, $round, $status);

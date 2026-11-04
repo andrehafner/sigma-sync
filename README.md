@@ -24,8 +24,13 @@ Sigma Sync is a small web app that keeps one source of truth for each transactio
   holds the lock, and what is waiting on you. Each signer key shows whether its owner has
   committed or signed. Each transaction has a description, comments,
   and a full activity history.
-- **Review before you sign.** Outputs are decoded from the transaction itself (amounts,
-  destination addresses, fee, change), so you can compare them with the description.
+- **Review before you sign.** A *Transaction details* panel decodes the transaction itself: every
+  payment with its ERG and tokens (names and decimals from the explorer) and destination, the
+  fee, the change, and which wallet addresses it spends from, with a warning when it spends from
+  more than one. It ends with a reminder to verify everything again in Minotaur.
+- **Minotaur generation check.** Minotaur 3.0+ and 2.x write different request layouts and cannot
+  read each other's. Sigma Sync detects the layout (it cannot tell 3.0 from 4.2.1 - those are
+  identical) and refuses a paste from the wrong generation for the transaction's chosen version.
 - **QR codes both ways.** Requests are shown as paged/animated QR codes in Minotaur's own
   format, and the camera scanner reads Minotaur's paged QR codes back.
 - **Encrypted at rest.** Titles, descriptions, payloads and comments are stored with AES-256-GCM.
