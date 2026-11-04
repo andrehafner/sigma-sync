@@ -1031,7 +1031,8 @@
           <div class="send">
             <div class="send-amount">${esc(erg(o.value))}</div>
             ${tokenLines(o.tokens)}
-            <div class="small muted mt-8">to ${o.is_multisig ? '<span class="tag">multi-sig address</span>' : ''}</div>
+            <div class="small muted mt-8">to ${o.to_input_address ? '<span class="tag">same address it spends from</span>'
+              : o.is_multisig ? '<span class="tag">multi-sig address</span>' : ''}</div>
             <div>${addrLink(o.address)}</div>
           </div>`).join('') : '<p class="small faint">Nothing leaves the wallet except the fee.</p>'}
 

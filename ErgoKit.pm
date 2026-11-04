@@ -729,8 +729,16 @@ sub analyze_payload {
         $res{inputs_tokens} = [ map { { id => $_, amount => "$in_tokens{$_}" } } sort keys %in_tokens ];
         $res{inputs} = [ map { { address => $_->{address}, value => "$_->{value}", boxes => $_->{boxes},
                                 tokens => scalar keys %{ $_->{tokens} } } } @by_addr{@in_addr} ];
+        # Ergo's transaction builder appends the change box after the payments (the fee
+        # box comes last), so only the last non-fee output can be change. Earlier outputs
+        # to a spending address are deliberate payments to it (e.g. a test send to self).
         my %mine = map { $_ => 1 } @in_addr;
-        $_->{is_change} = $mine{ $_->{address} } ? 1 : 0 for @{ $res{outputs} || [] };
+        my @outs = @{ $res{outputs} || [] };
+        my ($last) = grep { !$_->{is_fee} } reverse @outs;
+        for my $o (@outs) {
+            $o->{to_input_address} = $mine{ $o->{address} } ? 1 : 0;
+            $o->{is_change} = $last && $o == $last && $o->{to_input_address} ? 1 : 0;
+        }
     }
 
     $res{valid} = 1;
