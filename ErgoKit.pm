@@ -328,7 +328,7 @@ sub _signed_tx_split {
 # Verifies the CSTX text Minotaur returned for a sign-in request.
 #   expected_message: the unsigned transaction bytes from build_login_request
 #   pk: the 33-byte public key of the address that is signing in
-# Returns (1) on success or (0, reason).
+# Returns (1) on success or (0, reason[, signed_message]).
 sub verify_login_response {
     my (%arg) = @_;
     my $doc = eval { _decode_envelope(sanitize_payload($arg{response})) };
@@ -338,7 +338,9 @@ sub verify_login_response {
     my $signed = decode_base64($doc->{data}{signedTx});
     my ($message, $inputs) = eval { _signed_tx_split($signed) };
     return (0, 'The signed transaction could not be read.') unless $message;
-    return (0, 'This signature is for a different sign-in request. Start again and use the newest request.')
+    # On a mismatch the signed message is returned too, so the caller can tell the user
+    # *which* request was signed (e.g. an old one a wallet re-displayed).
+    return (0, 'This signature is for a different sign-in request. Start again and use the newest request.', $message)
         unless $message eq $arg{expected_message} && @$inputs == 1;
 
     my $proof = $inputs->[0]{proof};
@@ -727,8 +729,16 @@ sub analyze_payload {
         $res{inputs_tokens} = [ map { { id => $_, amount => "$in_tokens{$_}" } } sort keys %in_tokens ];
         $res{inputs} = [ map { { address => $_->{address}, value => "$_->{value}", boxes => $_->{boxes},
                                 tokens => scalar keys %{ $_->{tokens} } } } @by_addr{@in_addr} ];
+        # Ergo's transaction builder appends the change box after the payments (the fee
+        # box comes last), so only the last non-fee output can be change. Earlier outputs
+        # to a spending address are deliberate payments to it (e.g. a test send to self).
         my %mine = map { $_ => 1 } @in_addr;
-        $_->{is_change} = $mine{ $_->{address} } ? 1 : 0 for @{ $res{outputs} || [] };
+        my @outs = @{ $res{outputs} || [] };
+        my ($last) = grep { !$_->{is_fee} } reverse @outs;
+        for my $o (@outs) {
+            $o->{to_input_address} = $mine{ $o->{address} } ? 1 : 0;
+            $o->{is_change} = $last && $o == $last && $o->{to_input_address} ? 1 : 0;
+        }
     }
 
     $res{valid} = 1;

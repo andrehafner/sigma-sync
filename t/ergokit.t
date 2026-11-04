@@ -168,6 +168,24 @@ sub msr {
     is($a->{minotaur_format}, '3', 'hints layout reported as Minotaur 3.0+');
 }
 
+# A payment back to the spending address (e.g. a test send to self) is a payment, not
+# change: only the last non-fee output can be change.
+{
+    my $vlq  = \&ErgoKit::vlq;
+    my $tree = address_decode('9f3AaAirSTGYKWqDcw8hEa4Pk4hYiS96VC3Kpcr7CKTuqTiwjCy')->{tree};
+    my $fee  = pack 'H*', '1005040004000e36100204a00b08cd0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ea02d192a39a8cc7a701730073011001020402d19683030193a38cc7b2a57300000193c2b2a57301007473027303830108cdeeac93b1a57304';
+    my $box  = ErgoKit::_box_candidate_bytes(15_000_000_000, $tree, 100) . ("\x22" x 32) . $vlq->(0);
+    my $out  = sub { $vlq->($_[0]) . $_[1] . $vlq->(100) . "\x00\x00" };
+    my $msg  = $vlq->(1) . ErgoKit::blake2b256($box) . "\x00\x00" . $vlq->(0) . $vlq->(0) . $vlq->(3)
+             . $out->(10_000_000_000, $tree) . $out->(4_998_900_000, $tree) . $out->(1_100_000, $fee);
+    my $reduced = $vlq->(length $msg) . $msg . "\xcd" . address_decode('9f3AaAirSTGYKWqDcw8hEa4Pk4hYiS96VC3Kpcr7CKTuqTiwjCy')->{pk} . "\x00\x00";
+    my $a = analyze_payload(encode_json({ MSR => encode_json({ tx => encode_base64($reduced, ''),
+        boxes => [ encode_base64($box, '') ], hints => [['']] }) }));
+    ok(!$a->{outputs}[0]{is_change} && $a->{outputs}[0]{to_input_address}, 'a send to the spending address is a payment');
+    ok($a->{outputs}[1]{is_change}, '... and the last output back to it is the change');
+    ok(!$a->{outputs}[2]{is_change} && $a->{outputs}[2]{is_fee}, '... then the fee');
+}
+
 {
     my $a = analyze_payload('{"MSR":"{\"tx\":\"AAAA');
     ok(!$a->{valid}, 'rejects truncated JSON');
