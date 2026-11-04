@@ -419,6 +419,8 @@
             <li>Check it is the wallet for this address, then <strong>Sign</strong>. Air-gapped wallets work the same way.</li>
             <li>Copy (or show) the signed result Minotaur produces.</li>
           </ol>
+          <p class="small faint">Minotaur did not ask for your password? Then it is showing an old result -
+          fully close and reopen Minotaur and scan again.</p>
           <div data-ch="qr"></div>
           <div class="row mt-8">
             <button type="button" class="btn btn-sm" data-ch="copy">Copy request</button>

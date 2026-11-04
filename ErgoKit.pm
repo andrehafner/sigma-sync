@@ -328,7 +328,7 @@ sub _signed_tx_split {
 # Verifies the CSTX text Minotaur returned for a sign-in request.
 #   expected_message: the unsigned transaction bytes from build_login_request
 #   pk: the 33-byte public key of the address that is signing in
-# Returns (1) on success or (0, reason).
+# Returns (1) on success or (0, reason[, signed_message]).
 sub verify_login_response {
     my (%arg) = @_;
     my $doc = eval { _decode_envelope(sanitize_payload($arg{response})) };
@@ -338,7 +338,9 @@ sub verify_login_response {
     my $signed = decode_base64($doc->{data}{signedTx});
     my ($message, $inputs) = eval { _signed_tx_split($signed) };
     return (0, 'The signed transaction could not be read.') unless $message;
-    return (0, 'This signature is for a different sign-in request. Start again and use the newest request.')
+    # On a mismatch the signed message is returned too, so the caller can tell the user
+    # *which* request was signed (e.g. an old one a wallet re-displayed).
+    return (0, 'This signature is for a different sign-in request. Start again and use the newest request.', $message)
         unless $message eq $arg{expected_message} && @$inputs == 1;
 
     my $proof = $inputs->[0]{proof};

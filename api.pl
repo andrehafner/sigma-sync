@@ -273,8 +273,18 @@ sub act_auth_finish {
     fail('That is far too long to be a signed result.') if length $response > 200_000;
 
     my $info = address_decode($ch->{address});
-    my ($ok, $why) = verify_login_response(
+    my ($ok, $why, $signed_message) = verify_login_response(
         response => $response, expected_message => pack('H*', $ch->{message_hex}), pk => $info->{pk});
+    if (!$ok && $signed_message) {
+        # Minotaur keeps the previous signed result on screen when a new request is scanned
+        # in the same session (it then shows no password prompt). Recognise that case.
+        my ($old) = $db->selectrow_array(
+            'SELECT id FROM auth_challenges WHERE address = ? AND message_hex = ? AND id <> ?',
+            undef, $ch->{address}, unpack('H*', $signed_message), $ch->{id});
+        $why = 'Minotaur gave you the result of an earlier sign-in instead of signing this new request '
+             . '(it did not ask for your password, right?). This is a Minotaur quirk: fully close and reopen '
+             . 'Minotaur, then scan or paste the request shown here again.' if $old;
+    }
     unless ($ok) {
         # A wrong paste (e.g. the request itself) does not burn the challenge.
         log_event('login_failed', "$ch->{address}: $why");
