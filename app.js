@@ -1237,6 +1237,9 @@
       <div class="stack">
         <div>
           <p class="step-label"><span class="step-num">1</span> Copy the latest request into Minotaur</p>
+          <p class="small muted">In Minotaur open the <strong>multi-sig wallet</strong> → <strong>Multi-sig Communication</strong>
+          → scan or paste there. The scanner on Minotaur's home screen cannot read multi-sig requests
+          ("Invalid QR Code").</p>
           ${p ? payloadBlock(p) : '<p class="faint">No payload stored yet.</p>'}
         </div>
         <form id="submit-form" class="stack" novalidate>
