@@ -613,6 +613,7 @@ sub act_get_transaction {
             format          => $a->{format},
             outputs         => $d->{outputs},
             outputs_partial => $d->{outputs_partial} ? 1 : 0,
+            outputs_uncertain => $d->{outputs_uncertain} ? 1 : 0,
             inputs          => $d->{inputs},
             inputs_value    => $d->{inputs_value},
             inputs_tokens   => $d->{inputs_tokens},

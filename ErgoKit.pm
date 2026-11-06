@@ -524,6 +524,7 @@ sub _skip_value {
     }
     elsif (my $e = $t->{coll}) {
         my $len = _vlq($r);
+        die "collection too long\n" if $len > length($r->{b}) - $r->{p} + 8 || ($e->{unit} && $len);
         if    (($e->{prim} // 0) == 1) { _take($r, int(($len + 7) / 8)) }   # bit-packed
         elsif (($e->{prim} // 0) == 2) { _take($r, $len) }
         else  { _skip_value($r, $e) for 1 .. $len }
@@ -584,29 +585,19 @@ sub _parse_reduced {
     }
     $tx{input_keys} = \@input_keys if $readable;
 
-    # Outputs (best effort - stops quietly on layouts we do not decode).
+    # Outputs. Contract trees without a size field cannot be measured without a full
+    # ErgoTree parser, so for those every possible length is tried and the one after
+    # which the rest of the transaction parses exactly to its end is kept.
     eval {
         my $n_data = _vlq($m);
         _take($m, 32 * $n_data);
         my $n_tok = _vlq($m);
         my @token_ids = map { unpack 'H*', _take($m, 32) } 1 .. $n_tok;
         my $n_out = _vlq($m);
-        for (1 .. $n_out) {
-            my %o = (value => '' . _vlq($m));    # strings: amounts can exceed JS safe integers
-            my $tree = _read_tree($m);
-            $o{tree}    = unpack 'H*', $tree;
-            $o{address} = address_from_tree($tree);
-            $o{is_fee}  = $o{tree} eq $FEE_TREE_HEX ? 1 : 0;
-            $o{is_multisig} = !$o{is_fee} && substr($tree, 0, 1) eq "\x10" ? 1 : 0;
-            _vlq($m);    # creation height
-            my $nt = _u8($m);
-            for (1 .. $nt) {
-                my $idx = _vlq($m);
-                push @{ $o{tokens} }, { id => $token_ids[$idx], amount => '' . _vlq($m) };
-            }
-            _skip_registers($m);
-            push @{ $tx{outputs} }, \%o;
-        }
+        my ($budget, @found) = (200_000);
+        _parse_outputs($msg, $m->{p}, $n_out, \@token_ids, \$budget, \@found);
+        die "outputs\n" unless @found;
+        $tx{output_parses} = \@found;
         1;
     } or $tx{outputs_partial} = 1;
 
@@ -614,6 +605,77 @@ sub _parse_reduced {
 }
 
 # Value, address and tokens of a serialized input box (registers are not needed).
+# Parses $n outputs from $pos. Every complete parse that ends exactly at the end of
+# $bytes is pushed to @$found (at most 32); the caller chooses between them.
+sub _parse_outputs {
+    my ($bytes, $pos, $n, $token_ids, $budget, $found, @path) = @_;
+    if ($n == 0) {
+        push @$found, [@path] if $pos == length $bytes && @$found < 32;
+        return;
+    }
+    return if $$budget-- <= 0 || @$found >= 32;
+
+    my $r = { b => $bytes, p => $pos };
+    my $value = eval { _vlq($r) };
+    return unless $value;
+    my $tree_start = $r->{p};
+
+    my $known = eval { _read_tree($r); $r->{p} };
+    my @ends = defined $known ? ($known) : ();
+    if (!defined $known && !(ord(substr($bytes, $tree_start, 1)) & 0x08)) {
+        @ends = ($tree_start + 2 .. length($bytes) - 3);    # unknown contract: try every length
+    }
+    for my $end (@ends) {
+        my $rr = { b => $bytes, p => $end };
+        my $o = eval {
+            my %o = (value => "$value");
+            $o{height} = _vlq($rr);
+            die "height\n" if $o{height} > 100_000_000;
+            my $nt = _u8($rr);
+            die "tokens\n" if $nt > @$token_ids;
+            for (1 .. $nt) {
+                my $idx = _vlq($rr);
+                die "token index\n" if $idx >= @$token_ids;
+                my $amount = _vlq($rr);
+                die "token amount\n" unless $amount;
+                push @{ $o{tokens} }, { id => $token_ids->[$idx], amount => "$amount" };
+            }
+            die "registers\n" if ord(substr($bytes, $rr->{p}, 1)) > 6;
+            _skip_registers($rr);
+            my $tree = substr($bytes, $tree_start, $end - $tree_start);
+            $o{tree}        = unpack 'H*', $tree;
+            $o{address}     = address_from_tree($tree);
+            $o{is_fee}      = $o{tree} eq $FEE_TREE_HEX ? 1 : 0;
+            $o{is_multisig} = defined $known && !$o{is_fee} && substr($tree, 0, 1) eq "\x10" ? 1 : 0;
+            $o{is_contract} = !$o{is_fee} && !$o{is_multisig} && $tree !~ /^\x00\x08\xcd/ ? 1 : 0;
+            \%o;
+        } or next;
+        _parse_outputs($bytes, $rr->{p}, $n - 1, $token_ids, $budget, $found, @path, $o);
+    }
+}
+
+# Chooses the parse that makes sense as a transaction: ERG in = ERG out and no token
+# created out of nothing (when the input boxes are known), all outputs sharing one
+# creation height (wallets build them that way), then the shortest contract trees.
+# Returns (outputs, certain) or ().
+sub _choose_outputs {
+    my ($found, $in_value, $in_tokens, $mint_id) = @_;
+    my @ok = @$found;
+    if (defined $in_value) {
+        @ok = grep {
+            my $sum = 0;
+            my %tok;
+            for my $o (@$_) { $sum += $o->{value}; $tok{ $_->{id} } += $_->{amount} for @{ $o->{tokens} || [] } }
+            $sum == $in_value && !grep { $_ ne ($mint_id // '') && $tok{$_} > ($in_tokens->{$_} // 0) } keys %tok;
+        } @ok;
+    }
+    return () unless @ok;
+    my @same = grep { my %h = map { $_->{height} => 1 } @$_; keys(%h) == 1 } @ok;
+    @ok = @same if @same;
+    my %distinct = map { join('|', map { "$_->{address}:$_->{value}" } @$_) => 1 } @ok;
+    return ($ok[0], keys(%distinct) == 1 && defined $in_value ? 1 : 0);
+}
+
 sub _parse_box_summary {
     my ($b64) = @_;
     my $r = _reader(decode_base64($b64));
@@ -724,6 +786,19 @@ sub analyze_payload {
         $a->{boxes}++;
         $a->{tokens}{$_} = 1 for keys %{ $s->{tokens} || {} };
     }
+    # Pick the output parse that makes sense against the inputs (see _choose_outputs).
+    if ($tx->{output_parses}) {
+        my $inputs_known = defined $total && @$boxes;
+        my ($outs, $certain) = _choose_outputs($tx->{output_parses}, ($inputs_known ? $total : undef),
+            \%in_tokens, $tx->{input_ids}[0]);
+        if ($outs) {
+            $res{outputs} = $outs;
+            $res{outputs_uncertain} = $certain ? 0 : 1;
+        } else {
+            $res{outputs_partial} = 1;
+        }
+    }
+
     if (defined $total && @$boxes) {
         $res{inputs_value}  = "$total";
         $res{inputs_tokens} = [ map { { id => $_, amount => "$in_tokens{$_}" } } sort keys %in_tokens ];
