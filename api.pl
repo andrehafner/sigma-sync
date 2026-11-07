@@ -67,6 +67,7 @@ my %MEMBER = (
 my %ADMIN = (
     admin_members  => \&act_admin_members,
     admin_update   => \&act_admin_update,
+    admin_delete   => \&act_admin_delete,
     recent_events  => \&act_recent_events,
 );
 
@@ -982,13 +983,53 @@ sub act_admin_members {
     my %addr;
     push @{ $addr{ $_->[0] } }, $_->[1]
         for @{ $db->selectall_arrayref('SELECT member_id, address FROM member_keys ORDER BY id') };
+    $rows = [ grep { $addr{ $_->{id} } } @$rows ];    # deleted accounts have no addresses
     for my $m (@$rows) {
         $m->{$_} += 0 for qw(id is_admin is_active);
-        $m->{addresses} = $addr{ $m->{id} } || [];
+        $m->{addresses} = $addr{ $m->{id} };
         $m->{env_admin} = is_env_admin($m->{addresses});
         $m->{is_admin}  = 1 if $m->{env_admin};
     }
     return { members => $rows };
+}
+
+# Deletes an account: its addresses and sessions go, any lock it holds is released
+# and its open unlock votes are dropped. Signing in again with one of those addresses
+# creates a fresh account. Past commitments, signatures and comments stay on the
+# transactions (labelled "<name> (deleted)"); an account with no history is removed.
+sub act_admin_delete {
+    my $id = int_param('id');
+    my $m = load_member($id) or fail('Account not found.');
+    fail('You cannot delete your own account.') if $id == $ME->{id};
+    fail('This admin is set in the server config (ADMIN_ADDRESSES); remove it there first.') if $m->{env_admin};
+    fail('This account was already deleted.') unless @{ $m->{addresses} };
+
+    my $db = dbh();
+    $db->begin_work;
+    my $locked = $db->selectcol_arrayref('SELECT id FROM transactions WHERE lock_member_id = ? FOR UPDATE', undef, $id);
+    for my $tx_id (@$locked) {
+        $db->do('UPDATE transactions SET lock_member_id = NULL, locked_at = NULL WHERE id = ?', undef, $tx_id);
+        log_event('release', 'lock released: account deleted by an admin', $tx_id);
+    }
+    $db->do('DELETE FROM unlock_votes WHERE member_id = ?', undef, $id);
+    $db->do('DELETE FROM sessions WHERE member_id = ?', undef, $id);
+    $db->do('DELETE FROM member_keys WHERE member_id = ?', undef, $id);
+
+    my ($history) = $db->selectrow_array(q{
+        SELECT (SELECT COUNT(*) FROM transactions WHERE created_by = ?)
+             + (SELECT COUNT(*) FROM submissions WHERE member_id = ?)
+             + (SELECT COUNT(*) FROM comments WHERE member_id = ?)}, undef, $id, $id, $id);
+    if ($history) {
+        my $name = substr($m->{display_name}, 0, 40) . ' (deleted)';
+        my ($taken) = $db->selectrow_array('SELECT id FROM members WHERE LOWER(display_name) = LOWER(?) AND id <> ?', undef, $name, $id);
+        $name = substr($m->{display_name}, 0, 30) . " (deleted #$id)" if $taken;
+        $db->do('UPDATE members SET display_name = ?, is_admin = 0, is_active = 0 WHERE id = ?', undef, $name, $id);
+    } else {
+        $db->do('DELETE FROM members WHERE id = ?', undef, $id);
+    }
+    log_event('member_delete', "#$id $m->{display_name}: " . join(', ', @{ $m->{addresses} }));
+    $db->commit;
+    return act_admin_members();
 }
 
 sub act_admin_update {
