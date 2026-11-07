@@ -161,7 +161,7 @@ sub load_session {
     return if $SESSION;
     my $token = $cgi->cookie('sigmasync_sid') // '';
     return unless $token =~ /^[0-9a-f]{64}$/;
-    my $idle = cfg('SESSION_IDLE_MINUTES', 120) + 0;
+    my $idle = cfg('SESSION_IDLE_MINUTES', 2880) + 0;
     my $row = dbh()->selectrow_hashref(q{
         SELECT s.id AS session_id, s.csrf_token, m.id, m.display_name, m.name_chosen, m.is_admin
           FROM sessions s JOIN members m ON m.id = s.member_id
@@ -326,7 +326,7 @@ sub act_auth_finish {
 
     my $session = random_hex(32);
     my $csrf    = random_hex(32);
-    my $hours   = cfg('SESSION_HOURS', 12) + 0;
+    my $hours   = cfg('SESSION_HOURS', 48) + 0;
     $db->do('DELETE FROM sessions WHERE expires_at < UTC_TIMESTAMP()');
     $db->do(q{INSERT INTO sessions (token_hash, csrf_token, member_id, ip, expires_at)
               VALUES (?,?,?,?, UTC_TIMESTAMP() + INTERVAL ? HOUR)},
