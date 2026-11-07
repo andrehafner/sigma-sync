@@ -186,6 +186,31 @@ sub msr {
     ok(!$a->{outputs}[2]{is_change} && $a->{outputs}[2]{is_fee}, '... then the fee');
 }
 
+# A contract output whose tree has no size field: its length is inferred from the
+# parse that balances against the inputs and keeps one creation height.
+{
+    my $vlq  = \&ErgoKit::vlq;
+    my $tree = address_decode('9f3AaAirSTGYKWqDcw8hEa4Pk4hYiS96VC3Kpcr7CKTuqTiwjCy')->{tree};
+    my $fee  = pack 'H*', '1005040004000e36100204a00b08cd0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ea02d192a39a8cc7a701730073011001020402d19683030193a38cc7b2a57300000193c2b2a57301007473027303830108cdeeac93b1a57304';
+    my $contract = "\x10\x02\x04\x04\x0e\x20" . ("\x5a" x 32) . "\xd1\x91\xa3\x73\x00\x73\x01";
+    my $token = "\xcc" x 32;
+    my $box  = $vlq->(20_000_000_000) . $tree . $vlq->(1_900_000) . "\x01" . $token . $vlq->(1000) . "\x00"
+             . ("\x33" x 32) . $vlq->(0);
+    my $out  = sub { my ($v, $t, $tok) = @_; $vlq->($v) . $t . $vlq->(1_910_680)
+                     . ($tok ? "\x01" . $vlq->(0) . $vlq->($tok) : "\x00") . "\x00" };
+    my $msg  = $vlq->(1) . ErgoKit::blake2b256($box) . "\x00\x00" . $vlq->(0) . $vlq->(1) . $token . $vlq->(3)
+             . $out->(5_000_000_000, $contract, 250) . $out->(14_998_900_000, $tree, 750) . $out->(1_100_000, $fee);
+    my $reduced = $vlq->(length $msg) . $msg . "\xcd" . address_decode('9f3AaAirSTGYKWqDcw8hEa4Pk4hYiS96VC3Kpcr7CKTuqTiwjCy')->{pk} . "\x00\x00";
+    my $a = analyze_payload(encode_json({ MSR => encode_json({ tx => encode_base64($reduced, ''),
+        boxes => [ encode_base64($box, '') ], hints => [['']] }) }));
+    ok(!$a->{outputs_partial} && !$a->{outputs_uncertain}, 'contract output decoded and cross-checked');
+    is($a->{outputs}[0]{value}, '5000000000', '... its ERG');
+    is($a->{outputs}[0]{tokens}[0]{amount}, '250', '... its tokens');
+    is($a->{outputs}[0]{tree}, unpack('H*', $contract), '... its exact contract bytes');
+    ok($a->{outputs}[0]{is_contract}, '... flagged as a contract');
+    ok($a->{outputs}[1]{is_change}, '... change after it');
+}
+
 {
     my $a = analyze_payload('{"MSR":"{\"tx\":\"AAAA');
     ok(!$a->{valid}, 'rejects truncated JSON');

@@ -1008,10 +1008,12 @@
   // What the transaction does, decoded from the transaction itself.
   function detailsHtml(t) {
     const r = t.review;
-    if (!r || !r.outputs) return '';
-    const sends = r.outputs.filter((o) => !o.is_fee && !o.is_change);
-    const fee = r.outputs.filter((o) => o.is_fee);
-    const change = r.outputs.filter((o) => o.is_change);
+    if (!r) return '';
+    const outputs = r.outputs || [];
+    const decoded = outputs.length > 0;
+    const sends = outputs.filter((o) => !o.is_fee && !o.is_change);
+    const fee = outputs.filter((o) => o.is_fee);
+    const change = outputs.filter((o) => o.is_change);
     const sum = (list) => list.reduce((acc, o) => acc + BigInt(o.value), 0n).toString();
     const addrText = (a) => (a.length > 60 ? `${a.slice(0, 14)}…${a.slice(-10)}` : a);
     const addrLink = (a) => `<a class="addr" href="${esc((S.config.explorer_address_url || '') + a)}" target="_blank" rel="noopener" title="${esc(a)}">${esc(addrText(a))}</a>
@@ -1020,19 +1022,15 @@
       <div class="token-line">${tokenHtml(tk.id, tk.amount)}</div>`).join('');
     const changeTokens = change.reduce((n, o) => n + (o.tokens?.length || 0), 0);
     const inputs = r.inputs || [];
-
-    return `
-      <section class="panel mt-12 tx-details" aria-labelledby="details-title">
-        <h2 id="details-title">Transaction details</h2>
-        <p class="small muted">Decoded from the transaction itself.</p>
-
+    const outputsHtml = decoded ? `
         <h3 class="mt-16">Sending</h3>
         ${sends.length ? sends.map((o) => `
           <div class="send">
             <div class="send-amount">${esc(erg(o.value))}</div>
             ${tokenLines(o.tokens)}
             <div class="small muted mt-8">to ${o.to_input_address ? '<span class="tag">same address it spends from</span>'
-              : o.is_multisig ? '<span class="tag">multi-sig address</span>' : ''}</div>
+              : o.is_multisig ? '<span class="tag">multi-sig address</span>'
+              : o.is_contract ? '<span class="tag">smart contract</span>' : ''}</div>
             <div>${addrLink(o.address)}</div>
           </div>`).join('') : '<p class="small faint">Nothing leaves the wallet except the fee.</p>'}
 
@@ -1043,11 +1041,20 @@
         </dl>
         ${changeTokens ? `
           <details class="small mt-8" data-tokens-lazy>
-            <summary>${changeTokens} token${changeTokens === 1 ? '' : 's'} stay at the spending address</summary>
+            <summary>${changeTokens} token${changeTokens === 1 ? ' stays' : 's stay'} at the spending address</summary>
             ${change.map((o) => tokenLines(o.tokens)).join('')}
           </details>` : ''}
         ${!change.length && sends.length ? `<div class="notice notice-warning small mt-8">No output goes back to the address
           being spent from. If the wallet holds more than is being sent, check where the rest goes.</div>` : ''}
+` : `<div class="notice notice-warning small mt-16">Sigma Sync could not work out where this transaction
+        sends funds. Check every output in Minotaur.</div>`;
+
+    return `
+      <section class="panel mt-12 tx-details" aria-labelledby="details-title">
+        <h2 id="details-title">Transaction details</h2>
+        <p class="small muted">Decoded from the transaction itself.</p>
+
+        ${outputsHtml}
 
         ${inputs.length ? `
           <h3 class="mt-16">Spending from</h3>
@@ -1060,7 +1067,9 @@
                 i.tokens ? ` · ${i.tokens} token type${i.tokens === 1 ? '' : 's'}` : ''}</div>
             </div>`).join('')}` : ''}
 
-        ${r.outputs_partial ? '<p class="small faint mt-8">Some outputs could not be decoded - check them in Minotaur.</p>' : ''}
+        ${r.outputs_uncertain ? `<div class="notice notice-warning small mt-8">Some outputs pay to contracts Sigma Sync
+          cannot read fully, and the decoded amounts could not be cross-checked against the inputs.
+          Treat them as a hint and check every amount in Minotaur.</div>` : ''}
         ${r.minotaur_format ? `<p class="small faint mt-12">Request format: Minotaur ${r.minotaur_format === '3' ? '3.0 or later' : '2.x'}.</p>` : ''}
 
         <div class="notice notice-warning verify mt-12">Please verify this for yourself when signing on Minotaur!</div>
@@ -1237,6 +1246,9 @@
       <div class="stack">
         <div>
           <p class="step-label"><span class="step-num">1</span> Copy the latest request into Minotaur</p>
+          <p class="small muted">In Minotaur open the <strong>multi-sig wallet</strong> → <strong>Multi-sig Communication</strong>
+          → scan or paste there. The scanner on Minotaur's home screen cannot read multi-sig requests
+          ("Invalid QR Code").</p>
           ${p ? payloadBlock(p) : '<p class="faint">No payload stored yet.</p>'}
         </div>
         <form id="submit-form" class="stack" novalidate>
