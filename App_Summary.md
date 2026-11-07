@@ -19,6 +19,10 @@
 | Admin | Everything an account can, plus disable/enable accounts, grant/revoke admin, read the audit log, cancel transactions **they are a signer of** | `ADMIN_ADDRESSES` in the env file (cannot be removed in the app), or the admin flag set by another admin |
 
 - Admins have no access to transactions they are not a signer of.
+- Admins can delete an account: its addresses and sessions are removed, any lock it holds is
+  released and its open unlock votes dropped. Past activity stays on the transactions, labelled
+  "(deleted)"; an account with no history is removed entirely. Signing in again with the same
+  address creates a new account (delete is not a ban - Disable is). Deletions are audit-logged.
 - Disabled accounts cannot sign in, and their sessions are deleted immediately.
 - Admins cannot remove their own access, and config-file admins cannot be demoted in the app.
 

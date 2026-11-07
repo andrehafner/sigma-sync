@@ -1172,7 +1172,7 @@
       } else {
         dot = ['lock_override', 'cancel', 'unlock_vote'].includes(e.event) ? 'alert' : 'event';
         head = `<strong>${esc(e.member || 'Someone')}</strong> ${esc(EVENT_TEXT[e.event] || e.event)}${
-          e.event === 'cancel' && e.detail ? `: <em>${esc(e.detail)}</em>` : ''}`;
+          (e.event === 'cancel' || e.event === 'release') && e.detail ? `: <em>${esc(e.detail)}</em>` : ''}`;
       }
       return `<li><span class="dot dot-${esc(dot)}"></span>
         <div class="tl-head">${head}</div>
@@ -1551,7 +1551,8 @@
               <td>${m.last_login_at ? timeTag(m.last_login_at) : '<span class="faint">never</span>'}</td>
               <td class="nowrap right">${m.env_admin ? '<span class="faint small">set in config</span>' : m.id === S.me.id ? '' : `
                 <button type="button" class="btn btn-sm" data-member="${m.id}" data-op="admin">${m.is_admin ? 'Remove admin' : 'Make admin'}</button>
-                <button type="button" class="btn btn-sm ${m.is_active ? 'btn-danger' : ''}" data-member="${m.id}" data-op="active">${m.is_active ? 'Disable' : 'Enable'}</button>`}
+                <button type="button" class="btn btn-sm ${m.is_active ? 'btn-danger' : ''}" data-member="${m.id}" data-op="active">${m.is_active ? 'Disable' : 'Enable'}</button>
+                <button type="button" class="btn btn-sm btn-danger" data-member="${m.id}" data-op="delete">Delete</button>`}
               </td>
             </tr>`).join('')}
           </tbody>
@@ -1577,6 +1578,22 @@
     $$('[data-member]', view).forEach((btn) => btn.addEventListener('click', async () => {
       const m = members.find((x) => x.id === Number(btn.dataset.member));
       const params = { id: m.id };
+      if (btn.dataset.op === 'delete') {
+        const ok = await dialog({
+          title: `Delete ${m.display_name}?`,
+          body: `Removes the account and its ${m.addresses.length} linked address${m.addresses.length === 1 ? '' : 'es'}, signs them out
+            and releases any lock they hold. Their past commitments, signatures and comments stay on the transactions,
+            marked "(deleted)". They can sign in again later and get a fresh account - to keep someone out, use Disable instead.`,
+          confirm: 'Delete account', danger: true,
+        });
+        if (!ok) return;
+        try {
+          const r = await api('admin_delete', params);
+          drawAdmin(r.members, events);
+          toast('Account deleted', 'success');
+        } catch (e) { toast(e.message, 'error'); }
+        return;
+      }
       if (btn.dataset.op === 'admin') params.is_admin = m.is_admin ? 0 : 1;
       else {
         if (m.is_active && !(await dialog({
