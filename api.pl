@@ -24,7 +24,8 @@ use AppConfig qw(cfg dbh seal unseal random_hex client_ip);
 use ErgoKit qw(address_decode address_from_tree build_login_request verify_login_response
                sanitize_payload analyze_payload compare_hints payload_input_ids);
 
-$CGI::POST_MAX = 4 * 1024 * 1024;
+# Large enough for a full batch of big requests (MAX_BATCH entries of a few hundred KB).
+$CGI::POST_MAX = 32 * 1024 * 1024;
 
 my $JSON = JSON::PP->new->utf8->canonical;
 my $cgi  = CGI->new;
@@ -75,6 +76,8 @@ my %ADMIN = (
 
 my $response = eval {
     die { public => 'Use POST.' } unless ($ENV{REQUEST_METHOD} // '') eq 'POST';
+    die { public => 'That upload is too large (over 32 MB). Split it into smaller batches.' }
+        if ($cgi->cgi_error // '') =~ /^413/;
     my $action = $cgi->param('action') // '';
     if (my $h = $PUBLIC{$action}) { return $h->() }
     my $h = $MEMBER{$action} || $ADMIN{$action} or die { public => 'Unknown action.' };
