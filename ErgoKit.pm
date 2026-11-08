@@ -119,7 +119,16 @@ sub address_decode {
     return \%info;
 }
 
+# Base58 is slow in pure Perl and a large transaction repeats the same few trees, so
+# addresses are cached per process.
+my %ADDRESS_CACHE;
 sub address_from_tree {
+    my ($tree, $network) = @_;
+    my $cached = \$ADDRESS_CACHE{ ($network // 'mainnet') . ':' . $tree };
+    return $$cached //= _address_from_tree($tree, $network);
+}
+
+sub _address_from_tree {
     my ($tree, $network) = @_;
     my $net = ($network // 'mainnet') eq 'testnet' ? NETWORK_TESTNET : NETWORK_MAINNET;
     my $body;
