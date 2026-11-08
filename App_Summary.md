@@ -36,6 +36,7 @@
 | `auth_challenges` | One-time sign-in challenges: SHA-256 of token, address, unsigned challenge tx, IP, expiry | Low; purged after 1 day |
 | `sessions` | SHA-256 of session token, CSRF token, member, IP, expiry | Moderate (session secrets; only hashes of the cookie value are stored) |
 | `transactions` | Title*, description*, wallet name, Minotaur version, threshold, Ergo tx ID, status, counts, lock holder | Moderate (treasury plans before they are public) |
+| `batches` | Batch title*, item count, creator, time | Moderate |
 | `submissions` | Each pasted payload*, its SHA-256, round, counts, detected signer slot | Moderate (partially signed transactions; no private keys or secret nonces) |
 | `comments` | Comment text* | Moderate |
 | `unlock_votes` | Who voted to force-unlock which lock | Low |
@@ -62,6 +63,11 @@
   signer and already committed; threshold must match the wallet's; 20 per account per day) ->
   `transactions`, its `transaction_keys`, the first `submissions` row (+ optional `comments`)
   inserted in one DB transaction.
+- **Batch**: Start Batch form -> `batch_preview` (read-only: every entry checked exactly as a
+  single start, plus duplicates within the batch and already-tracked transactions; at most 100
+  entries) -> `create_batch` re-checks everything server-side and inserts the batch and one
+  transaction per valid entry in one DB transaction (invalid entries only skipped on explicit
+  confirmation; counts against the daily cap, default 200).
 - **Lock**: `lock` atomically sets the lock holder only if unlocked and open
   (`UPDATE ... WHERE lock_member_id IS NULL`).
 - **Submit**: lock holder pastes output -> `submit` (row locked with `SELECT ... FOR UPDATE`) ->

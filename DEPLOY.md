@@ -152,6 +152,18 @@ without Minotaur signer keys (the old "Other / not Minotaur" mode) are cancelled
 is harmless. To undo: `sudo mysql -e 'DROP DATABASE sigmasync; CREATE DATABASE sigmasync'` then
 `sudo mysql sigmasync < ~/sigmasync-before-001.sql` and check out the previous release.
 
+### Migration 002 - batch transactions
+
+```bash
+sudo mysqldump sigmasync > ~/sigmasync-before-002.sql     # backup
+cd /data/AAP_Storage/apps/sigmasync
+git pull && sudo ./redeploy.sh
+sudo mysql sigmasync < tools/migrate-002-batches.sql
+```
+
+Adds the `batches` table and two columns on `transactions`. Safe to run twice. Fresh installs get
+it from `schema.sql`.
+
 ## Backups
 
 - `mysqldump --single-transaction sigmasync > sigmasync-$(date +%F).sql` on the usual DB backup
