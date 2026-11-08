@@ -109,6 +109,24 @@ You can only lock a transaction while it still needs **your** step: in the commi
 none of your keys has committed, in the signing round if you committed and have not signed.
 Signers who did not commit cannot join once signing has started.
 
+### Batches
+
+**Start Batch** takes tens of requests at once - pasted one after another, as a JSON array, or
+uploaded as `.json`/`.txt` files. Each may be an unsigned cold signing request (`{"CSR":…}`,
+nobody committed yet) or a multi-sig request (`{"MSR":…}`) with the starter's commitment.
+
+1. **Check** reads every entry and shows what it sends, its M-of-N wallet and its Ergo TX ID,
+   and flags duplicates, transactions already tracked, and wallets you do not sign for. Nothing
+   is written.
+2. **Start** creates one transaction per valid entry, named `<batch name> 1`, `<batch name> 2`, …,
+   sharing the wallet name, Minotaur version, description and note.
+3. Signers work through them as usual; after each submit, **Next in batch** jumps to the next one
+   waiting for them.
+
+For a transaction started from a CSR, the first committer opens it with Minotaur's
+**home-screen** scanner (or paste there): Minotaur files it under the multi-sig wallet, where they
+press Commit. Everyone after that uses the multi-sig wallet's Multi-sig Communication page.
+
 ### Locks
 
 Only the lock holder sees the latest request and can submit. Submitting or releasing frees

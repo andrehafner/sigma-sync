@@ -61,6 +61,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     CONSTRAINT fk_session_member FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
+-- Transactions started together (e.g. tens of requests uploaded at once). Each item is
+-- named "<batch title> <n>".
+CREATE TABLE IF NOT EXISTS batches (
+    id             INT AUTO_INCREMENT PRIMARY KEY,
+    title_enc      TEXT         NOT NULL,
+    item_count     SMALLINT UNSIGNED NOT NULL,
+    created_by     INT          NOT NULL,
+    created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_batch_creator FOREIGN KEY (created_by) REFERENCES members(id)
+) ENGINE=InnoDB;
+
 -- A multi-sig transaction moving through the commitment and signing rounds.
 -- status: commit -> sign -> complete -> broadcast   (or cancelled)
 CREATE TABLE IF NOT EXISTS transactions (
@@ -82,7 +93,10 @@ CREATE TABLE IF NOT EXISTS transactions (
     lock_member_id    INT          NULL,
     lock_seq          INT          NOT NULL DEFAULT 0,
     locked_at         DATETIME     NULL,
+    batch_id          INT          NULL,
+    batch_seq         SMALLINT UNSIGNED NULL,
     KEY ix_tx_status (status, updated_at),
+    KEY ix_tx_batch (batch_id, batch_seq),
     CONSTRAINT fk_tx_creator FOREIGN KEY (created_by) REFERENCES members(id),
     CONSTRAINT fk_tx_lock FOREIGN KEY (lock_member_id) REFERENCES members(id)
 ) ENGINE=InnoDB;
@@ -106,7 +120,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     id              INT AUTO_INCREMENT PRIMARY KEY,
     transaction_id  INT          NOT NULL,
     member_id       INT          NOT NULL,
-    round           VARCHAR(8)   NOT NULL,           -- commit | sign | final
+    round           VARCHAR(8)   NOT NULL,           -- start | commit | sign | final
     payload_enc     MEDIUMTEXT   NOT NULL,
     payload_sha256  CHAR(64)     NOT NULL,
     commits         TINYINT UNSIGNED NOT NULL DEFAULT 0,

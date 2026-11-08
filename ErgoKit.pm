@@ -725,7 +725,15 @@ sub analyze_payload {
         return \%res;
     }
 
-    unless ($doc->{type} eq 'MSR' && ref $d eq 'HASH' && $d->{tx}) {
+    # A cold signing request (CSR) is the unsigned transaction before anyone committed:
+    # the same reduced transaction and input boxes, with no hints yet.
+    my $is_csr = $doc->{type} eq 'CSR' && ref $d eq 'HASH' && $d->{reducedTx};
+    if ($is_csr) {
+        $res{sender} = $d->{sender} if defined $d->{sender} && !ref $d->{sender};
+        $d = { tx => $d->{reducedTx}, boxes => $d->{inputs} // [], hints => [] };
+    }
+
+    unless (($doc->{type} eq 'MSR' || $is_csr) && ref $d eq 'HASH' && $d->{tx}) {
         $res{error} = "Unrecognised payload type '$doc->{type}'.";
         return \%res;
     }
@@ -739,7 +747,7 @@ sub analyze_payload {
     # used "commitments" + "signed".
     # Payload layout reveals the Minotaur generation: 3.0+ writes "hints", 2.x wrote
     # "commitments"/"signed"/"simulated". Versions within a generation are identical.
-    $res{minotaur_format} = exists $d->{hints} ? '3' : '2';
+    $res{minotaur_format} = $is_csr ? undef : exists $d->{hints} ? '3' : '2';
     my $matrix = _as_list(exists $d->{hints} ? $d->{hints} : $d->{commitments});
     my @hints = map { [ map { defined $_ && !ref $_ ? $_ : '' } @{ _as_list($_) } ] } @$matrix;
     $res{hints} = \@hints;

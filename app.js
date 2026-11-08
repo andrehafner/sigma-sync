@@ -23,7 +23,7 @@
   const MINOTAUR_RELEASES = 'https://github.com/minotaur-ergo/minotaur-wallet/releases';
   const MINOTAUR_API = 'https://api.github.com/repos/minotaur-ergo/minotaur-wallet/releases?per_page=100';
   // Used when GitHub cannot be reached. Newest first.
-  const FALLBACK_VERSIONS = ['v4.2.1', 'v4.2.0', 'v4.1.0', 'v4.0.0', 'v3.4.0', 'v3.3.0', 'v3.2.0',
+  const FALLBACK_VERSIONS = ['v4.3.0', 'v4.2.1', 'v4.2.0', 'v4.1.0', 'v4.0.0', 'v3.4.0', 'v3.3.0', 'v3.2.0',
     'v3.1.0', 'v3.0.1', 'v3.0.0', 'v2.5.0', 'v2.4.0', 'v2.3.0', 'v2.2.0', 'v2.1.0', 'v2.0.2'];
   const QR_DENSITY = [1600, 900, 450]; // characters per QR page: dense, medium, light
   const ADDRESS_KEY = 'sigmasync.address';
@@ -569,6 +569,7 @@
     const m = hash.match(/^tx\/(\d+)$/);
     if (m) return renderDetail(Number(m[1]));
     if (hash === 'start') return renderStart();
+    if (hash === 'batch') return renderBatch();
     if (hash === 'account') return renderAccount();
     if (hash === 'admin' && S.me.is_admin) return renderAdmin();
     return renderList();
@@ -587,6 +588,7 @@
     const tabs = [
       ['sign', 'Sign Transactions', awaiting],
       ['start', 'Start Transaction'],
+      ['batch', 'Start Batch'],
       ['account', 'Account'],
       ...(S.me.is_admin ? [['admin', 'Admin']] : []),
     ];
@@ -816,24 +818,7 @@
         </aside>
       </div>`;
 
-    const versions = await loadVersions();
-    const sel = $('#f-version');
-    if (!sel) return;
-    const stable = versions.filter((v) => !v.pre);
-    const pre = versions.filter((v) => v.pre);
-    const opt = (v, i) => `<option value="${esc(v.tag)}" ${i === 0 && !v.pre ? 'selected' : ''}>${esc(v.tag)}${i === 0 && !v.pre ? ' (latest)' : ''}${v.date ? ` - ${esc(v.date)}` : ''}</option>`;
-    sel.innerHTML = `
-      <optgroup label="Releases">${stable.map(opt).join('')}</optgroup>
-      ${pre.length ? `<optgroup label="Pre-releases">${pre.map((v) => opt(v, 1)).join('')}</optgroup>` : ''}`;
-    const hint = () => {
-      const v = sel.value;
-      $('#version-hint').innerHTML = v
-        ? `Every signer should use this version. <a href="${esc(releaseUrl(v))}" target="_blank" rel="noopener">Release notes</a>`
-        : '';
-    };
-    sel.addEventListener('change', hint);
-    hint();
-    if (versions.offline) $('#version-hint').insertAdjacentHTML('beforeend', ' (GitHub unreachable - showing known versions)');
+    fillVersions($('#f-version'), $('#version-hint'));    // fills in when GitHub answers
 
     let timer;
     $('#f-payload').addEventListener('input', () => {
@@ -875,6 +860,198 @@
     });
   }
 
+  // Fills a <select> with Minotaur releases; returns false if the view is gone.
+  async function fillVersions(sel, hintEl) {
+    const versions = await loadVersions();
+    if (!sel || !document.body.contains(sel)) return false;
+    const stable = versions.filter((v) => !v.pre);
+    const pre = versions.filter((v) => v.pre);
+    const opt = (v, i) => `<option value="${esc(v.tag)}" ${i === 0 && !v.pre ? 'selected' : ''}>${esc(v.tag)}${i === 0 && !v.pre ? ' (latest)' : ''}${v.date ? ` - ${esc(v.date)}` : ''}</option>`;
+    sel.innerHTML = `
+      <optgroup label="Releases">${stable.map(opt).join('')}</optgroup>
+      ${pre.length ? `<optgroup label="Pre-releases">${pre.map((v) => opt(v, 1)).join('')}</optgroup>` : ''}`;
+    const hint = () => {
+      const v = sel.value;
+      hintEl.innerHTML = v
+        ? `Every signer should use this version. <a href="${esc(releaseUrl(v))}" target="_blank" rel="noopener">Release notes</a>`
+        : '';
+      if (versions.offline) hintEl.insertAdjacentHTML('beforeend', ' (GitHub unreachable - showing known versions)');
+    };
+    sel.addEventListener('change', hint);
+    hint();
+    return true;
+  }
+
+  // ------------------------------------------------------------------------
+  // Start batch: many requests at once
+  // ------------------------------------------------------------------------
+  async function renderBatch() {
+    const view = shell('batch');
+    view.innerHTML = `
+      <div class="detail">
+        <form class="panel" id="batch-form" novalidate>
+          <div class="panel-title"><h2>Start a batch of transactions</h2></div>
+          <p class="muted small">Paste or upload many requests at once - one JSON request after another, or a JSON array.
+          Cold signing requests (<code>{"CSR":…}</code>, nobody committed yet) and multi-sig requests (<code>{"MSR":…}</code>,
+          with your commitment) both work. Each becomes its own transaction, named after the batch.</p>
+          <div class="field-row">
+            <div>
+              <label for="b-name">Batch name</label>
+              <input type="text" id="b-name" maxlength="100" required placeholder="e.g. Rosen TX Cleanup">
+              <p class="hint" id="b-name-hint">Transactions are named "Batch name 1", "Batch name 2", …</p>
+            </div>
+            <div>
+              <label for="b-wallet">Multi-sig wallet <span class="faint">(optional)</span></label>
+              <input type="text" id="b-wallet" maxlength="80" list="b-wallet-names" placeholder="e.g. Rosen Guard">
+              <datalist id="b-wallet-names">${S.wallets.map((w) => `<option value="${esc(w)}">`).join('')}</datalist>
+            </div>
+            <div>
+              <label for="b-version">Minotaur version</label>
+              <select id="b-version" required><option value="">Loading releases…</option></select>
+              <p class="hint" id="b-version-hint"></p>
+            </div>
+          </div>
+          <div class="field">
+            <label for="b-desc">What are these transactions for? <span class="faint">(shown on every one)</span></label>
+            <textarea id="b-desc" maxlength="10000" rows="4"></textarea>
+          </div>
+          <div class="field">
+            <label for="b-items">Requests</label>
+            <textarea class="payload" id="b-items" required autocomplete="off" autocapitalize="off" autocorrect="off"
+              spellcheck="false" placeholder='{"CSR":"…"}&#10;{"CSR":"…"}&#10;…'></textarea>
+            <div class="row mt-8">
+              <label class="btn btn-sm" for="b-file">Upload file(s)</label>
+              <input type="file" id="b-file" accept=".json,.txt,application/json,text/plain" multiple hidden>
+              <span class="hint" id="b-file-hint">.json or .txt - their contents are added to the box above.</span>
+            </div>
+          </div>
+          <div class="field">
+            <label for="b-comment">Note to signers <span class="faint">(optional, added to every transaction)</span></label>
+            <textarea id="b-comment" maxlength="4000" rows="2"></textarea>
+          </div>
+          <div id="b-error"></div>
+          <div class="row mt-16"><span class="spacer"></span>
+            <button class="btn btn-primary" type="submit">Check batch</button></div>
+        </form>
+        <aside class="panel detail-side">
+          <h3>How batches work</h3>
+          <ol class="howto small">
+            <li><strong>Check</strong> reads every request, shows what each one sends, and flags problems (duplicates,
+            transactions already tracked, wallets you do not sign for) before anything is created.</li>
+            <li><strong>Start</strong> creates one transaction per valid request. They appear under Sign Transactions
+            for every signer of the wallet.</li>
+            <li>Signers take them one at a time as usual; after each submit, <strong>Next in batch</strong> jumps
+            to the next one waiting for them.</li>
+          </ol>
+          <p class="small muted">For a CSR, the first committer opens it with Minotaur's <strong>home-screen</strong>
+          scanner (or paste there): Minotaur files it under the multi-sig wallet, where they press Commit.</p>
+        </aside>
+      </div>
+      <section class="panel mt-16" id="b-preview" hidden></section>`;
+
+    fillVersions($('#b-version'), $('#b-version-hint'));    // fills in when GitHub answers
+
+    $('#b-name').addEventListener('input', () => {
+      const n = $('#b-name').value.trim() || 'Batch name';
+      $('#b-name-hint').textContent = `Transactions are named "${n} 1", "${n} 2", …`;
+    });
+
+    $('#b-file').addEventListener('change', async (ev) => {
+      const files = Array.from(ev.target.files || []);
+      if (!files.length) return;
+      const texts = await Promise.all(files.map((f) => f.text()));
+      const box = $('#b-items');
+      box.value = [box.value.trim(), ...texts.map((t) => t.trim())].filter(Boolean).join('\n');
+      $('#b-file-hint').textContent = `Added ${files.length} file${files.length === 1 ? '' : 's'}.`;
+      ev.target.value = '';
+    });
+
+    const params = () => ({
+      name: $('#b-name').value, wallet_name: $('#b-wallet').value, minotaur_version: $('#b-version').value,
+      description: $('#b-desc').value, comment: $('#b-comment').value, items: $('#b-items').value,
+    });
+
+    $('#batch-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const btn = $('button[type=submit]', ev.target);
+      btn.disabled = true;
+      btn.textContent = 'Checking…';
+      $('#b-error').innerHTML = '';
+      try {
+        const r = await api('batch_preview', params());
+        drawBatchPreview(r, params);
+      } catch (e) {
+        $('#b-error').innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Check batch';
+      }
+    });
+  }
+
+  function drawBatchPreview(r, params) {
+    const box = $('#b-preview');
+    const name = $('#b-name').value.trim() || 'Batch';
+    const bad = r.items.length - r.ok;
+    let seq = 0;
+    box.hidden = false;
+    box.innerHTML = `
+      <div class="panel-title"><h2>Check result</h2>
+        <span class="faint small">${r.ok} of ${r.items.length} ready${bad ? ` · ${bad} with problems` : ''}</span></div>
+      <div class="table-wrap"><table class="list">
+        <thead><tr><th>#</th><th>Will be named</th><th>Request</th><th>Sends</th><th>Ergo TX</th><th>Status</th></tr></thead>
+        <tbody>${r.items.map((it) => {
+          const nm = it.ok ? `${name} ${++seq}` : '';
+          const sends = it.sends
+            ? (it.decoded ? `${esc(erg(it.sends.value))}${it.sends.tokens ? ` + ${it.sends.tokens} token type${it.sends.tokens === 1 ? '' : 's'}` : ''}
+                <div class="small faint">${it.sends.outputs} output${it.sends.outputs === 1 ? '' : 's'}${it.sends.to.length
+                  ? ` · to ${it.sends.to.slice(0, 2).map((a) => `<code>${esc(shortAddr(a))}</code>`).join(', ')}${it.sends.to.length > 2 ? '…' : ''}` : ''}</div>`
+              : '<span class="faint">could not decode</span>')
+            : '';
+          return `<tr class="${it.ok ? '' : 'inactive'}">
+            <td>${it.index}</td>
+            <td>${esc(nm)}</td>
+            <td>${it.format ? `${esc(it.format)}${it.required ? ` · ${it.required}-of-${it.signers}` : ''}${it.format === 'MSR' ? ` · ${it.committed} committed` : ''}` : ''}</td>
+            <td>${sends}</td>
+            <td>${it.tx_id ? `<code title="${esc(it.tx_id)}">${esc(shortId(it.tx_id))}</code>` : ''}</td>
+            <td>${it.ok ? '<span class="tick">✓ Ready</span>'
+              : `<span class="small error-text">${esc(it.error)}</span>${it.tracked ? ` <a href="#tx/${it.tracked}">open</a>` : ''}`}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table></div>
+      ${r.ok ? `<div class="row mt-16">
+          <span class="small muted">${bad ? `${bad} entr${bad === 1 ? 'y' : 'ies'} with problems will be skipped.` : 'Everything checks out.'}</span>
+          <span class="spacer"></span>
+          <button type="button" class="btn btn-primary" id="b-create">Start ${r.ok} transaction${r.ok === 1 ? '' : 's'}</button>
+        </div>` : '<p class="small muted mt-12">Nothing to start - fix the problems above and check again.</p>'}`;
+    box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+    const create = $('#b-create');
+    if (!create) return;
+    create.addEventListener('click', async () => {
+      if (!$('#b-name').value.trim()) { toast('Give the batch a name', 'error'); $('#b-name').focus(); return; }
+      if (bad && !(await dialog({
+        title: `Start ${r.ok} of ${r.items.length}?`,
+        body: `${bad} entr${bad === 1 ? 'y has' : 'ies have'} problems and will be skipped.`,
+        confirm: `Start ${r.ok}`,
+      }))) return;
+      create.disabled = true;
+      create.textContent = 'Starting…';
+      try {
+        const res = await api('create_batch', { ...params(), skip_invalid: bad ? 1 : 0 });
+        toast(`Started ${res.created.length} transactions`, 'success');
+        S.txs = [];
+        S.search = $('#b-name').value.trim();
+        S.filter = 'active';
+        location.hash = '';
+      } catch (e) {
+        create.disabled = false;
+        create.textContent = `Start ${r.ok} transaction${r.ok === 1 ? '' : 's'}`;
+        toast(e.message, 'error');
+      }
+    });
+  }
+
   // Calls the server-side analyzer and renders what it found.
   async function analyzeInto(text, el, txId, onResult) {
     const payload = cleanPayload(text);
@@ -903,6 +1080,8 @@
         if (c.new_signatures) items.push(`<strong>+${c.new_signatures} new signature</strong>`);
         items.push('Keeps every earlier commitment and signature');
       }
+    } else if (a.format === 'CSR') {
+      items.push(`Unsigned cold signing request${a.required ? ` · ${a.required}-of-${a.signers} wallet` : ''} · no commitments yet`);
     } else if (a.format === 'CSTX') {
       items.push('<strong>Fully signed transaction</strong> - ready to broadcast');
     }
@@ -962,6 +1141,7 @@
           <h1 class="mt-8">${esc(t.title)}</h1>
           <div class="meta">
             <span>#${t.id}</span>
+            ${t.batch ? `<span class="tag">Batch item ${t.batch.seq} of ${t.batch.count}</span>` : ''}
             ${t.wallet_name ? `<span>${esc(t.wallet_name)}</span>` : ''}
             <span><a href="${esc(releaseUrl(t.minotaur_version))}" target="_blank" rel="noopener">${esc(versionLabel(t.minotaur_version))}</a></span>
             <span>Started by ${esc(t.created_by)} · ${timeTag(t.created_at)}</span>
@@ -1163,7 +1343,7 @@
       let head;
       if (e.kind === 'submission') {
         dot = e.round;
-        const what = { commit: 'added a commitment', sign: 'added a signature', final: 'submitted the fully signed transaction' }[e.round] || 'submitted';
+        const what = { start: 'started it from the unsigned request (no commitments yet)', commit: 'added a commitment', sign: 'added a signature', final: 'submitted the fully signed transaction' }[e.round] || 'submitted';
         head = `<strong>${esc(e.member)}</strong> ${what}
           <span class="faint small">· ${e.commits} commit${e.commits === 1 ? '' : 's'}, ${e.signatures} sig${e.signatures === 1 ? '' : 's'}
           · <span class="fingerprint" title="SHA-256 fingerprint of the stored payload">${esc(e.fingerprint)}</span></span>`;
@@ -1180,6 +1360,14 @@
         ${e.comment ? `<div class="tl-comment">${esc(e.comment)}</div>` : ''}
       </li>`;
     }).join('')}</ol>`;
+  }
+
+  function nextInBatchHtml(t) {
+    const n = t.batch && t.batch.next;
+    if (!n) return '';
+    const left = t.batch.waiting_on_you;
+    return `<a class="btn btn-primary btn-block mt-12" href="#tx/${n.id}">Next in batch: item ${n.seq} →</a>
+      <p class="small faint mt-8 right">${left} more in this batch waiting for you</p>`;
   }
 
   function actionHtml(t) {
@@ -1211,7 +1399,8 @@
           : (t.me.signed ? 'Your signature is in and final.'
             : t.me.committed ? '' : 'Commitments are closed, and only signers who committed can sign.');
         const done = t.status === 'commit' ? t.me.committed : t.me.signed;
-        return `${header}<div class="lockbox"><p class="small">${done ? '<span class="tick">✓</span> ' : ''}${esc(why)}</p></div>`;
+        return `${header}<div class="lockbox"><p class="small">${done ? '<span class="tick">✓</span> ' : ''}${esc(why)}</p></div>
+          ${nextInBatchHtml(t)}`;
       }
       return `${header}
         <div class="lockbox">
@@ -1246,9 +1435,13 @@
       <div class="stack">
         <div>
           <p class="step-label"><span class="step-num">1</span> Copy the latest request into Minotaur</p>
-          <p class="small muted">In Minotaur open the <strong>multi-sig wallet</strong> → <strong>Multi-sig Communication</strong>
+          ${p && p.type === 'CSR' ? `<p class="small muted">Nobody has committed yet, so this is the original
+          <strong>cold signing request</strong>. Open it with the QR scanner on Minotaur's <strong>home screen</strong>
+          (or paste it there): Minotaur picks the multi-sig wallet and adds the transaction to
+          <strong>Multi-sig Communication</strong>. Press Commit there, then copy the new request.</p>`
+          : `<p class="small muted">In Minotaur open the <strong>multi-sig wallet</strong> → <strong>Multi-sig Communication</strong>
           → scan or paste there. The scanner on Minotaur's home screen cannot read multi-sig requests
-          ("Invalid QR Code").</p>
+          ("Invalid QR Code").</p>`}
           ${p ? payloadBlock(p) : '<p class="faint">No payload stored yet.</p>'}
         </div>
         <form id="submit-form" class="stack" novalidate>
@@ -1332,7 +1525,8 @@
               : `${s.round === 'commit' ? 'Commitment' : 'Signature'} saved and the lock released. Thank you!`;
           toast('Submitted', 'success');
           S.txs = [];
-          drawDetail(esc(msg));
+          drawDetail(esc(msg) + (S.detail.batch?.next
+            ? ` <a href="#tx/${S.detail.batch.next.id}"><strong>Next in batch: item ${S.detail.batch.next.seq} →</strong></a>` : ''));
           window.scrollTo({ top: 0, behavior: 'smooth' });
         } catch (e) {
           btn.disabled = false;

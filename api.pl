@@ -53,6 +53,8 @@ my %MEMBER = (
     get_transaction    => \&act_get_transaction,
     analyze            => \&act_analyze,
     create_transaction => \&act_create_transaction,
+    batch_preview      => \&act_batch_preview,
+    create_batch       => \&act_create_batch,
     lock               => \&act_lock,
     release_lock       => \&act_release_lock,
     vote_unlock        => \&act_vote_unlock,
@@ -499,6 +501,7 @@ sub tx_brief {
             : undef,
         comments => $comment_count // 0,
         me       => my_progress($tx, $states, $rounds),
+        batch    => $tx->{batch_id} ? { id => $tx->{batch_id} + 0, seq => $tx->{batch_seq} + 0 } : undef,
     };
 }
 
@@ -631,6 +634,22 @@ sub act_get_transaction {
         }
     }
 
+    # Batch context: position, and the next item in the batch that needs this account.
+    if ($tx->{batch_id}) {
+        my ($count) = $db->selectrow_array('SELECT item_count FROM batches WHERE id = ?', undef, $tx->{batch_id});
+        $brief->{batch}{count} = $count + 0;
+        my $siblings = $db->selectall_arrayref(qq{
+            SELECT t.* FROM transactions t WHERE t.batch_id = ? AND t.id <> ? AND t.lock_member_id IS NULL
+               AND t.status IN ('commit','sign') AND $VISIBLE ORDER BY t.batch_seq},
+            { Slice => {} }, $tx->{batch_id}, $id, $ME->{id});
+        my $states = my_key_states();
+        my $rounds = my_rounds();
+        my @todo = grep { my_progress($_, $states->{ $_->{id} }, $rounds->{ $_->{id} })->{can_act} } @$siblings;
+        my ($next) = (grep { $_->{batch_seq} > $tx->{batch_seq} } @todo)[0] // $todo[0];
+        $brief->{batch}{next} = { id => $next->{id} + 0, seq => $next->{batch_seq} + 0 } if $next;
+        $brief->{batch}{waiting_on_you} = scalar @todo;
+    }
+
     $brief->{can} = {
         lock      => !$tx->{lock_member_id} && !turn_refusal($tx, $brief->{me}) ? 1 : 0,
         cancel    => ($tx->{created_by} == $ME->{id} || $ME->{is_admin}) && $tx->{status} ne 'broadcast' && $tx->{status} ne 'cancelled' ? 1 : 0,
@@ -656,7 +675,10 @@ sub check_payload {
         fail('This is the same request that is already stored. In Minotaur, add your commitment or signature, then paste the NEW output.');
     }
     my $prev = analyze_payload($latest->{payload});
-    return ($a, undef) unless $a->{format} eq 'MSR' && $prev->{format} eq 'MSR';
+    # A transaction started from a cold signing request (CSR) has no hints yet: the
+    # first MSR is compared against an empty matrix, so the usual rules apply.
+    $prev->{hints} = [] if $prev->{format} eq 'CSR';
+    return ($a, undef) unless $a->{format} eq 'MSR' && ($prev->{format} eq 'MSR' || $prev->{format} eq 'CSR');
 
     my $cmp = compare_hints($prev->{hints} || [], $a->{hints} || []);
     # Older Minotaur builds keep signatures in a separate list; compare the counts too.
@@ -744,6 +766,71 @@ sub version_param {
     return $v;
 }
 
+# Checks a payload someone wants to start a transaction from. Returns
+# (analysis, signer keys) or (undef, undef, reason) so batches can report per item.
+#   MSR: the starter's own commitment must already be in it.
+#   CSR: an unsigned request (nobody committed yet); the starter must be a signer.
+sub start_checks {
+    my ($payload, $version) = @_;
+    my $a = analyze_payload($payload);
+    return (undef, undef, $a->{error}) unless $a->{valid};
+    return (undef, undef, 'Use a multi-sig request (MSR) from Minotaur, or an unsigned cold signing request (CSR).')
+        unless $a->{format} eq 'MSR' || $a->{format} eq 'CSR';
+    return (undef, undef, 'Sigma Sync could not read the signer keys from this transaction.') unless $a->{input_keys};
+    if ($a->{minotaur_format} && version_major($version) && ($a->{minotaur_format} eq '2') != (version_major($version) < 3)) {
+        return (undef, undef, $a->{minotaur_format} eq '2'
+            ? 'This request was made with Minotaur 2.x. Pick a 2.x version, or (better) redo it with the latest Minotaur.'
+            : 'This request was made with Minotaur 3.0 or later, but you picked a 2.x version. Pick the version you actually used.');
+    }
+    my $keys = tx_keys($a);
+    my %mine = map { $_ => 1 } @{ my_pks() };
+    my @my_keys = grep { $mine{$_} } @$keys;
+    return (undef, undef, 'None of the addresses on your account is a signer of this multi-sig wallet. If you sign '
+        . 'with another wallet or address, link it on the Account tab first.') unless @my_keys;
+    if ($a->{format} eq 'MSR' && !grep { ($a->{key_states}{$_} // 0) =~ /^[12]$/ } @my_keys) {
+        return (undef, undef, 'Your commitment is not in this request yet. In Minotaur, press Commit first, then copy the new request.');
+    }
+    return ($a, $keys);
+}
+
+sub daily_quota_left {
+    my ($recent) = dbh()->selectrow_array(
+        'SELECT COUNT(*) FROM transactions WHERE created_by = ? AND created_at > UTC_TIMESTAMP() - INTERVAL 1 DAY',
+        undef, $ME->{id});
+    return cfg('DAILY_TX_LIMIT', 200) - $recent;
+}
+
+sub tracked_as {
+    my ($ergo_tx_id) = @_;
+    my ($dupe) = dbh()->selectrow_array(
+        q{SELECT id FROM transactions WHERE ergo_tx_id = ? AND status <> 'cancelled'}, undef, $ergo_tx_id);
+    return $dupe;
+}
+
+# Inserts a checked transaction with its signer keys and first submission. Caller
+# holds the DB transaction.
+sub insert_transaction {
+    my (%t) = @_;
+    my ($a, $keys) = @t{qw(analysis keys)};
+    my $required = $a->{required};
+    my $commits  = $a->{committed} // 0;
+    my $status   = $commits >= $required ? 'sign' : 'commit';
+    my $db = dbh();
+    $db->do(q{INSERT INTO transactions (title_enc, description_enc, wallet_name, minotaur_version,
+                signers_required, signers_total, ergo_tx_id, status, commits, created_by, batch_id, batch_seq)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)}, undef,
+        seal($t{title}, 'transaction.title'), seal($t{description}, 'transaction.description'), $t{wallet}, $t{version},
+        $required, scalar @$keys, $a->{tx_id}, $status, $commits, $ME->{id}, $t{batch_id}, $t{batch_seq});
+    my $tx_id = $db->last_insert_id(undef, undef, 'transactions', 'id');
+    my $sth = $db->prepare('INSERT INTO transaction_keys (transaction_id, pk, slot, state) VALUES (?,?,?,?)');
+    $sth->execute($tx_id, $keys->[$_], $_, $a->{key_states}{ $keys->[$_] } // 0) for 0 .. $#$keys;
+    # A CSR start is not a commitment; an MSR start carries the starter's commitment.
+    my $sub_id = insert_submission($tx_id, ($a->{format} eq 'CSR' ? 'start' : 'commit'), $t{payload}, $commits, 0);
+    insert_comment($tx_id, $t{comment}, $sub_id) if length($t{comment} // '');
+    log_event('create', $t{batch_id} ? "batch $t{batch_id} item $t{batch_seq}" : '', $tx_id);
+    return $tx_id;
+}
+
 sub act_create_transaction {
     my $title = clean_text(param('title'), $LIMIT{title}, 'Title');
     fail('Give the transaction a name.') unless length $title;
@@ -755,56 +842,133 @@ sub act_create_transaction {
     my $comment = clean_text(param('comment'), $LIMIT{comment}, 'Comment', 1);
     my $payload = payload_param();
 
-    my $db = dbh();
-    my ($recent) = $db->selectrow_array(
-        'SELECT COUNT(*) FROM transactions WHERE created_by = ? AND created_at > UTC_TIMESTAMP() - INTERVAL 1 DAY',
-        undef, $ME->{id});
-    fail('You have started a lot of transactions today. Try again tomorrow.') if $recent >= cfg('DAILY_TX_LIMIT', 20);
-
-    my $a = analyze_payload($payload);
-    fail($a->{error}) unless $a->{valid};
-    fail('Start a transaction with the multi-sig request (MSR) from Minotaur, after you have committed.')
-        unless $a->{format} eq 'MSR';
-    fail('Sigma Sync could not read the signer keys from this transaction.') unless $a->{input_keys};
-    if ($a->{minotaur_format} && version_major($version) && ($a->{minotaur_format} eq '2') != (version_major($version) < 3)) {
-        fail($a->{minotaur_format} eq '2'
-            ? 'This request was made with Minotaur 2.x. Pick a 2.x version, or (better) redo it with the latest Minotaur.'
-            : 'This request was made with Minotaur 3.0 or later, but you picked a 2.x version. Pick the version you actually used.');
-    }
-
-    # Only a signer of the wallet can start a transaction for it, and their own
-    # commitment must already be in the request.
-    my $keys = tx_keys($a);
-    my %mine = map { $_ => 1 } @{ my_pks() };
-    my @my_keys = grep { $mine{$_} } @$keys;
-    fail('None of the addresses on your account is a signer of this multi-sig wallet. If you sign with another '
-       . 'wallet or address, link it on the Account tab first.') unless @my_keys;
-    fail('Your commitment is not in this request yet. In Minotaur, press Commit first, then copy the new request.')
-        unless grep { ($a->{key_states}{$_} // 0) =~ /^[12]$/ } @my_keys;
+    fail('You have started a lot of transactions today. Try again tomorrow.') if daily_quota_left() < 1;
+    my ($a, $keys, $why) = start_checks($payload, $version);
+    fail($why) unless $a;
     if ($a->{required} && $a->{required} != $required) {
         fail("This multi-sig wallet needs $a->{required} of $a->{signers} signatures. Set \"Signatures required\" to $a->{required}.");
     }
-    my ($dupe) = $db->selectrow_array(
-        q{SELECT id FROM transactions WHERE ergo_tx_id = ? AND status <> 'cancelled'}, undef, $a->{tx_id});
-    fail("This Ergo transaction is already being tracked (#$dupe).") if $dupe;
+    if (my $dupe = tracked_as($a->{tx_id})) { fail("This Ergo transaction is already being tracked (#$dupe).") }
 
-    my $commits = $a->{committed};
-    my $status = $commits >= $required ? 'sign' : 'commit';
-
+    my $db = dbh();
     $db->begin_work;
-    $db->do(q{INSERT INTO transactions (title_enc, description_enc, wallet_name, minotaur_version,
-                signers_required, signers_total, ergo_tx_id, status, commits, created_by)
-              VALUES (?,?,?,?,?,?,?,?,?,?)}, undef,
-        seal($title, 'transaction.title'), seal($desc, 'transaction.description'), $wallet, $version,
-        $required, scalar @$keys, $a->{tx_id}, $status, $commits, $ME->{id});
-    my $tx_id = $db->last_insert_id(undef, undef, 'transactions', 'id');
-    my $sth = $db->prepare('INSERT INTO transaction_keys (transaction_id, pk, slot, state) VALUES (?,?,?,?)');
-    $sth->execute($tx_id, $keys->[$_], $_, $a->{key_states}{ $keys->[$_] } // 0) for 0 .. $#$keys;
-    my $sub_id = insert_submission($tx_id, 'commit', $payload, $commits, 0);
-    insert_comment($tx_id, $comment, $sub_id) if length $comment;
-    log_event('create', '', $tx_id);
+    my $tx_id = insert_transaction(analysis => $a, keys => $keys, payload => $payload, title => $title,
+        description => $desc, wallet => $wallet, version => $version, comment => $comment);
     $db->commit;
     return { id => $tx_id + 0 };
+}
+
+# --- Batches -----------------------------------------------------------------
+# A batch is many requests pasted or uploaded at once: JSON objects one after another
+# (any whitespace between them), or a JSON array of them.
+use constant MAX_BATCH => 100;
+
+sub split_batch {
+    my ($text) = @_;
+    $text //= '';
+    $text =~ s/^\x{FEFF}//;
+    my $json = JSON::PP->new->allow_nonref;
+    my @items;
+    $text =~ s/^\s+//;
+    while (length $text) {
+        my ($value, $used) = eval { $json->decode_prefix($text) };
+        return (undef, 'Could not read entry ' . (@items + 1) . ' - the text may be cut off or not JSON.') unless $used;
+        # Keep each request's text exactly as given; only array elements need re-encoding.
+        push @items, ref $value eq 'ARRAY' ? (map { ref $_ ? JSON::PP->new->encode($_) : "$_" } @$value)
+                                           : substr($text, 0, $used);
+        $text = substr($text, $used);
+        $text =~ s/^[\s,]+//;
+        return (undef, 'Too many entries: a batch can hold at most ' . MAX_BATCH . '.') if @items > MAX_BATCH;
+    }
+    return (undef, 'Paste or upload at least one request.') unless @items;
+    return \@items;
+}
+
+# Checks every item; returns per-item results without writing anything.
+sub check_batch {
+    my ($text, $version) = @_;
+    my ($items, $err) = split_batch($text);
+    fail($err) unless $items;
+    my (%seen, @out);
+    my $i = 0;
+    for my $raw (@$items) {
+        $i++;
+        my $payload = sanitize_payload($raw);
+        my %r = (index => $i);
+        if (length $payload > $LIMIT{payload}) {
+            $r{error} = 'Too large.';
+        } else {
+            my ($a, $keys, $why) = start_checks($payload, $version);
+            if (!$a) {
+                $r{error} = $why;
+            } else {
+                @r{qw(format tx_id required signers committed outputs_uncertain)} =
+                    @$a{qw(format tx_id required signers committed outputs_uncertain)};
+                my @sends = grep { !$_->{is_fee} && !$_->{is_change} } @{ $a->{outputs} || [] };
+                my $sent = 0;
+                my %tok;
+                for my $o (@sends) { $sent += $o->{value}; $tok{ $_->{id} } += $_->{amount} for @{ $o->{tokens} || [] } }
+                $r{sends}  = { outputs => scalar @sends, value => "$sent", tokens => scalar keys %tok,
+                               to => [ map { $_->{address} } @sends ] };
+                $r{decoded} = @{ $a->{outputs} || [] } ? 1 : 0;
+                if (my $first = $seen{ $a->{tx_id} }) {
+                    $r{error} = "Same transaction as entry $first.";
+                } elsif (my $dupe = tracked_as($a->{tx_id})) {
+                    $r{error} = "Already tracked as #$dupe.";
+                    $r{tracked} = $dupe + 0;
+                }
+                $seen{ $a->{tx_id} } //= $i;
+                $r{ok} = $r{error} ? 0 : 1;
+                $r{_payload} = $payload;
+                $r{_analysis} = $a;
+                $r{_keys} = $keys;
+            }
+        }
+        $r{ok} //= 0;
+        push @out, \%r;
+    }
+    return \@out;
+}
+
+sub public_items { return [ map { my $r = $_; +{ map { $_ => $r->{$_} } grep { !/^_/ } keys %$r } } @{ $_[0] } ] }
+
+sub act_batch_preview {
+    my $version = version_param();
+    my $items = check_batch(param('items'), $version);
+    return { items => public_items($items), ok => scalar(grep { $_->{ok} } @$items) };
+}
+
+sub act_create_batch {
+    my $name = clean_text(param('name'), 100, 'Batch name');
+    fail('Give the batch a name.') unless length $name;
+    my $desc    = clean_text(param('description'), $LIMIT{description}, 'Description', 1);
+    my $wallet  = clean_text(param('wallet_name'), $LIMIT{wallet}, 'Wallet name');
+    my $version = version_param();
+    my $comment = clean_text(param('comment'), $LIMIT{comment}, 'Comment', 1);
+
+    my $items = check_batch(param('items'), $version);
+    my @ok = grep { $_->{ok} } @$items;
+    fail('None of the entries can be started - check them first.') unless @ok;
+    fail('Some entries have problems. Fix or remove them, or confirm to start only the valid ones.')
+        if @ok < @$items && !param('skip_invalid');
+    fail('That is more transactions than you can start today (limit ' . cfg('DAILY_TX_LIMIT', 200) . ').')
+        if daily_quota_left() < @ok;
+
+    my $db = dbh();
+    $db->begin_work;
+    $db->do('INSERT INTO batches (title_enc, created_by, item_count) VALUES (?,?,?)', undef,
+        seal($name, 'batch.title'), $ME->{id}, scalar @ok);
+    my $batch_id = $db->last_insert_id(undef, undef, 'batches', 'id');
+    my ($seq, @created) = (0);
+    for my $item (@ok) {
+        $seq++;
+        push @created, insert_transaction(analysis => $item->{_analysis}, keys => $item->{_keys},
+            payload => $item->{_payload}, title => "$name $seq", description => $desc, wallet => $wallet,
+            version => $version, comment => $comment, batch_id => $batch_id, batch_seq => $seq) + 0;
+    }
+    log_event('batch_create', "batch $batch_id: " . scalar(@created) . ' transactions');
+    $db->commit;
+    return { batch_id => $batch_id + 0, created => \@created, skipped => scalar(@$items) - scalar(@ok) };
 }
 
 sub insert_submission {

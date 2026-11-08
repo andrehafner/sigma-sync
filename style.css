@@ -357,3 +357,4 @@ table.list tr.inactive td { color: var(--text-3); }
 .tx-details details[open] summary { margin-bottom: 6px; }
 .tx-details .addr { font-size: .78rem; }
 .verify { font-weight: 700; text-align: center; }
+.error-text { color: var(--error); }
