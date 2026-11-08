@@ -993,7 +993,6 @@
     const box = $('#b-preview');
     const name = $('#b-name').value.trim() || 'Batch';
     const bad = r.items.length - r.ok;
-    let seq = 0;
     box.hidden = false;
     box.innerHTML = `
       <div class="panel-title"><h2>Check result</h2>
@@ -1001,7 +1000,7 @@
       <div class="table-wrap"><table class="list">
         <thead><tr><th>#</th><th>Will be named</th><th>Request</th><th>Sends</th><th>Ergo TX</th><th>Status</th></tr></thead>
         <tbody>${r.items.map((it) => {
-          const nm = it.ok ? `${name} ${++seq}` : '';
+          const nm = it.ok ? `${name} ${it.seq}` : '';
           const sends = it.sends
             ? (it.decoded ? `${esc(erg(it.sends.value))}${it.sends.tokens ? ` + ${it.sends.tokens} token type${it.sends.tokens === 1 ? '' : 's'}` : ''}
                 <div class="small faint">${it.sends.outputs} output${it.sends.outputs === 1 ? '' : 's'}${it.sends.to.length
@@ -1014,7 +1013,8 @@
             <td>${it.format ? `${esc(it.format)}${it.required ? ` · ${it.required}-of-${it.signers}` : ''}${it.format === 'MSR' ? ` · ${it.committed} committed` : ''}` : ''}</td>
             <td>${sends}</td>
             <td>${it.tx_id ? `<code title="${esc(it.tx_id)}">${esc(shortId(it.tx_id))}</code>` : ''}</td>
-            <td>${it.ok ? '<span class="tick">✓ Ready</span>'
+            <td>${it.ok ? `<span class="tick">✓ Ready</span>${it.after ? `<div class="small muted">after entr${it.after.length === 1 ? 'y' : 'ies'}
+              ${it.after.join(', ')} - spends ${it.after.length === 1 ? 'its' : 'their'} output</div>` : ''}`
               : `<span class="small error-text">${esc(it.error)}</span>${it.tracked ? ` <a href="#tx/${it.tracked}">open</a>` : ''}`}</td>
           </tr>`;
         }).join('')}</tbody>

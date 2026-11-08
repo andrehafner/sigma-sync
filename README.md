@@ -118,8 +118,13 @@ nobody committed yet) or a multi-sig request (`{"MSR":…}`) with the starter's 
 1. **Check** reads every entry and shows what it sends, its M-of-N wallet and its Ergo TX ID,
    and flags duplicates, transactions already tracked, and wallets you do not sign for. Nothing
    is written.
-2. **Start** creates one transaction per valid entry, named `<batch name> 1`, `<batch name> 2`, …,
-   sharing the wallet name, Minotaur version, description and note.
+   It also checks how the entries relate on-chain: two entries spending the same box (or a box an
+   open transaction already spends) can never both confirm, so the later one is flagged; an entry
+   that spends another entry's output is marked "after entry N".
+2. **Start** creates one transaction per valid entry, named `<batch name> 1`, `<batch name> 2`, …
+   **in broadcast order** (an entry always comes after the ones it spends from), sharing the
+   wallet name, Minotaur version, description and note. Chained transactions get a comment saying
+   which one must be broadcast first.
 3. Signers work through them as usual; after each submit, **Next in batch** jumps to the next one
    waiting for them.
 

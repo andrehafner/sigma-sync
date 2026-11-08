@@ -22,7 +22,7 @@ use JSON::PP ();
 
 use AppConfig qw(cfg dbh seal unseal random_hex client_ip);
 use ErgoKit qw(address_decode address_from_tree build_login_request verify_login_response
-               sanitize_payload analyze_payload compare_hints);
+               sanitize_payload analyze_payload compare_hints payload_input_ids);
 
 $CGI::POST_MAX = 4 * 1024 * 1024;
 
@@ -927,6 +927,51 @@ sub check_batch {
         $r{ok} //= 0;
         push @out, \%r;
     }
+
+    # Boxes already being spent by open transactions: a second spender can never confirm.
+    my %open_spends;
+    my $open = dbh()->selectall_arrayref(q{
+        SELECT t.id, (SELECT s.payload_enc FROM submissions s WHERE s.transaction_id = t.id ORDER BY s.id LIMIT 1)
+          FROM transactions t WHERE t.status IN ('commit','sign','complete')});
+    for my $row (@$open) {
+        my $ids = payload_input_ids(unseal($row->[1], 'submission.payload')) or next;
+        $open_spends{$_} //= $row->[0] for @$ids;
+    }
+
+    # Within the batch: two entries spending one box conflict; an entry spending another
+    # entry's output must wait until that one is broadcast.
+    my (%spent_by, %output_of);
+    for my $r (grep { $_->{ok} } @out) {
+        for my $o (@{ $r->{_analysis}{outputs} || [] }) { $output_of{ $o->{box_id} } = $r->{index} if $o->{box_id} }
+    }
+    for my $r (grep { $_->{ok} } @out) {
+        my (%deps, $clash, $tracked_clash);
+        for my $in (@{ $r->{_analysis}{input_ids} || [] }) {
+            $clash //= $spent_by{$in};
+            $tracked_clash //= $open_spends{$in};
+            $spent_by{$in} //= $r->{index};
+            $deps{ $output_of{$in} } = 1 if $output_of{$in} && $output_of{$in} != $r->{index};
+        }
+        if ($clash) {
+            @$r{qw(ok error)} = (0, "Spends the same box as entry $clash - only one of them can ever confirm.");
+        } elsif ($tracked_clash) {
+            @$r{qw(ok error tracked)} = (0, "Spends a box that #$tracked_clash already spends - only one can ever confirm.", $tracked_clash + 0);
+        }
+        $r->{after} = [ sort { $a <=> $b } keys %deps ] if %deps;
+    }
+
+    # Number valid entries in broadcast order: an entry always comes after the entries
+    # whose outputs it spends (otherwise keep the pasted order).
+    my @ready = grep { $_->{ok} } @out;
+    my %done;
+    my $seq = 0;
+    while (my @next = grep { !$done{ $_->{index} } && !grep { !$done{$_} } @{ $_->{after} || [] } } @ready) {
+        $done{ $next[0]{index} } = ++$seq;
+        $next[0]{seq} = $seq;
+    }
+    for my $r (grep { !$done{ $_->{index} } } @ready) {       # a cycle cannot confirm at all
+        @$r{qw(ok error)} = (0, 'Part of a circular chain of spends - these can never all confirm.');
+    }
     return \@out;
 }
 
@@ -959,12 +1004,23 @@ sub act_create_batch {
     $db->do('INSERT INTO batches (title_enc, created_by, item_count) VALUES (?,?,?)', undef,
         seal($name, 'batch.title'), $ME->{id}, scalar @ok);
     my $batch_id = $db->last_insert_id(undef, undef, 'batches', 'id');
-    my ($seq, @created) = (0);
+    @ok = sort { $a->{seq} <=> $b->{seq} } grep { $_->{ok} } @ok;
+    my ($seq, @created, %seq_of_index, %id_of_index) = (0);
+    $seq_of_index{ $_->{index} } = $_->{seq} for @ok;
     for my $item (@ok) {
-        $seq++;
+        $seq = $item->{seq};
         push @created, insert_transaction(analysis => $item->{_analysis}, keys => $item->{_keys},
             payload => $item->{_payload}, title => "$name $seq", description => $desc, wallet => $wallet,
             version => $version, comment => $comment, batch_id => $batch_id, batch_seq => $seq) + 0;
+    }
+    $id_of_index{ $ok[$_]{index} } = $created[$_] for 0 .. $#ok;
+    # Record the broadcast order on each chained transaction, visible to every signer.
+    for my $i (0 .. $#ok) {
+        my @after = grep { $id_of_index{$_} } @{ $ok[$i]{after} || [] };
+        next unless @after;
+        insert_comment($created[$i], 'Broadcast order: this transaction spends an output of '
+            . join(', ', map { "$name $seq_of_index{$_} (#$id_of_index{$_})" } @after)
+            . (@after == 1 ? '. Broadcast that one first.' : '. Broadcast those first.'), undef);
     }
     log_event('batch_create', "batch $batch_id: " . scalar(@created) . ' transactions');
     $db->commit;
