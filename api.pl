@@ -86,6 +86,8 @@ my $response = eval {
     return $h->();
 };
 if (my $err = $@) {
+    # Undo any half-done database transaction before reporting the error.
+    eval { my $db = dbh(); $db->rollback unless $db->{AutoCommit}; 1 };
     if (ref $err eq 'HASH' && $err->{public}) {
         $response = { success => 0, error => $err->{public}, %{ $err->{extra} || {} } };
     } else {
