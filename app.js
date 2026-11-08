@@ -790,7 +790,7 @@
             <textarea id="f-desc" maxlength="10000" rows="5" placeholder="Who is being paid, for what, amounts, links to the vote or invoice…"></textarea>
           </div>
           <div class="field">
-            <label for="f-payload">Your first commitment (multi-sig request from Minotaur)</label>
+            <label for="f-payload">Multi-sig request from Minotaur (usually with your commitment)</label>
             <textarea class="payload" id="f-payload" required autocomplete="off" autocapitalize="off" autocorrect="off"
               spellcheck="false" placeholder='{"MSR":"{\\"tx\\":\\"…"}'></textarea>
             <div class="row mt-8"><button type="button" class="btn btn-sm" id="f-scan">Scan QR</button>
@@ -893,7 +893,7 @@
           <div class="panel-title"><h2>Start a batch of transactions</h2></div>
           <p class="muted small">Paste or upload many requests at once - one JSON request after another, or a JSON array.
           Cold signing requests (<code>{"CSR":…}</code>, nobody committed yet) and multi-sig requests (<code>{"MSR":…}</code>,
-          with your commitment) both work. Each becomes its own transaction, named after the batch.</p>
+          with or without commitments already in it) both work. Each becomes its own transaction, named after the batch.</p>
           <div class="field-row">
             <div>
               <label for="b-name">Batch name</label>
@@ -1068,7 +1068,6 @@
     const items = [];
     if (!txId && a.valid && a.format === 'MSR' && a.is_signer !== undefined) {
       if (!a.is_signer) a.problem = 'None of your addresses is a signer of this multi-sig wallet. Link the address you sign with on the Account tab.';
-      else if (!a.my_committed) a.problem = 'Your commitment is not in this request yet. Press Commit in Minotaur first, then copy the new request.';
     }
     const bad = !a.valid || !!a.problem;
     if (a.format === 'MSR') {
@@ -1343,7 +1342,7 @@
       let head;
       if (e.kind === 'submission') {
         dot = e.round;
-        const what = { start: 'started it from the unsigned request (no commitments yet)', commit: 'added a commitment', sign: 'added a signature', final: 'submitted the fully signed transaction' }[e.round] || 'submitted';
+        const what = { start: 'started the transaction', commit: 'added a commitment', sign: 'added a signature', final: 'submitted the fully signed transaction' }[e.round] || 'submitted';
         head = `<strong>${esc(e.member)}</strong> ${what}
           <span class="faint small">· ${e.commits} commit${e.commits === 1 ? '' : 's'}, ${e.signatures} sig${e.signatures === 1 ? '' : 's'}
           · <span class="fingerprint" title="SHA-256 fingerprint of the stored payload">${esc(e.fingerprint)}</span></span>`;

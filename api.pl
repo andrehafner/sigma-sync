@@ -768,8 +768,9 @@ sub version_param {
 
 # Checks a payload someone wants to start a transaction from. Returns
 # (analysis, signer keys) or (undef, undef, reason) so batches can report per item.
-#   MSR: the starter's own commitment must already be in it.
-#   CSR: an unsigned request (nobody committed yet); the starter must be a signer.
+# The starter must be a signer. An MSR may already carry commitments from anyone
+# (tools such as the Rosen guard scripts generate requests with one in place); a CSR
+# is an unsigned request nobody has committed to yet.
 sub start_checks {
     my ($payload, $version) = @_;
     my $a = analyze_payload($payload);
@@ -787,9 +788,6 @@ sub start_checks {
     my @my_keys = grep { $mine{$_} } @$keys;
     return (undef, undef, 'None of the addresses on your account is a signer of this multi-sig wallet. If you sign '
         . 'with another wallet or address, link it on the Account tab first.') unless @my_keys;
-    if ($a->{format} eq 'MSR' && !grep { ($a->{key_states}{$_} // 0) =~ /^[12]$/ } @my_keys) {
-        return (undef, undef, 'Your commitment is not in this request yet. In Minotaur, press Commit first, then copy the new request.');
-    }
     return ($a, $keys);
 }
 
@@ -824,8 +822,11 @@ sub insert_transaction {
     my $tx_id = $db->last_insert_id(undef, undef, 'transactions', 'id');
     my $sth = $db->prepare('INSERT INTO transaction_keys (transaction_id, pk, slot, state) VALUES (?,?,?,?)');
     $sth->execute($tx_id, $keys->[$_], $_, $a->{key_states}{ $keys->[$_] } // 0) for 0 .. $#$keys;
-    # A CSR start is not a commitment; an MSR start carries the starter's commitment.
-    my $sub_id = insert_submission($tx_id, ($a->{format} eq 'CSR' ? 'start' : 'commit'), $t{payload}, $commits, 0);
+    # The first submission counts as the starter's commitment only if their own key has
+    # committed in it; otherwise they still owe the commitment round their step.
+    my %mine = map { $_ => 1 } @{ my_pks() };
+    my $own_commit = grep { $mine{$_} && ($a->{key_states}{$_} // 0) =~ /^[12]$/ } @$keys;
+    my $sub_id = insert_submission($tx_id, ($own_commit ? 'commit' : 'start'), $t{payload}, $commits, 0);
     insert_comment($tx_id, $t{comment}, $sub_id) if length($t{comment} // '');
     log_event('create', $t{batch_id} ? "batch $t{batch_id} item $t{batch_seq}" : '', $tx_id);
     return $tx_id;

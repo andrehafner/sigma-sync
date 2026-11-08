@@ -62,8 +62,8 @@ Sigma Sync is a small web app that keeps one source of truth for each transactio
   (the `atLeast(M, keys)` proposition of each input) and stores them with it.
 - An account sees, locks, signs, comments on or cancels a transaction **only if one of its proven
   addresses is one of those keys**. Anyone else gets "Transaction not found". Admins are no exception.
-- Only a signer of the wallet can start a transaction for it, and their own commitment must
-  already be in the request.
+- Only a signer of the wallet can start a transaction for it. The request may already carry
+  commitments (yours or another signer's); anyone whose key has not committed adds theirs in turn.
 - Minotaur derives each multi-sig key from every signer's wallet at the same address index, so a
   multi-sig's first address uses each signer's first address. If you sign with several wallets,
   or a multi-sig uses a later address, link those addresses on the **Account** tab (each one is
@@ -113,7 +113,7 @@ Signers who did not commit cannot join once signing has started.
 
 **Start Batch** takes tens of requests at once - pasted one after another, as a JSON array, or
 uploaded as `.json`/`.txt` files. Each may be an unsigned cold signing request (`{"CSR":…}`,
-nobody committed yet) or a multi-sig request (`{"MSR":…}`) with the starter's commitment.
+nobody committed yet) or a multi-sig request (`{"MSR":…}`), with or without commitments already in it.
 
 1. **Check** reads every entry and shows what it sends, its M-of-N wallet and its Ergo TX ID,
    and flags duplicates, transactions already tracked, and wallets you do not sign for. Nothing
