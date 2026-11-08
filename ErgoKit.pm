@@ -26,7 +26,7 @@ use Exporter 'import';
 our @EXPORT_OK = qw(
     blake2b256 address_decode address_from_tree
     build_login_request verify_login_response
-    sanitize_payload analyze_payload compare_hints
+    sanitize_payload analyze_payload compare_hints payload_input_ids
 );
 
 use constant {
@@ -641,7 +641,9 @@ sub _parse_outputs {
                 push @{ $o{tokens} }, { id => $token_ids->[$idx], amount => "$amount" };
             }
             die "registers\n" if ord(substr($bytes, $rr->{p}, 1)) > 6;
+            my $reg_start = $rr->{p};
             _skip_registers($rr);
+            $o{_registers} = substr($bytes, $reg_start, $rr->{p} - $reg_start);
             my $tree = substr($bytes, $tree_start, $end - $tree_start);
             $o{tree}        = unpack 'H*', $tree;
             $o{address}     = address_from_tree($tree);
@@ -652,6 +654,23 @@ sub _parse_outputs {
         } or next;
         _parse_outputs($bytes, $rr->{p}, $n - 1, $token_ids, $budget, $found, @path, $o);
     }
+}
+
+# Box id of each output: Blake2b-256 of the full box (candidate with full token ids,
+# then the transaction id and the output index). Lets a batch see which transactions
+# spend another's outputs.
+sub _set_box_ids {
+    my ($outs, $tx_id) = @_;
+    for my $i (0 .. $#$outs) {
+        my $o = $outs->[$i];
+        my $bytes = vlq($o->{value}) . pack('H*', $o->{tree}) . vlq($o->{height})
+                  . chr(scalar @{ $o->{tokens} || [] })
+                  . join('', map { pack('H*', $_->{id}) . vlq($_->{amount}) } @{ $o->{tokens} || [] })
+                  . ($o->{_registers} // "\x00")
+                  . pack('H*', $tx_id) . vlq($i);
+        $o->{box_id} = unpack 'H*', blake2b256($bytes);
+    }
+    delete $_->{_registers} for @$outs;
 }
 
 # Chooses the parse that makes sense as a transaction: ERG in = ERG out and no token
@@ -687,6 +706,24 @@ sub _parse_box_summary {
         $b{tokens}{$id} += _vlq($r);
     }
     return \%b;
+}
+
+# Box ids a payload's transaction spends (hex), without the full analysis. Undef if
+# the payload is not a readable MSR/CSR.
+sub payload_input_ids {
+    my ($text) = @_;
+    my $doc = eval { _decode_envelope(sanitize_payload($text)) } or return;
+    my $d = $doc->{data};
+    return unless ref $d eq 'HASH';
+    my $tx = $doc->{type} eq 'CSR' ? $d->{reducedTx} : $doc->{type} eq 'MSR' ? $d->{tx} : undef;
+    return unless $tx;
+    return eval {
+        my $r = _reader(decode_base64($tx));
+        my $m = _reader(_take($r, _vlq($r)));
+        my @ids;
+        for (1 .. _vlq($m)) { push @ids, unpack 'H*', _take($m, 32); _take($m, _vlq($m)); _u8($m) }
+        \@ids;
+    };
 }
 
 # Read-only analysis of a pasted payload. Never throws; returns a hashref:
@@ -740,8 +777,8 @@ sub analyze_payload {
 
     my $tx = eval { _parse_reduced(decode_base64($d->{tx})) };
     unless ($tx) { $res{error} = 'The transaction inside the payload could not be read. It may be truncated.'; return \%res }
-    @res{qw(tx_id required signers outputs outputs_partial input_keys)}
-        = @$tx{qw(tx_id required signers outputs outputs_partial input_keys)};
+    @res{qw(tx_id required signers outputs outputs_partial input_keys input_ids)}
+        = @$tx{qw(tx_id required signers outputs outputs_partial input_keys input_ids)};
 
     # Hints: current builds use "hints" (matrix input x signer slot); the oldest builds
     # used "commitments" + "signed".
@@ -800,6 +837,7 @@ sub analyze_payload {
         my ($outs, $certain) = _choose_outputs($tx->{output_parses}, ($inputs_known ? $total : undef),
             \%in_tokens, $tx->{input_ids}[0]);
         if ($outs) {
+            _set_box_ids($outs, $tx->{tx_id});
             $res{outputs} = $outs;
             $res{outputs_uncertain} = $certain ? 0 : 1;
         } else {
