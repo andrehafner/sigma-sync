@@ -20,6 +20,12 @@
     qrTimers: new Set(),
     view: 0, // counts the routes drawn, so a late answer can tell it is stale
     listSeq: 0, // counts the list fetches, so an older answer can tell a newer one has started
+    runWallet: null, // the context of a connected wallet that passed the B1 and Q7 checks, or null (Q4)
+    selection: new Set(), // ids of the rows picked for a run (Q4). It lives here so a redraw keeps it (Q9).
+    selGroup: '', // the group key of those rows: a selection holds one group
+    selNotes: [], // plain texts that say why the selection is not what the signer asked for
+    acks: new Map(), // id -> the reading of the flagged item that the signer ticked. A different reading drops the tick (Q5).
+    readings: new Map(), // id -> the reading the review screen shows now
   };
 
   const MINOTAUR_RELEASES = 'https://github.com/minotaur-ergo/minotaur-wallet/releases';
@@ -611,7 +617,10 @@
     nautilusSlot = { el, fill };
     fill();
   }
-  window.addEventListener('ergo-wallet:injected', () => { if (nautilusSlot?.el.isConnected) nautilusSlot.fill(); });
+  window.addEventListener('ergo-wallet:injected', () => {
+    if (nautilusSlot?.el.isConnected) nautilusSlot.fill();
+    if ($('#tx-filter')) checkRunWallet(viewGuard());
+  });
 
   // ------------------------------------------------------------------------
   // Sign-in
@@ -620,6 +629,7 @@
     stopPolling();
     stopQrTimers();
     $('#user-chip').hidden = true;
+    resetRun();
     const si = S.signin || {};
     app().innerHTML = `
       <section class="signin">
@@ -713,6 +723,7 @@
     if (m) return renderDetail(Number(m[1]));
     if (hash === 'start') return renderStart();
     if (hash === 'batch') return renderBatch();
+    if (hash === 'review') return renderReview();
     if (hash === 'wallets') return renderWallets();
     const w = hash.match(/^wallet\/(\d+)$/);
     if (w) return renderWallet(w[1]);
@@ -778,12 +789,14 @@
   const isOpen = (t) => t.status === 'commit' || t.status === 'sign';
 
   // False when a newer fetch has started: its answer is the one to keep, so this one is dropped.
+  // The selection is reconciled with every answer that is kept, whether or not a view draws it.
   async function fetchList() {
     const seq = ++S.listSeq;
     const r = await api('list_transactions');
     if (seq !== S.listSeq) return false;
     S.txs = r.transactions;
     S.wallets = r.wallet_names || [];
+    reconcileSelection();
     return true;
   }
 
@@ -797,6 +810,7 @@
     if (location.hash.replace(/^#/, '') !== '' && location.hash !== '#sign') return;
     drawList();
     poll(async () => { if (await fetchList() && live()) drawList(true); }, 30000);
+    checkRunWallet(live);
   }
 
   function progressBars(t) {
@@ -842,6 +856,7 @@
   function drawList(keepFocus = false) {
     const view = $('#view');
     if (!view) return;
+    const refocus = keepFocus ? focusSelector() : '';
     const counts = {
       awaiting: S.txs.filter((t) => t.me.awaiting).length,
       active: S.txs.filter(isOpen).length,
@@ -885,16 +900,20 @@
         </select>
         <a class="btn btn-primary" href="#start">Start transaction</a>
       </div>
+      ${selectionBarHtml()}
       ${groups.length ? groups.map(([key, title, rows]) => `
         <section class="group" data-group="${key}" aria-labelledby="group-${key}">
-          <h2 class="group-title" id="group-${key}"><span data-group-title>${title}</span> <span class="group-count" data-group-count>${rows.length}</span></h2>
-          <div class="cards">${rows.map((t) => card(t, true, false)).join('')}</div>
+          ${S.runWallet && rows.some(selectable) ? `<div class="group-head">${groupHeading(key, title, rows.length)}
+            <button type="button" class="btn btn-sm" data-select-all="${key}" aria-label="Select all in ${esc(title)}">Select all</button></div>`
+            : groupHeading(key, title, rows.length)}
+          <div class="cards">${rows.map((t) => (S.runWallet ? pickRow(t) : card(t, true, false))).join('')}</div>
         </section>`).join('') : `
         <div class="empty" data-queue="empty">${S.txs.length ? 'Nothing matches this filter.' : 'No transactions for your wallets yet. They appear here when someone starts one for a multi-sig wallet one of your addresses signs for.'}</div>`}`;
 
     paintBars(view);
     updateTabCount();
-    if (keepFocus && document.activeElement?.id === 'tx-search') $('#tx-search').focus();
+    // The focus returns without a scroll: a list refresh must not move the page (Q9).
+    if (keepFocus && refocus) $(refocus)?.focus({ preventScroll: true });
     $('#tx-search').addEventListener('input', (ev) => { S.search = ev.target.value; drawList(true); placeCaret(); });
     $('#tx-filter').addEventListener('change', (ev) => { S.filter = ev.target.value; drawList(); });
   }
@@ -906,8 +925,12 @@
     el.setSelectionRange(el.value.length, el.value.length);
   }
 
+  const groupHeading = (key, title, count) => `
+    <h2 class="group-title" id="group-${key}"><span data-group-title>${title}</span> <span class="group-count" data-group-count>${count}</span></h2>`;
+
   // `showTurn` is false inside a group: the heading already says what the signer owes.
-  function card(t, showWallet = true, showTurn = true) {
+  // `why` is the reason a row cannot be picked for a run. It stands in for the two lines that say the same.
+  function card(t, showWallet = true, showTurn = true, why = '') {
     const mine = myStatusText(t);
     return `
       <a class="card ${t.me.awaiting ? 'attention' : ''}" href="#tx/${t.id}">
@@ -921,14 +944,269 @@
         </div>
         ${isOpen(t) || t.status === 'complete' ? progressBars(t) : ''}
         ${t.lock ? `<div><span class="pill pill-lock">Locked by ${esc(t.lock.mine ? 'you' : t.lock.name)} · ${timeTag(t.lock.since)}</span></div>` : ''}
+        ${why ? `<div class="why" data-why>${esc(why)}</div>` : ''}
         <div class="card-foot">
           <span>By ${esc(t.created_by)} · ${timeTag(t.created_at)}</span>
           <span>Updated ${timeTag(t.updated_at)}</span>
           ${t.comments ? `<span>${t.comments} comment${t.comments > 1 ? 's' : ''}</span>` : ''}
-          ${!t.me.awaiting && mine ? `<span class="tick">${esc(mine)}</span>` : ''}
-          ${t.status === 'sign' && !t.me.committed ? '<span class="muted">Commitments are closed, so you cannot sign</span>' : ''}
+          ${!t.me.awaiting && mine && !why ? `<span class="tick">${esc(mine)}</span>` : ''}
+          ${!why && t.status === 'sign' && !t.me.committed ? '<span class="muted">Commitments are closed, so you cannot sign</span>' : ''}
         </div>
       </a>`;
+  }
+
+  // ------------------------------------------------------------------------
+  // Pick rows for a run (SPEC Q4, Q9, B1, B2)
+  // ------------------------------------------------------------------------
+  const RUN_MAX = 20; // B2: one wallet call holds at most 20 items
+  const GROUPS = [...QUEUE_GROUPS, CLOSED_GROUP];
+  const groupOf = (t) => GROUPS.find(([, , test]) => test(t))?.[0];
+  const groupLabel = (key) => GROUPS.find(([k]) => k === key)?.[1] || '';
+  // The server's turn rule (`me.can_act`) and the lock decide, as section 2 of queue-patterns.md has it.
+  const selectable = (t) => !!t.me.can_act && !(t.lock && !t.lock.mine);
+
+  // Why a row cannot be picked, as plain text, or '' when it can.
+  function whyNot(t) {
+    if (selectable(t)) return '';
+    if (t.me.can_act) return `${t.lock.name || 'A co-signer'} holds the lock, taken ${ago(t.lock.since)}.`;
+    if (t.status === 'commit') return t.me.committed ? 'You committed. Waiting for others.' : 'None of your keys has an open commitment slot.';
+    if (t.status === 'sign') return t.me.signed ? 'You signed.' : 'Commitments are closed, so you cannot sign.';
+    return t.status === 'complete' ? 'Nothing left to sign.' : 'This transaction is closed.';
+  }
+
+  function clearSelection() {
+    S.selection.clear();
+    S.acks.clear();
+    S.selGroup = '';
+  }
+
+  function resetRun() {
+    S.runWallet = null;
+    S.selNotes = [];
+    clearSelection();
+  }
+
+  // Run actions need a wallet that passes three checks (SPEC B1, Q7). The origin already allows it: the page
+  // opens no connect window of its own. Its context has `multisig` as an own property, with version 1: the
+  // context is frozen but its prototype is not, so a plain read could find a `multisig` any script added there.
+  // One of its addresses belongs to the signed-in account. Any failure of the wallet reads as "no".
+  async function findRunWallet() {
+    const wallet = nautilusConnector();
+    if (!wallet) return null;
+    try {
+      if (!(await wallet.isAuthorized()) || !(await wallet.connect({ createErgoObject: false }))) return null;
+      const ctx = await wallet.getContext();
+      if (!Object.hasOwn(ctx, 'multisig') || ctx.multisig?.version !== 1) return null;
+      const lists = await Promise.all([ctx.get_used_addresses(), ctx.get_unused_addresses()]);
+      const mine = S.me?.addresses || [];
+      return lists.flat().some((a) => mine.includes(a)) ? ctx : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Draws the list again only when the answer changes whether run actions show.
+  async function checkRunWallet(live) {
+    const ctx = await findRunWallet();
+    if (!live()) return;
+    const changed = !!ctx !== !!S.runWallet;
+    S.runWallet = ctx;
+    if (changed) drawList(true);
+  }
+
+  // A selector that finds the focused control of the list again after the list is drawn anew (Q9).
+  function focusSelector() {
+    const el = document.activeElement;
+    if (!el || !$('#view')?.contains(el)) return '';
+    for (const attr of ['id', 'data-select', 'data-select-all', 'data-clear-selection', 'data-filter', 'href']) {
+      const value = el.getAttribute(attr);
+      if (value) return attr === 'id' ? `#${CSS.escape(value)}` : `[${attr}="${CSS.escape(value)}"]`;
+    }
+    return '';
+  }
+
+  // Drops the rows that a list answer made unselectable, and says why. Runs when a list answer is kept.
+  function reconcileSelection() {
+    for (const id of [...S.selection]) {
+      const t = S.txs.find((x) => x.id === id);
+      const why = !t ? 'It is no longer in your queue.' : whyNot(t) || (groupOf(t) === S.selGroup ? '' : 'It moved to another group.');
+      if (!why) continue;
+      S.selection.delete(id);
+      S.acks.delete(id);
+      S.selNotes.push(`#${id}${t ? ` ${t.title}` : ''} left your selection. ${why}`);
+    }
+    if (!S.selection.size) S.selGroup = '';
+  }
+
+  function pick(id, on) {
+    const t = S.txs.find((x) => x.id === id);
+    S.selNotes = [];
+    if (!t || whyNot(t)) return drawList(true);
+    if (!on) {
+      S.selection.delete(id);
+      S.acks.delete(id);
+    } else {
+      const group = groupOf(t);
+      if (S.selection.size && S.selGroup !== group) {
+        clearSelection();
+        S.selNotes.push(`Started a new selection in ${groupLabel(group)}. A run covers one group.`);
+      }
+      if (S.selection.size >= RUN_MAX) {
+        S.selNotes.push(`A run holds at most ${RUN_MAX} transactions. Clear one before you add #${id}.`);
+      } else {
+        S.selection.add(id);
+        S.selGroup = group;
+      }
+    }
+    if (!S.selection.size) S.selGroup = '';
+    drawList(true);
+  }
+
+  // "Select all" takes the selectable rows the list shows for the group, up to the cap.
+  function pickAll(group) {
+    const ids = $$(`[data-group="${group}"] [data-select]`).map((el) => Number(el.dataset.select));
+    clearSelection();
+    S.selNotes = [];
+    S.selection = new Set(ids.slice(0, RUN_MAX));
+    S.selGroup = ids.length ? group : '';
+    if (ids.length > RUN_MAX) S.selNotes.push(`Selected the first ${RUN_MAX} of ${ids.length}. A run holds at most ${RUN_MAX} transactions.`);
+    drawList(true);
+  }
+
+  const selNotesHtml = (attr) =>
+    S.selNotes.length ? `<ul class="select-notes" ${attr}>${S.selNotes.map((m) => `<li>${esc(m)}</li>`).join('')}</ul>` : '';
+
+  function selectionBarHtml() {
+    const n = S.selection.size;
+    if (!n && !S.selNotes.length) return '';
+    return `
+      <section class="selection-bar" data-selection aria-label="Selection">
+        ${n && S.runWallet ? `<strong data-select-count>${n} selected</strong> <span class="muted">in ${esc(groupLabel(S.selGroup))}</span>
+          <span class="spacer"></span>
+          <a class="btn btn-primary btn-sm" href="#review">Review</a>
+          <button type="button" class="btn btn-sm" data-clear-selection="1">Clear</button>` : ''}
+        ${n && !S.runWallet ? `<p class="muted" data-wallet-away>Your wallet is not available, so run actions are hidden. Your selection of ${n} stays.</p>` : ''}
+        ${selNotesHtml('data-select-note')}
+      </section>`;
+  }
+
+  // The checkbox sits outside the card: a control inside a link is not valid markup.
+  function pickRow(t) {
+    const why = whyNot(t);
+    const on = S.selection.has(t.id);
+    return `
+      <div class="card-row ${on ? 'selected' : ''}">
+        <span class="pick">${why ? '' : `<input type="checkbox" data-select="${t.id}" ${on ? 'checked' : ''} aria-label="Select #${t.id} ${esc(t.title)}">`}</span>
+        ${card(t, true, false, why)}
+      </div>`;
+  }
+
+  // ------------------------------------------------------------------------
+  // Review before a run (SPEC Q5)
+  // ------------------------------------------------------------------------
+  // The review reads the newest list first, so an id that the list no longer holds never gets an item. A fetch
+  // started here also makes an older list answer that is still on its way drop itself (listSeq).
+  async function renderReview() {
+    const live = viewGuard();
+    const view = shell('sign');
+    const back = '<a class="back" href="#">← Back to the queue</a>';
+    if (S.selection.size) {
+      view.innerHTML = '<div class="loading">Loading the review…</div>';
+      try { await fetchList(); } catch (e) { if (live()) view.innerHTML = back + loadError(e.message); return; }
+      if (!live()) return;
+    }
+    const ids = [...S.selection];
+    if (!ids.length) {
+      view.innerHTML = `${back}
+        <div class="empty" data-review-empty>Nothing is selected. Pick transactions in the queue to review them.</div>
+        ${selNotesHtml('data-review-note')}`;
+      return;
+    }
+    const items = await Promise.all(ids.map(async (id) => {
+      try { return { id, t: (await api('get_transaction', { id })).transaction }; } catch (e) { return { id, error: e.message }; }
+    }));
+    if (live()) drawReview(items);
+  }
+
+  function drawReview(items) {
+    const view = $('#view');
+    if (!view) return;
+    // A tick holds for the reading the signer saw. Boxes can change with the Ergo transaction id the same, so compare all of the decoded view.
+    S.readings = new Map(items.filter((i) => i.t).map((i) => [i.id, JSON.stringify([i.t.review, i.t.ergo_tx_id])]));
+    for (const [id, seen] of S.acks) if (S.readings.has(id) && S.readings.get(id) !== seen) S.acks.delete(id);
+    view.innerHTML = `
+      <a class="back" href="#">← Back to the queue</a>
+      <h1>Review ${items.length} transaction${items.length === 1 ? '' : 's'}</h1>
+      <p class="muted">${esc(groupLabel(S.selGroup))}. Decoded by Sigma Sync from each request. Your wallet shows its own review of every item.
+        Your selection stays in the queue.</p>
+      ${selNotesHtml('data-review-note')}
+      <div class="stack" data-review-list>${items.map(reviewItemHtml).join('')}</div>
+      <div class="row mt-16">
+        <a class="btn" href="#">Back to the queue</a>
+        ${items.some((i) => i.error) ? '<button type="button" class="btn" data-retry>Try again</button>' : ''}
+      </div>`;
+    fillTokenNames(view);
+  }
+
+  // What makes an item need its own tick (Q5): the server's doubts about its reading, and a payment to a contract.
+  function reviewFlags(t) {
+    const r = t.review;
+    if (!r) return [['No decoded view', 'Sigma Sync has no decoded view of this transaction.']];
+    const flags = [];
+    if (r.inputs_unverified) flags.push(['unverified', 'Inputs unverified', 'The input boxes of this request do not match the inputs it spends, so no amount is cross-checked.']);
+    if (r.outputs_partial) flags.push(['partial', 'Outputs partial', 'Sigma Sync could not read every output.']);
+    if (r.outputs_uncertain) flags.push(['uncertain', 'Outputs uncertain', 'Some outputs pay to contracts Sigma Sync cannot read fully, or could not be cross-checked against the inputs.']);
+    else if ((r.outputs || []).some((o) => o.is_contract)) flags.push(['contract', 'Pays to a smart contract', 'Check the contract in your wallet.']);
+    return flags;
+  }
+
+  function reviewSendHtml(o) {
+    return `
+      <div class="send" data-review-send>
+        <div class="send-amount">${esc(erg(o.value))}</div>
+        ${(o.tokens || []).map((tk) => `<div class="token-line">${tokenHtml(tk.id, tk.amount)}</div>`).join('')}
+        <div class="small muted mt-8">to ${o.to_input_address ? '<span class="tag">same address it spends from</span>'
+          : o.is_multisig ? '<span class="tag">multi-sig address</span>'
+          : o.is_contract ? '<span class="tag">smart contract</span>' : ''}</div>
+        <div class="mono anywhere" data-review-to>${esc(o.address)}</div>
+      </div>`;
+  }
+
+  function reviewItemHtml({ id, t, error }) {
+    if (error) {
+      return `<section class="panel" data-review-item="${id}"><div class="notice notice-error">Could not load #${id}: ${esc(error)}</div></section>`;
+    }
+    const outputs = t.review?.outputs || [];
+    const sends = outputs.filter((o) => !o.is_fee && !o.is_change);
+    const fee = outputs.filter((o) => o.is_fee).reduce((n, o) => n + BigInt(o.value), 0n).toString();
+    const flags = reviewFlags(t);
+    const gone = whyNot(t);
+    return `
+      <section class="panel" data-review-item="${id}" aria-labelledby="review-${id}">
+        <div class="card-head">
+          <div class="grow">
+            <h2 id="review-${id}"><a class="row-link" href="#tx/${id}">${esc(t.title)}</a></h2>
+            <div class="meta">
+              <span>#${id}</span>
+              <span data-review-wallet>${t.wallet ? esc(walletName(t.wallet)) : 'No wallet'}</span>
+              <span data-review-m>${esc(t.signers_required)} of ${esc(t.signers_total)} signatures</span>
+            </div>
+          </div>
+          ${statusPill(t.status)}
+        </div>
+        ${gone ? `<div class="notice notice-error small mt-12" data-review-gone>It cannot be run now. ${esc(gone)}</div>` : ''}
+        <h3 class="mt-16">Pays</h3>
+        ${!outputs.length ? '<p class="small muted">Sigma Sync could not read the outputs.</p>'
+          : sends.length ? sends.map(reviewSendHtml).join('') : '<p class="small muted">Nothing leaves the wallet except the fee.</p>'}
+        <dl class="kv mt-12"><dt>Network fee</dt><dd data-review-fee>${outputs.length ? esc(erg(fee)) : 'Unknown'}</dd></dl>
+        ${t.ergo_tx_id ? `<p class="small mt-12">Ergo transaction ID <code class="anywhere" data-review-txid>${esc(t.ergo_tx_id)}</code></p>` : ''}
+        ${flags.length ? `
+          <div class="notice notice-warning mt-12" data-review-flags>
+            <ul class="flags">${flags.map(([key, label, text]) => `<li data-flag="${esc(key)}"><strong>${esc(label)}.</strong> ${esc(text)}</li>`).join('')}</ul>
+            <label class="check mt-8"><input type="checkbox" data-ack="${id}" ${S.acks.has(id) ? 'checked' : ''}>
+              I have read ${flags.length > 1 ? 'these warnings' : 'this warning'} for #${id}.</label>
+          </div>` : ''}
+      </section>`;
   }
 
   // ------------------------------------------------------------------------
@@ -2286,12 +2564,25 @@
     const filter = ev.target.closest('[data-filter]');
     if (filter) { S.filter = filter.dataset.filter; drawList(); return; }
     if (ev.target.closest('[data-retry]')) { route(); return; }
+    const all = ev.target.closest('[data-select-all]');
+    if (all) { pickAll(all.dataset.selectAll); return; }
+    if (ev.target.closest('[data-clear-selection]')) { clearSelection(); S.selNotes = []; drawList(true); return; }
     if (ev.target.closest('#user-chip [data-action=logout]')) {
       try { await api('logout'); } catch (e) { /* ignore */ }
       S.me = null;
       S.csrf = '';
       S.txs = [];
       renderSignIn();
+    }
+  });
+
+  document.addEventListener('change', (ev) => {
+    const row = ev.target.closest('[data-select]');
+    if (row) pick(Number(row.dataset.select), row.checked);
+    const ack = ev.target.closest('[data-ack]');
+    if (ack) {
+      const id = Number(ack.dataset.ack);
+      if (ack.checked) S.acks.set(id, S.readings.get(id)); else S.acks.delete(id);
     }
   });
 

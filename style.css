@@ -36,6 +36,7 @@
   --chip-size: 24px;
   --weight-medium: 500;
   --hit-min: 28px; /* the least height of a link that stands alone in a row (U3 asks 24px) */
+  --pick-size: 24px; /* a checkbox: U3 asks 24px */
   --shadow: 0 1px 2px rgba(20, 18, 14, .06), 0 2px 8px rgba(20, 18, 14, .04);
   --shadow-lg: 0 10px 40px rgba(20, 18, 14, .18);
 
@@ -167,6 +168,7 @@ textarea.payload[readonly] { color: var(--text-2); }
 .field-row { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
 .field-row + .field, .field + .field-row { margin-top: 14px; }
 .check { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+input[type=checkbox] { flex: none; width: var(--pick-size); height: var(--pick-size); margin: 0; accent-color: var(--accent); cursor: pointer; }
 
 /* --- Panels, cards ------------------------------------------------------ */
 .panel {
@@ -398,3 +400,21 @@ table.list tr.inactive td { color: var(--text-3); }
 /* --- Wallets ------------------------------------------------------------ */
 .row-link { display: inline-flex; align-items: center; min-height: var(--hit-min); font-weight: var(--weight-medium); overflow-wrap: anywhere; }
 .wallet-address { display: block; margin-bottom: var(--space-2); overflow-wrap: anywhere; }
+
+/* --- Select and review (Q4, Q5) ----------------------------------------- */
+/* A row with a checkbox has less width for the lock pill, which keeps its text on one line elsewhere. */
+.card-row .pill { white-space: normal; overflow-wrap: anywhere; }
+.group-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-1); flex-wrap: wrap; margin: 0 0 var(--space-2); }
+.group-head .group-title { margin: 0; }
+.card-row { display: flex; gap: var(--space-2); align-items: flex-start; min-width: 0; }
+.card-row > .card { flex: 1; min-width: 0; }
+.pick { flex: none; width: var(--pick-size); padding-top: var(--space-3); }
+.card-row.selected > .card { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.why { padding-left: var(--space-1); border-left: 3px solid var(--border-strong); color: var(--text-2); font-size: var(--text-sm); }
+.selection-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-3);
+  margin-bottom: var(--space-4); padding: var(--space-3) var(--space-4);
+  background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border)); border-radius: var(--radius);
+}
+.select-notes { flex-basis: 100%; margin: 0; padding-left: var(--space-4); color: var(--text-2); font-size: var(--text-sm); }
+.flags { margin: 0; padding-left: var(--space-4); }
