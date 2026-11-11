@@ -25,7 +25,7 @@ use Math::BigInt try => 'GMP';    # pure-Perl fallback works, ~10x slower (~0.9 
 use Exporter 'import';
 our @EXPORT_OK = qw(
     blake2b256 address_decode address_from_tree
-    build_login_request verify_login_response
+    build_login_request verify_login_response verify_nautilus_auth
     sanitize_payload analyze_payload compare_hints payload_input_ids
 );
 
@@ -356,6 +356,35 @@ sub verify_login_response {
     return (0, 'The wallet did not produce a signature.') unless length $proof == 56;
 
     return schnorr_verify($arg{pk}, $message, $proof)
+        ? (1)
+        : (0, 'Signature check failed. Make sure you signed with the wallet for this address.');
+}
+
+# Verifies the text and proof that Nautilus's auth(address, challenge) returned, with the
+# checks of SPEC L4 in their order. The text is "challenge;host;seconds;random" and the
+# proof is the single-key proof verify_login_response checks, over the text's bytes (L9).
+#   challenge: the stored token; host: SITE_HOST; pk: 33 bytes of the stored address
+#   not_before, not_after: Unix seconds, the challenge's life widened by 300 each side
+# Returns (1) on success or (0, reason).
+sub verify_nautilus_auth {
+    my (%arg) = @_;
+    my $text   = $arg{signed_message} // '';
+    my @fields = split /;/, $text, -1;
+    my $not_nautilus = 'The wallet did not return a Nautilus sign-in text.';
+    return (0, $not_nautilus) unless $text =~ /\A[\x20-\x7e]{1,300}\z/ && @fields == 4;
+    my ($challenge, $host, $seconds, $rand) = @fields;
+
+    return (0, 'This signature is for a different sign-in request. Start again and use the newest request.')
+        unless length $challenge && $challenge eq ($arg{challenge} // '');
+    return (0, 'This signature was made for another site.')
+        unless length $host && $host eq ($arg{host} // '');
+    return (0, 'The time in the signed text is outside the sign-in window. Check the clock of this computer.')
+        unless $seconds =~ /\A[0-9]+\z/ && $seconds >= $arg{not_before} && $seconds <= $arg{not_after};
+    return (0, $not_nautilus) unless $rand =~ /\A[0-9a-fA-F]{64}\z/;
+
+    my $proof = $arg{proof} // '';
+    return (0, 'The wallet did not produce a signature.') unless $proof =~ /\A[0-9a-fA-F]{112}\z/;
+    return schnorr_verify($arg{pk}, $text, pack('H*', $proof))
         ? (1)
         : (0, 'Signature check failed. Make sure you signed with the wallet for this address.');
 }
