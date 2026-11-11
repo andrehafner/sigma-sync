@@ -29,6 +29,9 @@
     review: [], // the items the review screen shows now: { id, t } or { id, error }. The confirm reads it (Q5).
     run: null, // the run in progress or the last one: { kind, ctx, rows, active } (Q6). It lives here so a redraw and a route change keep it (Q9).
     connect: { ask: false, note: '' }, // ask: the origin is not allowed yet, so the queue offers a connect button. note: what the last click found.
+    held: [], // the locks the account holds, from `held_locks` of the last list answer (B7). Never read from the rows of the list.
+    heldBusy: false, // the action that releases them is running
+    heldNote: '', // what the last release could not do
   };
 
   const MINOTAUR_RELEASES = 'https://github.com/minotaur-ergo/minotaur-wallet/releases';
@@ -145,7 +148,8 @@
   async function api(action, params = {}) {
     const form = new FormData();
     form.append('action', action);
-    if (S.csrf) form.append('csrf', S.csrf);
+    const token = S.csrf;
+    if (token) form.append('csrf', token);
     Object.entries(params).forEach(([k, v]) => {
       if (v !== undefined && v !== null) form.append(k, v);
     });
@@ -157,7 +161,8 @@
       throw new Error('Could not reach the server. Check your connection and try again.');
     }
     if (!data.success) {
-      if (data.signed_out && S.me) {
+      // Only the page's own session can be signed out by this answer: one for an older token changes nothing of the page.
+      if (data.signed_out && S.me && S.csrf === token) {
         S.me = null;
         S.csrf = '';
         renderSignIn();
@@ -793,13 +798,15 @@
   };
   const isOpen = (t) => t.status === 'commit' || t.status === 'sign';
 
-  // False when a newer fetch has started: its answer is the one to keep, so this one is dropped.
+  // False when a newer fetch has started or the session it started in has ended: that answer is dropped before it changes anything.
   // The selection is reconciled with every answer that is kept, whether or not a view draws it.
   async function fetchList() {
     const seq = ++S.listSeq;
+    const session = S.csrf;
     const r = await api('list_transactions');
-    if (seq !== S.listSeq) return false;
+    if (seq !== S.listSeq || session !== S.csrf) return false;
     S.txs = r.transactions;
+    S.held = r.held_locks || [];
     S.wallets = r.wallet_names || [];
     reconcileSelection();
     return true;
@@ -915,7 +922,7 @@
         </select>
         <a class="btn btn-primary" href="#start">Start transaction</a>
       </div>
-      ${runBarHtml()}${connectBarHtml()}${selectionBarHtml()}
+      ${runBarHtml()}${heldBarHtml()}${connectBarHtml()}${selectionBarHtml()}
       ${groups.length ? groups.map(([key, title, rows]) => `
         <section class="group" data-group="${key}" aria-labelledby="group-${key}">
           ${canPick() && rows.some(selectable) ? `<div class="group-head">${groupHeading(key, title, rows.length)}
@@ -1003,6 +1010,9 @@
   function resetRun() {
     S.runWallet = null;
     S.run = null;
+    S.held = [];
+    S.heldBusy = false;
+    S.heldNote = '';
     S.review = [];
     S.connect = { ask: false, note: '' };
     S.selNotes = [];
@@ -1076,7 +1086,7 @@
   function focusSelector() {
     const el = document.activeElement;
     if (!el || !$('#view')?.contains(el)) return '';
-    for (const attr of ['id', 'data-select', 'data-select-all', 'data-clear-selection', 'data-filter', 'data-connect-wallet', 'data-run-action', 'href']) {
+    for (const attr of ['id', 'data-select', 'data-select-all', 'data-clear-selection', 'data-filter', 'data-connect-wallet', 'data-held-release', 'data-run-action', 'href']) {
       const value = el.getAttribute(attr);
       if (value) return attr === 'id' ? `#${CSS.escape(value)}` : `[${attr}="${CSS.escape(value)}"]`;
     }
@@ -1219,6 +1229,7 @@
   // Why the run cannot start yet, as plain text, or '' when it can (Q5, Q6).
   function confirmBlock() {
     if (S.run?.active) return 'A run is already open. It must end first.';
+    if (S.heldBusy) return 'Wait until the locks are released. The list is still giving them back.';
     if (S.run?.rows.some((r) => r.held)) return 'A lock of the last run may still be held. Release the locks of the last run first.';
     if (!S.runWallet) return 'Your wallet is not available, so a run cannot start.';
     if (!S.review.length || S.review.some((i) => i.error)) return 'Every transaction must load first. Use Try again.';
@@ -1363,6 +1374,7 @@
     const rows = S.review.map(({ id, t }) => ({
       id, title: t.title, state: 'waiting', own: false, text: '', kept: null, reason: '', detail: '', note: '',
       held: false, // the account may hold this item's lock: asked for, or its own. Only the server's answer clears it.
+      count: 0, // the release count of that lock: the `seq` of its release (B7). Set whenever `held` is.
       reading: readingOf(t), // the reading the signer confirmed. The locked request must decode to the same one.
     }));
     const run = { kind: S.selGroup === 'sign' ? 'sign' : 'commit', ctx: S.runWallet, rows, active: false };
@@ -1375,16 +1387,16 @@
 
   function retryRun() {
     const run = S.run;
-    if (run && !run.active) runRound(run, run.rows.filter((r) => r.state === 'failed'));
+    if (run && !run.active && !S.heldBusy) runRound(run, run.rows.filter((r) => r.state === 'failed'));
   }
 
-  // Gives one lock back, in the plain form. Only the server's own answer settles it: a release that went through, or
+  // Gives one lock back by its count (B7). Only the server's own answer settles it: a release that went through, or
   // its refusal that the account holds no lock. Any other failure (a lost answer, a server error) leaves the lock
   // possibly held, and the row says so.
   async function freeLock(row) {
     if (!row.held) return;
     try {
-      await api('release_lock', { id: row.id });
+      await api('release_lock', { id: row.id, seq: row.count });
     } catch (e) {
       if (e.message !== NOT_HELD) {
         row.note = `${LOCK_LEFT} ${e.message}`;
@@ -1408,7 +1420,7 @@
   // Asks the server again for every lock the run may still hold. It calls no wallet.
   async function releaseHeld() {
     const run = S.run;
-    if (!run || run.active) return;
+    if (!run || run.active || S.heldBusy) return;
     run.active = true;
     run.releasing = true;
     drawRun(run);
@@ -1468,10 +1480,12 @@
         if (!alive()) return;
         row.own = !!t.lock?.mine;
         row.held = row.own; // the server's answer about this account's lock
+        // The release count (B7): the `seq` of the lock this run asks for, or the count before the own lock it adopted.
+        row.count = row.own ? t.lock_seq - 1 : t.lock_seq;
         let got = t;
         if (!row.own) {
           row.held = true; // asked for: the lock may be taken even when its answer never arrives
-          got = (await api('lock', { id: row.id })).transaction;
+          got = (await api('lock', { id: row.id, seq: t.lock_seq })).transaction;
           if (!alive()) return;
         }
         if (readingOf(got) !== row.reading) {
@@ -1607,8 +1621,8 @@
       ${run.active ? '<p class="hint run-hint">You can leave this page. The run goes on, and the queue links back to it.</p>' : ''}
       <ul class="run-rows" data-run-rows>${run.rows.map(runRowHtml).join('')}</ul>
       ${!run.active && (failed || held) ? `<div class="row mt-16">
-        ${failed ? `<button type="button" class="btn btn-primary" data-run-action="retry">Retry ${failed} failed</button>` : ''}
-        ${held ? `<button type="button" class="btn ${failed ? '' : 'btn-primary'}" data-run-action="release">Release ${held} lock${held === 1 ? '' : 's'}</button>` : ''}
+        ${failed ? `<button type="button" class="btn btn-primary" data-run-action="retry" ${S.heldBusy ? 'disabled' : ''}>Retry ${failed} failed</button>` : ''}
+        ${held ? `<button type="button" class="btn ${failed ? '' : 'btn-primary'}" data-run-action="release" ${S.heldBusy ? 'disabled' : ''}>Release ${held} lock${held === 1 ? '' : 's'}</button>` : ''}
       </div>` : ''}`;
     if (refocus) $(refocus)?.focus({ preventScroll: true });
   }
@@ -1625,6 +1639,81 @@
         <a class="btn btn-primary btn-sm" href="#run">View run</a>
         ${S.run.active || held ? '' : '<button type="button" class="btn btn-sm" data-run-action="dismiss">Dismiss</button>'}
       </section>`;
+  }
+
+  // The locks the account holds, from `held_locks` of the list answer and never from the rows of the list, which stop
+  // at 500 (B7). Nothing shows when there are none, and nothing while the page's own run is open: that run owns its
+  // locks and gives them back itself. While the action runs its button is off, and a failure shows as text (U5).
+  function heldBarHtml() {
+    const n = S.held.length;
+    if (!n || S.run?.active) return '';
+    const s = n === 1 ? '' : 's';
+    return `
+      <section class="notice notice-warning held-bar" data-held-locks aria-label="Locks you hold">
+        <div class="grow">
+          <strong>You hold ${n} lock${s}.</strong> A lock keeps your co-signers from taking their turn until you submit or release it.
+          <ul class="held-list">${S.held.map((h) => `
+            <li data-held-lock="${h.id}">
+              <a class="row-link" href="#tx/${h.id}">${esc(h.title)}</a>
+              <span class="small">#${h.id}${h.wallet?.name ? ` · ${esc(h.wallet.name)}` : ''}${h.lock?.since ? ` · taken ${esc(ago(h.lock.since))}` : ''}</span>
+            </li>`).join('')}</ul>
+        </div>
+        <button type="button" class="btn btn-sm" data-held-release="1" ${S.heldBusy ? 'disabled' : ''}>${S.heldBusy ? 'Releasing…' : `Release ${n} lock${s}`}</button>
+        ${S.heldNote ? `<p class="held-note" role="alert" data-held-note>${esc(S.heldNote)}</p>` : ''}
+      </section>`;
+  }
+
+  // One release for each lock the view shows, by count: `seq` is the entry's `lock_seq` less 1. The view can be one poll
+  // old, and a release by count clears only a lock the view showed, never one the signer took after that in another tab.
+  // A refusal that the account holds no lock means the lock is gone already. Then the list is read again.
+  // The action belongs to the session it started in (the CSRF token names it). A session that ended is a different
+  // account state: after every wait the action stops and changes nothing, for the sign-in screen and a new session own the page.
+  async function releaseListedLocks() {
+    if (S.heldBusy || S.run?.active || !S.held.length) return;
+    const live = viewGuard();
+    const shown = S.held;
+    const session = S.csrf;
+    const ended = () => S.csrf !== session;
+    setHeldBusy(true);
+    S.heldNote = '';
+    drawList(true);
+    let released = 0;
+    let failed = '';
+    for (const h of shown) {
+      if (ended()) return;
+      try {
+        await api('release_lock', { id: h.id, seq: h.lock_seq - 1 });
+        released++;
+      } catch (e) {
+        if (ended()) return; // the locks stay until the signer returns
+        if (e.message !== NOT_HELD) failed ||= e.message;
+      }
+    }
+    if (ended()) return;
+    S.heldNote = failed ? `Some locks were not released. ${failed}` : '';
+    let fresh = false;
+    try { fresh = await fetchList(); } catch (e) { /* the view draws what the page has */ }
+    if (ended()) return;
+    // Only now can a run start again: until the list is read, the action still writes to the page's state.
+    setHeldBusy(false);
+    if (!failed) {
+      // The message reports what the server confirmed. A refusal that the account holds no lock does not say that no newer
+      // lock is held: only a fresh `held_locks` answer says what is left. Without one, the page does not know.
+      const count = (n) => `${n} lock${n === 1 ? '' : 's'}`;
+      const left = S.held.length;
+      toast(!fresh ? `${count(released)} released. The locks that are left could not be checked.`
+        : left ? `${count(released)} released. ${count(left)} still held.`
+          : released ? `${count(released)} released.` : 'No lock was left to release.', 'success');
+    }
+    if (live()) drawList(true);
+  }
+
+  // The action that releases the listed locks and a run never overlap: a run adopts or takes locks, and the action's
+  // releases would clear them. The confirm, Retry and the run's Release wait until the action ends.
+  function setHeldBusy(busy) {
+    S.heldBusy = busy;
+    syncConfirm();
+    if (S.run) drawRun(S.run);
   }
 
   // ------------------------------------------------------------------------
@@ -2965,6 +3054,23 @@
     }));
   }
 
+  // B7: a page that is closed gives back every lock its run holds and every lock it has asked for and has no answer to.
+  // `sendBeacon` is the one request a closing page can still make, as a POST with the CSRF token in the form body (I9).
+  // Each names its item's release count: it clears the lock this run took, and the server cancels a lock that has not
+  // arrived yet. A tab that is only hidden sends nothing: a wallet review can take minutes and the submit needs the lock.
+  window.addEventListener('pagehide', () => {
+    if (!S.run || !S.csrf) return;
+    for (const row of S.run.rows) {
+      if (!row.held) continue;
+      const form = new FormData();
+      form.append('action', 'release_lock');
+      form.append('csrf', S.csrf);
+      form.append('id', row.id);
+      form.append('seq', row.count);
+      navigator.sendBeacon('api.pl', form);
+    }
+  });
+
   // ------------------------------------------------------------------------
   // Global wiring
   // ------------------------------------------------------------------------
@@ -2985,6 +3091,7 @@
     const all = ev.target.closest('[data-select-all]');
     if (all) { pickAll(all.dataset.selectAll); return; }
     if (ev.target.closest('[data-clear-selection]')) { clearSelection(); S.selNotes = []; drawList(true); return; }
+    if (ev.target.closest('[data-held-release]')) { releaseListedLocks(); return; }
     if (ev.target.closest('[data-run-confirm]')) { startRun(); return; }
     const act = ev.target.closest('[data-run-action]');
     if (act) { runAction(act.dataset.runAction); return; }

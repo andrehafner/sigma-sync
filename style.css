@@ -434,5 +434,12 @@ table.list tr.inactive td { color: var(--text-3); }
 .pill-run-failed { background: var(--error-soft); color: var(--error); }
 .connect-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-3); margin-bottom: var(--space-4); }
 .connect-note { flex-basis: 100%; margin: 0; }
+/* --- The locks the account holds (B7) ------------------------------------ */
+.held-bar { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--space-2) var(--space-3); margin-bottom: var(--space-4); }
+.held-bar .grow { flex: 1 1 16rem; }
+.held-list { list-style: none; margin: var(--space-2) 0 0; padding: 0; display: grid; gap: var(--space-0); }
+.held-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--space-2); }
+.held-list .row-link { color: inherit; text-decoration: underline; }
+.held-note { flex-basis: 100%; margin: 0; }
 /* The hints of the review and the run read at 4.5:1 on the page: --text-3 does not (SPEC U3). */
 .hint.run-hint { color: var(--text-2); }

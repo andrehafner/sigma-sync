@@ -167,8 +167,12 @@ window by itself.
   submitted. A wallet call that fails, or whose answer has the wrong length, order or ids, submits
   nothing and releases the locks of the call. When your session ends the run stops and the sign-in
   screen shows; the locks stay until you return.
-- A run does not yet release its locks when the page is closed. Release a stray lock on the
-  transaction page.
+- Every lock of a run names the lock count the page read, and every release names its item's count. A page that is
+  closed during a run sends one release for each lock the run holds and each lock it asked for and has no answer
+  to, so no lock stays. A tab that is only hidden keeps its locks, because a wallet review can take minutes.
+- When the queue loads it shows every lock you hold, also one on a transaction beyond the 500 rows of the list, and
+  one **Release** action frees them. It releases by count, so it never clears a lock you took after the view was
+  drawn. It does not show while your own run is open.
 
 ### Rounds and statuses
 
