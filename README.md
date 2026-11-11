@@ -132,6 +132,44 @@ The server keeps a registry of multi-sig wallets, and the page has a **Wallets**
 - An operator can add a wallet before any signer does:
   `APP_ENV_FILE=... perl tools/add-wallet.pl '<address>' '<name>'` prints its id.
 
+### Select and run
+
+The queue offers run actions only while a connected wallet supports them: its context has `multisig`
+as its own property with `version` 1, and one of its addresses is one of yours. Without that the same
+queue leads into the paste flow, one transaction at a time. When Nautilus is in the page but the site
+is not allowed yet, the queue shows a **Connect Nautilus** button. The page never opens the connect
+window by itself.
+
+- A row where you owe a step has a checkbox, and each group has **Select all**. A selection holds
+  rows of one group and at most 20. A row you cannot select says why. A refresh of the list keeps
+  the selection.
+- **Review** lists every selected transaction with what it pays, to whom, the fee, the wallet, M of N
+  and the Ergo transaction ID. An item with unverified inputs, a partial or uncertain reading or a
+  payment to a contract has its own tick. **Confirm** is off until every such tick is given, and it
+  is the only confirm.
+- A run handles one item after another: the page reads it, takes its lock (an item whose lock you
+  already hold keeps it and uses the request the server gave for it), then makes one wallet call
+  with the requests as the server returned them. It submits each answer through `submit`, so the
+  server's checks decide what is stored. Each row shows waiting, lock taken, in the wallet,
+  submitted, done, or failed with the server's or the wallet's reason. One failure does not stop the
+  rest. A lock that did not lead to a stored step is released. A lock counts as released only when the
+  server says so. If a release fails any other way, the row and the summary say the lock may still be
+  held, and **Release** asks the server again without calling the wallet.
+- The page compares what the server decoded from each request with what you reviewed. An item that
+  changed since the review never goes to the wallet. Its row fails, its lock is released and you
+  review it again.
+- The summary offers **Retry** for the failed rows. A retry takes the lock again. It sends the
+  wallet's kept answer when the stored request is the one the wallet got, and asks the wallet again
+  when it is not.
+- The list does not refresh while a run is open, and the queue offers no new selection or review
+  until it ends. Leaving the run page does not stop the run, and the queue links back to it.
+- Everything the wallet returns shows as text. An answer that is not a signed request (`MSR`) is never
+  submitted. A wallet call that fails, or whose answer has the wrong length, order or ids, submits
+  nothing and releases the locks of the call. When your session ends the run stops and the sign-in
+  screen shows; the locks stay until you return.
+- A run does not yet release its locks when the page is closed. Release a stray lock on the
+  transaction page.
+
 ### Rounds and statuses
 
 | Status | Meaning |

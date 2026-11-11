@@ -418,3 +418,21 @@ table.list tr.inactive td { color: var(--text-3); }
 }
 .select-notes { flex-basis: 100%; margin: 0; padding-left: var(--space-4); color: var(--text-2); font-size: var(--text-sm); }
 .flags { margin: 0; padding-left: var(--space-4); }
+
+/* --- The run and the connect offer (Q5, Q6) ----------------------------- */
+.run-rows { list-style: none; margin: var(--space-4) 0 0; padding: 0; display: grid; gap: var(--space-2); }
+.run-row {
+  display: flex; gap: var(--space-3); align-items: flex-start; justify-content: space-between;
+  padding: var(--space-3) var(--space-4); background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius);
+}
+.run-row[data-state=failed] { border-color: color-mix(in srgb, var(--error) 40%, var(--border)); }
+.run-row .why { margin-top: var(--space-1); overflow-wrap: anywhere; }
+.run-row .pill { flex: none; }
+.pill-run-locked, .pill-run-wallet, .pill-run-submitted { background: var(--info-soft); color: var(--info); }
+.pill-run-done { background: var(--success-soft); color: var(--success); }
+.pill-run-failed { background: var(--error-soft); color: var(--error); }
+.connect-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-3); margin-bottom: var(--space-4); }
+.connect-note { flex-basis: 100%; margin: 0; }
+/* The hints of the review and the run read at 4.5:1 on the page: --text-3 does not (SPEC U3). */
+.hint.run-hint { color: var(--text-2); }

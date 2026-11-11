@@ -26,6 +26,9 @@
     selNotes: [], // plain texts that say why the selection is not what the signer asked for
     acks: new Map(), // id -> the reading of the flagged item that the signer ticked. A different reading drops the tick (Q5).
     readings: new Map(), // id -> the reading the review screen shows now
+    review: [], // the items the review screen shows now: { id, t } or { id, error }. The confirm reads it (Q5).
+    run: null, // the run in progress or the last one: { kind, ctx, rows, active } (Q6). It lives here so a redraw and a route change keep it (Q9).
+    connect: { ask: false, note: '' }, // ask: the origin is not allowed yet, so the queue offers a connect button. note: what the last click found.
   };
 
   const MINOTAUR_RELEASES = 'https://github.com/minotaur-ergo/minotaur-wallet/releases';
@@ -495,6 +498,7 @@
   const NAUTILUS_MESSAGE = {
     connect: 'Nautilus did not connect. Unlock Nautilus, approve the connection in its window and try again.',
     sign: 'Nautilus did not sign the request. Approve it in the Nautilus window and try again.',
+    noRuns: 'Nautilus is connected, but it cannot run transactions for your account here. Open them one at a time.',
   };
 
   function nautilusConnector() {
@@ -724,6 +728,7 @@
     if (hash === 'start') return renderStart();
     if (hash === 'batch') return renderBatch();
     if (hash === 'review') return renderReview();
+    if (hash === 'run') return renderRun();
     if (hash === 'wallets') return renderWallets();
     const w = hash.match(/^wallet\/(\d+)$/);
     if (w) return renderWallet(w[1]);
@@ -803,13 +808,23 @@
   async function renderList() {
     const live = viewGuard();
     const view = shell('sign');
+    // The poll does nothing while a run is open: the run changes the rows, and a fresh list would race its submits (Q9).
+    const refresh = async () => {
+      if (!S.run?.active && await fetchList() && live()) drawList(true);
+    };
+    // A run that is open owns the list: it draws what the page has and asks for nothing until the run ends (Q9).
+    if (S.run?.active) {
+      drawList();
+      poll(refresh, 30000);
+      return;
+    }
     view.innerHTML = '<div class="loading">Loading transactions…</div>';
     let fresh;
     try { fresh = await fetchList(); } catch (e) { if (live()) view.innerHTML = loadError(e.message); return; }
     if (!fresh || !live()) return;
     if (location.hash.replace(/^#/, '') !== '' && location.hash !== '#sign') return;
     drawList();
-    poll(async () => { if (await fetchList() && live()) drawList(true); }, 30000);
+    poll(refresh, 30000);
     checkRunWallet(live);
   }
 
@@ -900,13 +915,13 @@
         </select>
         <a class="btn btn-primary" href="#start">Start transaction</a>
       </div>
-      ${selectionBarHtml()}
+      ${runBarHtml()}${connectBarHtml()}${selectionBarHtml()}
       ${groups.length ? groups.map(([key, title, rows]) => `
         <section class="group" data-group="${key}" aria-labelledby="group-${key}">
-          ${S.runWallet && rows.some(selectable) ? `<div class="group-head">${groupHeading(key, title, rows.length)}
+          ${canPick() && rows.some(selectable) ? `<div class="group-head">${groupHeading(key, title, rows.length)}
             <button type="button" class="btn btn-sm" data-select-all="${key}" aria-label="Select all in ${esc(title)}">Select all</button></div>`
             : groupHeading(key, title, rows.length)}
-          <div class="cards">${rows.map((t) => (S.runWallet ? pickRow(t) : card(t, true, false))).join('')}</div>
+          <div class="cards">${rows.map((t) => (canPick() ? pickRow(t) : card(t, true, false))).join('')}</div>
         </section>`).join('') : `
         <div class="empty" data-queue="empty">${S.txs.length ? 'Nothing matches this filter.' : 'No transactions for your wallets yet. They appear here when someone starts one for a multi-sig wallet one of your addresses signs for.'}</div>`}`;
 
@@ -980,45 +995,88 @@
     S.selGroup = '';
   }
 
+  // Selecting is on while the wallet passes the checks and no run is open: a run owns the list and the review (Q9).
+  function canPick() {
+    return !!S.runWallet && !S.run?.active;
+  }
+
   function resetRun() {
     S.runWallet = null;
+    S.run = null;
+    S.review = [];
+    S.connect = { ask: false, note: '' };
     S.selNotes = [];
     clearSelection();
   }
 
-  // Run actions need a wallet that passes three checks (SPEC B1, Q7). The origin already allows it: the page
-  // opens no connect window of its own. Its context has `multisig` as an own property, with version 1: the
+  // Run actions need a wallet that passes three checks (SPEC B1, Q7). The page calls `connect()` by itself only when
+  // the origin is allowed already: it never opens a connect window of its own. When it is not, `ask` is true and the
+  // queue offers a button for the signer's click. The context has `multisig` as an own property, with version 1: the
   // context is frozen but its prototype is not, so a plain read could find a `multisig` any script added there.
   // One of its addresses belongs to the signed-in account. Any failure of the wallet reads as "no".
   async function findRunWallet() {
     const wallet = nautilusConnector();
-    if (!wallet) return null;
+    if (!wallet) return { ctx: null, ask: false };
     try {
-      if (!(await wallet.isAuthorized()) || !(await wallet.connect({ createErgoObject: false }))) return null;
+      if (!(await wallet.isAuthorized())) return { ctx: null, ask: true };
+      if (!(await wallet.connect({ createErgoObject: false }))) return { ctx: null, ask: false };
       const ctx = await wallet.getContext();
-      if (!Object.hasOwn(ctx, 'multisig') || ctx.multisig?.version !== 1) return null;
+      if (!Object.hasOwn(ctx, 'multisig') || ctx.multisig?.version !== 1) return { ctx: null, ask: false };
       const lists = await Promise.all([ctx.get_used_addresses(), ctx.get_unused_addresses()]);
       const mine = S.me?.addresses || [];
-      return lists.flat().some((a) => mine.includes(a)) ? ctx : null;
+      return { ctx: lists.flat().some((a) => mine.includes(a)) ? ctx : null, ask: false };
     } catch (e) {
-      return null;
+      return { ctx: null, ask: false };
     }
   }
 
-  // Draws the list again only when the answer changes whether run actions show.
+  // Draws the list again only when the answer changes what shows.
   async function checkRunWallet(live) {
-    const ctx = await findRunWallet();
+    const { ctx, ask } = await findRunWallet();
     if (!live()) return;
-    const changed = !!ctx !== !!S.runWallet;
+    const changed = !!ctx !== !!S.runWallet || ask !== S.connect.ask;
     S.runWallet = ctx;
+    S.connect.ask = ask;
+    if (ctx) S.connect.note = '';
     if (changed) drawList(true);
+  }
+
+  // The signer's click: connect, then the same checks as at load. A "no" shows one fixed message (L8).
+  async function connectRunWallet() {
+    const live = viewGuard();
+    const btn = $('[data-connect-wallet]');
+    if (btn) btn.disabled = true;
+    let granted = false;
+    try { granted = !!(await nautilusConnector()?.connect({ createErgoObject: false })); } catch (e) { /* the wallet said no: the message below */ }
+    if (!live()) return;
+    if (!granted) {
+      S.connect.note = NAUTILUS_MESSAGE.connect;
+    } else {
+      const found = await findRunWallet();
+      if (!live()) return;
+      S.runWallet = found.ctx;
+      S.connect = { ask: found.ask, note: found.ctx ? '' : NAUTILUS_MESSAGE.noRuns };
+    }
+    drawList(true);
+    if (S.runWallet) $('[data-select-all], [data-select]')?.focus({ preventScroll: true });
+  }
+
+  // The queue's offer to connect. The note is the page's own text, never the wallet's.
+  function connectBarHtml() {
+    if (!S.connect.ask && !S.connect.note) return '';
+    return `
+      <section class="notice notice-info connect-bar" data-connect aria-label="Nautilus">
+        <span>Connect Nautilus to select transactions and run them in one go.</span>
+        ${S.connect.ask ? '<button type="button" class="btn btn-sm" data-connect-wallet="1">Connect Nautilus</button>' : ''}
+        ${S.connect.note ? `<p class="connect-note" role="alert" data-connect-note>${esc(S.connect.note)}</p>` : ''}
+      </section>`;
   }
 
   // A selector that finds the focused control of the list again after the list is drawn anew (Q9).
   function focusSelector() {
     const el = document.activeElement;
     if (!el || !$('#view')?.contains(el)) return '';
-    for (const attr of ['id', 'data-select', 'data-select-all', 'data-clear-selection', 'data-filter', 'href']) {
+    for (const attr of ['id', 'data-select', 'data-select-all', 'data-clear-selection', 'data-filter', 'data-connect-wallet', 'data-run-action', 'href']) {
       const value = el.getAttribute(attr);
       if (value) return attr === 'id' ? `#${CSS.escape(value)}` : `[${attr}="${CSS.escape(value)}"]`;
     }
@@ -1110,6 +1168,12 @@
     const live = viewGuard();
     const view = shell('sign');
     const back = '<a class="back" href="#">← Back to the queue</a>';
+    if (S.run?.active) {
+      view.innerHTML = `${back}
+        <p class="muted" data-review-blocked>A run is open. Review a new selection after it ends. <a href="#run">View run</a></p>`;
+      return;
+    }
+    S.review = [];
     if (S.selection.size) {
       view.innerHTML = '<div class="loading">Loading the review…</div>';
       try { await fetchList(); } catch (e) { if (live()) view.innerHTML = back + loadError(e.message); return; }
@@ -1134,6 +1198,7 @@
     // A tick holds for the reading the signer saw. Boxes can change with the Ergo transaction id the same, so compare all of the decoded view.
     S.readings = new Map(items.filter((i) => i.t).map((i) => [i.id, JSON.stringify([i.t.review, i.t.ergo_tx_id])]));
     for (const [id, seen] of S.acks) if (S.readings.has(id) && S.readings.get(id) !== seen) S.acks.delete(id);
+    S.review = items;
     view.innerHTML = `
       <a class="back" href="#">← Back to the queue</a>
       <h1>Review ${items.length} transaction${items.length === 1 ? '' : 's'}</h1>
@@ -1142,10 +1207,33 @@
       ${selNotesHtml('data-review-note')}
       <div class="stack" data-review-list>${items.map(reviewItemHtml).join('')}</div>
       <div class="row mt-16">
+        <button type="button" class="btn btn-primary" data-run-confirm aria-describedby="run-hint"></button>
         <a class="btn" href="#">Back to the queue</a>
         ${items.some((i) => i.error) ? '<button type="button" class="btn" data-retry>Try again</button>' : ''}
-      </div>`;
+      </div>
+      <p class="hint run-hint" id="run-hint" data-run-hint></p>`;
     fillTokenNames(view);
+    syncConfirm();
+  }
+
+  // Why the run cannot start yet, as plain text, or '' when it can (Q5, Q6).
+  function confirmBlock() {
+    if (S.run?.active) return 'A run is already open. It must end first.';
+    if (S.run?.rows.some((r) => r.held)) return 'A lock of the last run may still be held. Release the locks of the last run first.';
+    if (!S.runWallet) return 'Your wallet is not available, so a run cannot start.';
+    if (!S.review.length || S.review.some((i) => i.error)) return 'Every transaction must load first. Use Try again.';
+    const open = S.review.filter((i) => reviewFlags(i.t).length && !S.acks.has(i.id)).length;
+    return open ? `Tick the warning of ${open} transaction${open === 1 ? '' : 's'} to turn this on.` : '';
+  }
+
+  // The one confirm. It stays off until every flagged item has its tick, and the page says what is missing.
+  function syncConfirm() {
+    const btn = $('[data-run-confirm]');
+    if (!btn) return;
+    const why = confirmBlock();
+    btn.disabled = !!why;
+    btn.textContent = `Confirm and ${S.selGroup === 'sign' ? 'sign' : 'commit'} ${S.review.length}`;
+    $('[data-run-hint]').textContent = why || 'Your wallet shows its own review of the list and asks once.';
   }
 
   // What makes an item need its own tick (Q5): the server's doubts about its reading, and a payment to a contract.
@@ -1206,6 +1294,336 @@
             <label class="check mt-8"><input type="checkbox" data-ack="${id}" ${S.acks.has(id) ? 'checked' : ''}>
               I have read ${flags.length > 1 ? 'these warnings' : 'this warning'} for #${id}.</label>
           </div>` : ''}
+      </section>`;
+  }
+
+  // ------------------------------------------------------------------------
+  // Run the selection (SPEC Q5, Q6, Q9, B2, B3, B6, B8, I4, I6)
+  // ------------------------------------------------------------------------
+  // The page reads each item, locks the ones whose lock it does not hold, makes one wallet call and submits each
+  // answer. The server's submit checks decide what is stored (I6): the page works out no status. Everything the wallet
+  // returns is untrusted: the page reads five fields of a result, shows its text as text and submits only an MSR (B8).
+  // It never asks the wallet for a nonce or a key (B5).
+  const RUN_STATE = { waiting: 'Waiting', locked: 'Lock taken', wallet: 'In the wallet', submitted: 'Submitted', done: 'Done', failed: 'Failed' };
+  const WALLET_CODE = {
+    declined: 'You declined it in the wallet.',
+    refused: 'The wallet refused this item.',
+    wallet_locked: 'The wallet is locked. Unlock it and retry.',
+    unsupported: 'The wallet cannot handle this request.',
+  };
+  const WALLET_FAILED = 'The wallet did not finish this item.';
+  const WALLET_BROKEN = 'The wallet call failed, or its answer did not match what was sent. Nothing was submitted.';
+  const NOT_MSR = 'The wallet answered with something that is not a signed request, so it was not sent to the server.';
+  const CHANGED = 'This transaction changed since you reviewed it, so nothing was sent to the wallet. Select it again and review it.';
+  const STOPPED = 'The run stopped before this item finished.';
+  const LOCK_LEFT = 'The lock may still be held.';
+  // The refusal of `release_lock` when the account holds no lock (api.pl, act_release_lock). It is the one answer that proves a lock is gone.
+  const NOT_HELD = 'You do not hold the lock on this transaction.';
+
+  // B8: a request is an MSR when it is {"MSR": "<json text of an object>"} and nothing else.
+  function isMsr(text) {
+    if (typeof text !== 'string') return false;
+    try {
+      const outer = JSON.parse(text);
+      const keys = outer && typeof outer === 'object' ? Object.keys(outer) : [];
+      if (keys.length !== 1 || keys[0] !== 'MSR' || typeof outer.MSR !== 'string') return false;
+      const inner = JSON.parse(outer.MSR);
+      return !!inner && typeof inner === 'object' && !Array.isArray(inner);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // The wallet's answer as a plain list of the five fields the page reads, or null when it is not the list the call
+  // asked for: same length, same order, same ids (B3). `ok` counts only as the boolean true.
+  function readAnswers(list, rows) {
+    try {
+      if (!Array.isArray(list) || list.length !== rows.length) return null;
+      const out = [];
+      for (const [i, row] of rows.entries()) {
+        const { id, ok, request, code, message } = list[i];
+        if (id !== row.id) return null;
+        out.push({ ok: ok === true, request, code, message });
+      }
+      return out;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // What the signer confirmed: the Ergo transaction and what the server decoded from it. A co-signer's honest step turns a
+  // CSR into an MSR, so the two format fields stay out: an added commitment does not invalidate a review (F1).
+  function readingOf(t) {
+    const { format, minotaur_format: shape, ...seen } = t.review || {};
+    return JSON.stringify([seen, t.ergo_tx_id]);
+  }
+
+  function startRun() {
+    if (confirmBlock()) return;
+    const rows = S.review.map(({ id, t }) => ({
+      id, title: t.title, state: 'waiting', own: false, text: '', kept: null, reason: '', detail: '', note: '',
+      held: false, // the account may hold this item's lock: asked for, or its own. Only the server's answer clears it.
+      reading: readingOf(t), // the reading the signer confirmed. The locked request must decode to the same one.
+    }));
+    const run = { kind: S.selGroup === 'sign' ? 'sign' : 'commit', ctx: S.runWallet, rows, active: false };
+    S.run = run;
+    clearSelection();
+    S.selNotes = [];
+    location.hash = '#run';
+    runRound(run, rows);
+  }
+
+  function retryRun() {
+    const run = S.run;
+    if (run && !run.active) runRound(run, run.rows.filter((r) => r.state === 'failed'));
+  }
+
+  // Gives one lock back, in the plain form. Only the server's own answer settles it: a release that went through, or
+  // its refusal that the account holds no lock. Any other failure (a lost answer, a server error) leaves the lock
+  // possibly held, and the row says so.
+  async function freeLock(row) {
+    if (!row.held) return;
+    try {
+      await api('release_lock', { id: row.id });
+    } catch (e) {
+      if (e.message !== NOT_HELD) {
+        row.note = `${LOCK_LEFT} ${e.message}`;
+        return;
+      }
+    }
+    row.held = false;
+    row.note = '';
+  }
+
+  // The one exit of a round, whatever way it ended: a row that did not finish fails, and every lock that may be held goes back.
+  // A session that ended has no way to release anything: the locks stay until the signer returns.
+  async function giveBack(run, rows) {
+    for (const row of rows) {
+      if (S.run !== run) return;
+      if (row.state !== 'done' && row.state !== 'failed') Object.assign(row, { state: 'failed', reason: STOPPED });
+      await freeLock(row);
+    }
+  }
+
+  // Asks the server again for every lock the run may still hold. It calls no wallet.
+  async function releaseHeld() {
+    const run = S.run;
+    if (!run || run.active) return;
+    run.active = true;
+    run.releasing = true;
+    drawRun(run);
+    try {
+      await giveBack(run, run.rows);
+    } finally {
+      run.releasing = false;
+      endRun(run);
+    }
+  }
+
+  // One round over `rows`: the first run, or a retry of the failed ones. The run stops quietly when the session ended
+  // (S.run is gone then): the locks stay until the signer returns.
+  async function runRound(run, rows) {
+    run.active = true;
+    rows.forEach((row) => Object.assign(row, { state: 'waiting', reason: '', detail: '', note: '' }));
+    drawRun(run);
+    try {
+      await runItems(run, rows);
+    } finally {
+      await giveBack(run, rows);
+      endRun(run);
+    }
+  }
+
+  async function runItems(run, rows) {
+    const alive = () => S.run === run;
+    const draw = () => drawRun(run);
+    const fail = (row, reason, detail = '') => {
+      Object.assign(row, { state: 'failed', reason, detail });
+      draw();
+    };
+    // Sends one answer. A refusal keeps the answer for a retry and gives the lock back (Q6).
+    const send = async (row, request) => {
+      row.state = 'submitted';
+      draw();
+      try {
+        await api('submit', { id: row.id, payload: request });
+        if (!alive()) return;
+        row.kept = null;
+        row.held = false; // the server clears the lock with the stored step
+        row.state = 'done';
+        draw();
+      } catch (e) {
+        if (!alive()) return;
+        row.kept = { request, sent: row.text };
+        fail(row, e.message);
+        await freeLock(row);
+      }
+    };
+
+    // One item after another: read it, then lock it unless the account holds its lock already (boundary 3).
+    const locked = [];
+    for (const row of rows) {
+      try {
+        const t = (await api('get_transaction', { id: row.id })).transaction;
+        if (!alive()) return;
+        row.own = !!t.lock?.mine;
+        row.held = row.own; // the server's answer about this account's lock
+        let got = t;
+        if (!row.own) {
+          row.held = true; // asked for: the lock may be taken even when its answer never arrives
+          got = (await api('lock', { id: row.id })).transaction;
+          if (!alive()) return;
+        }
+        if (readingOf(got) !== row.reading) {
+          // The signer confirmed another reading. This request never reaches the wallet.
+          row.kept = null;
+          fail(row, CHANGED);
+          await freeLock(row);
+          if (!alive()) return;
+        } else if (typeof got.payload?.text === 'string') {
+          row.text = got.payload.text;
+          row.state = 'locked';
+          locked.push(row);
+          draw();
+        } else {
+          fail(row, 'The server sent no request for this transaction.');
+          await freeLock(row);
+          if (!alive()) return;
+        }
+      } catch (e) {
+        if (!alive()) return;
+        fail(row, e.message);
+        await freeLock(row);
+        if (!alive()) return;
+      }
+    }
+
+    // The retry rule (Q6): the kept answer goes to the server when the stored request is the one the wallet got.
+    // Otherwise the wallet is asked again.
+    const reuse = locked.filter((r) => r.kept && r.kept.sent === r.text);
+    const ask = locked.filter((r) => !reuse.includes(r));
+    ask.forEach((r) => { r.kept = null; });
+    for (const row of reuse) {
+      await send(row, row.kept.request);
+      if (!alive()) return;
+    }
+    if (!ask.length) return;
+
+    ask.forEach((r) => { r.state = 'wallet'; });
+    draw();
+    let list = null;
+    try { list = await run.ctx.multisig[run.kind](ask.map((r) => ({ id: r.id, request: r.text }))); } catch (e) { /* the call failed: every row of it fails below */ }
+    if (!alive()) return;
+    const answers = readAnswers(list, ask);
+    if (!answers) {
+      ask.forEach((row) => fail(row, WALLET_BROKEN));
+      for (const row of ask) {
+        await freeLock(row);
+        if (!alive()) return;
+      }
+      return;
+    }
+    for (const [i, row] of ask.entries()) {
+      const a = answers[i];
+      if (a.ok && isMsr(a.request)) {
+        await send(row, a.request);
+      } else {
+        row.kept = null;
+        if (a.ok) fail(row, NOT_MSR);
+        else fail(row, typeof a.code === 'string' && Object.hasOwn(WALLET_CODE, a.code) ? WALLET_CODE[a.code] : WALLET_FAILED,
+          typeof a.message === 'string' ? a.message.slice(0, 300) : '');
+        await freeLock(row);
+      }
+      if (!alive()) return;
+    }
+  }
+
+  // The round is over: the summary shows, and a queue on screen reads the list again.
+  async function endRun(run) {
+    if (S.run !== run) return;
+    run.active = false;
+    drawRun(run);
+    $('[data-run-status]')?.focus();
+    if (!$('#tx-filter')) return;
+    const live = viewGuard();
+    try { if (await fetchList() && live()) drawList(true); } catch (e) { /* the next visit reads it */ }
+  }
+
+  function runAction(action) {
+    if (action === 'retry') retryRun();
+    if (action === 'release') releaseHeld();
+    if (action === 'dismiss' && S.run && !S.run.active && !S.run.rows.some((r) => r.held)) {
+      S.run = null;
+      drawList(true);
+    }
+  }
+
+  const runCounts = (run) => ({
+    total: run.rows.length,
+    done: run.rows.filter((r) => r.state === 'done').length,
+    failed: run.rows.filter((r) => r.state === 'failed').length,
+    held: run.rows.filter((r) => r.held).length,
+  });
+  const heldText = (n) => (n ? ` ${n} lock${n === 1 ? '' : 's'} may still be held.` : '');
+
+  const runRowHtml = (r) => `
+    <li class="run-row" data-run-row="${r.id}" data-state="${r.state}">
+      <div class="grow">
+        <a class="row-link" href="#tx/${r.id}">${esc(r.title)}</a>
+        <div class="small muted">#${r.id}</div>
+        ${r.reason ? `<div class="why" data-run-reason>${esc(r.reason)}</div>` : ''}
+        ${r.detail ? `<div class="why" data-run-message>${esc(`The wallet said: ${r.detail}`)}</div>` : ''}
+        ${r.note ? `<div class="${r.held ? 'why' : 'small muted'}" data-run-note>${esc(r.note)}</div>` : ''}
+      </div>
+      <span class="pill pill-run-${r.state}" data-run-state>${RUN_STATE[r.state]}</span>
+    </li>`;
+
+  function renderRun() {
+    const view = shell('sign');
+    if (!S.run) {
+      view.innerHTML = `<a class="back" href="#">← Back to the queue</a>
+        <div class="empty" data-run-empty>There is no run to show. Select transactions in the queue, review them and confirm.</div>`;
+      return;
+    }
+    view.innerHTML = '<div data-run-root></div>';
+    drawRun(S.run);
+  }
+
+  // The run's state lives in S.run. The view only shows it, so a redraw, a route change or a return loses nothing (Q9).
+  function drawRun(run) {
+    const root = $('[data-run-root]');
+    if (!root || S.run !== run) return;
+    const refocus = focusSelector();
+    const { total, done, failed, held } = runCounts(run);
+    const text = run.releasing ? 'Giving the locks back.'
+      : !run.active ? `Run finished. ${done} done${failed ? `, ${failed} failed` : ''}.${heldText(held)}`
+      : run.rows.some((r) => r.state === 'wallet') ? 'Waiting for your wallet. Approve the list in its window. It shows its own review of every item.'
+      : `Working through the list: ${done + failed} of ${total} finished.`;
+    root.innerHTML = `
+      <a class="back" href="#">← Back to the queue</a>
+      <h1>${run.kind === 'sign' ? 'Sign' : 'Commit'} ${total} transaction${total === 1 ? '' : 's'}</h1>
+      <div class="notice notice-${run.active ? 'info' : failed || held ? 'warning' : 'success'}" role="status" tabindex="-1"
+        data-run-status data-phase="${run.active ? 'running' : 'done'}">${esc(text)}</div>
+      ${run.active ? '<p class="hint run-hint">You can leave this page. The run goes on, and the queue links back to it.</p>' : ''}
+      <ul class="run-rows" data-run-rows>${run.rows.map(runRowHtml).join('')}</ul>
+      ${!run.active && (failed || held) ? `<div class="row mt-16">
+        ${failed ? `<button type="button" class="btn btn-primary" data-run-action="retry">Retry ${failed} failed</button>` : ''}
+        ${held ? `<button type="button" class="btn ${failed ? '' : 'btn-primary'}" data-run-action="release">Release ${held} lock${held === 1 ? '' : 's'}</button>` : ''}
+      </div>` : ''}`;
+    if (refocus) $(refocus)?.focus({ preventScroll: true });
+  }
+
+  // The queue's way back to a run that is open or just ended.
+  function runBarHtml() {
+    if (!S.run) return '';
+    const { done, failed, held } = runCounts(S.run);
+    return `
+      <section class="selection-bar" data-run-bar aria-label="Run">
+        ${S.run.active ? '<strong>A run is open.</strong> <span class="muted">The list refreshes when it ends.</span>'
+          : `<strong>Last run:</strong> <span>${done} done${failed ? `, ${failed} failed` : ''}.${heldText(held)}</span>`}
+        <span class="spacer"></span>
+        <a class="btn btn-primary btn-sm" href="#run">View run</a>
+        ${S.run.active || held ? '' : '<button type="button" class="btn btn-sm" data-run-action="dismiss">Dismiss</button>'}
       </section>`;
   }
 
@@ -2567,8 +2985,15 @@
     const all = ev.target.closest('[data-select-all]');
     if (all) { pickAll(all.dataset.selectAll); return; }
     if (ev.target.closest('[data-clear-selection]')) { clearSelection(); S.selNotes = []; drawList(true); return; }
+    if (ev.target.closest('[data-run-confirm]')) { startRun(); return; }
+    const act = ev.target.closest('[data-run-action]');
+    if (act) { runAction(act.dataset.runAction); return; }
+    if (ev.target.closest('[data-connect-wallet]')) { connectRunWallet(); return; }
     if (ev.target.closest('#user-chip [data-action=logout]')) {
-      try { await api('logout'); } catch (e) { /* ignore */ }
+      // The session stays until the server says it ended: a failed request keeps the account, the token and the run.
+      try { await api('logout'); } catch (e) {
+        if (!e.data?.signed_out) { toast(e.message, 'error'); return; }
+      }
       S.me = null;
       S.csrf = '';
       S.txs = [];
@@ -2583,6 +3008,7 @@
     if (ack) {
       const id = Number(ack.dataset.ack);
       if (ack.checked) S.acks.set(id, S.readings.get(id)); else S.acks.delete(id);
+      syncConfirm();
     }
   });
 
