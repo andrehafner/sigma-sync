@@ -12,13 +12,14 @@
     txs: [],
     wallets: [],
     versions: null,
-    filter: 'active',
+    filter: 'queue',
     search: '',
     detail: null,
     signin: null,
     pollTimer: null,
     qrTimers: new Set(),
     view: 0, // counts the routes drawn, so a late answer can tell it is stale
+    listSeq: 0, // counts the list fetches, so an older answer can tell a newer one has started
   };
 
   const MINOTAUR_RELEASES = 'https://github.com/minotaur-ergo/minotaur-wallet/releases';
@@ -754,13 +755,16 @@
     S.pollTimer = null;
   }
 
+  // The next tick is armed only while the route that asked for the poll is on screen. An answer that
+  // arrives after a route change must not draw into the new route or start a poll of the old one (Q8).
   function poll(fn, ms) {
     stopPolling();
+    const seq = S.view;
     S.pollTimer = setTimeout(async () => {
       if (document.visibilityState === 'visible') {
         try { await fn(); } catch (e) { /* next tick */ }
       }
-      poll(fn, ms);
+      if (seq === S.view) poll(fn, ms);
     }, ms);
   }
 
@@ -773,19 +777,26 @@
   };
   const isOpen = (t) => t.status === 'commit' || t.status === 'sign';
 
+  // False when a newer fetch has started: its answer is the one to keep, so this one is dropped.
   async function fetchList() {
+    const seq = ++S.listSeq;
     const r = await api('list_transactions');
+    if (seq !== S.listSeq) return false;
     S.txs = r.transactions;
     S.wallets = r.wallet_names || [];
+    return true;
   }
 
   async function renderList() {
+    const live = viewGuard();
     const view = shell('sign');
-    if (!S.txs.length) view.innerHTML = '<div class="loading">Loading transactions…</div>';
-    try { await fetchList(); } catch (e) { view.innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`; return; }
+    view.innerHTML = '<div class="loading">Loading transactions…</div>';
+    let fresh;
+    try { fresh = await fetchList(); } catch (e) { if (live()) view.innerHTML = loadError(e.message); return; }
+    if (!fresh || !live()) return;
     if (location.hash.replace(/^#/, '') !== '' && location.hash !== '#sign') return;
     drawList();
-    poll(async () => { await fetchList(); drawList(true); }, 30000);
+    poll(async () => { if (await fetchList() && live()) drawList(true); }, 30000);
   }
 
   function progressBars(t) {
@@ -817,6 +828,17 @@
     return '';
   }
 
+  // The groups of the queue, in the order of SPEC Q1. A row is in the first group whose test it meets.
+  // The test reads `status` and `me.can_act` alone, so every signer's page agrees with the server's turn rules.
+  const QUEUE_GROUPS = [
+    ['commit', 'Needs your commitment', (t) => t.status === 'commit' && t.me.can_act],
+    ['sign', 'Needs your signature', (t) => t.status === 'sign' && t.me.can_act],
+    ['waiting', 'Waiting for others', (t) => isOpen(t) && !t.me.can_act],
+    ['ready', 'Ready to broadcast', (t) => t.status === 'complete'],
+  ];
+  // Closed rows stay behind the filter: only the Closed and All filters let any through.
+  const CLOSED_GROUP = ['closed', 'Closed', (t) => t.status === 'broadcast' || t.status === 'cancelled'];
+
   function drawList(keepFocus = false) {
     const view = $('#view');
     if (!view) return;
@@ -827,15 +849,19 @@
       done: S.txs.filter((t) => t.status === 'broadcast' && (Date.now() - parseTs(t.closed_at)) < 30 * 86400000).length,
     };
     const filters = {
+      queue: (t) => isOpen(t) || t.status === 'complete',
       awaiting: (t) => t.me.awaiting,
       active: isOpen,
       complete: (t) => t.status === 'complete',
-      closed: (t) => t.status === 'broadcast' || t.status === 'cancelled',
+      closed: CLOSED_GROUP[2],
       all: () => true,
     };
     const q = S.search.toLowerCase();
-    const list = S.txs.filter(filters[S.filter] || filters.active).filter((t) => !q
+    const list = S.txs.filter(filters[S.filter] || filters.queue).filter((t) => !q
       || [t.title, t.wallet?.name, t.created_by, t.ergo_tx_id, `#${t.id}`].some((v) => (v || '').toLowerCase().includes(q)));
+    const groups = [...QUEUE_GROUPS, CLOSED_GROUP]
+      .map(([key, title, test]) => [key, title, list.filter(test)])
+      .filter(([, , rows]) => rows.length);
 
     const stat = (key, value, label, attention) => `
       <button type="button" class="stat ${attention && value ? 'attention' : ''}" data-filter="${key}" aria-pressed="${S.filter === key}">
@@ -854,13 +880,17 @@
         <input type="search" id="tx-search" placeholder="Search title, wallet, creator, TX ID…" value="${esc(searchValue)}" aria-label="Search transactions">
         <span class="spacer"></span>
         <select id="tx-filter" aria-label="Filter">
-          ${[['active', 'In progress'], ['awaiting', 'Waiting on you'], ['complete', 'Ready to broadcast'], ['closed', 'Closed'], ['all', 'All']]
+          ${[['queue', 'Queue'], ['active', 'In progress'], ['awaiting', 'Waiting on you'], ['complete', 'Ready to broadcast'], ['closed', 'Closed'], ['all', 'All']]
             .map(([v, l]) => `<option value="${v}" ${S.filter === v ? 'selected' : ''}>${l}</option>`).join('')}
         </select>
         <a class="btn btn-primary" href="#start">Start transaction</a>
       </div>
-      ${list.length ? `<div class="cards">${list.map((t) => card(t)).join('')}</div>` : `
-        <div class="empty">${S.txs.length ? 'Nothing matches this filter.' : 'No transactions for your wallets yet. They appear here when someone starts one for a multi-sig wallet one of your addresses signs for.'}</div>`}`;
+      ${groups.length ? groups.map(([key, title, rows]) => `
+        <section class="group" data-group="${key}" aria-labelledby="group-${key}">
+          <h2 class="group-title" id="group-${key}"><span data-group-title>${title}</span> <span class="group-count" data-group-count>${rows.length}</span></h2>
+          <div class="cards">${rows.map((t) => card(t, true, false)).join('')}</div>
+        </section>`).join('') : `
+        <div class="empty" data-queue="empty">${S.txs.length ? 'Nothing matches this filter.' : 'No transactions for your wallets yet. They appear here when someone starts one for a multi-sig wallet one of your addresses signs for.'}</div>`}`;
 
     paintBars(view);
     updateTabCount();
@@ -876,11 +906,12 @@
     el.setSelectionRange(el.value.length, el.value.length);
   }
 
-  function card(t, showWallet = true) {
+  // `showTurn` is false inside a group: the heading already says what the signer owes.
+  function card(t, showWallet = true, showTurn = true) {
     const mine = myStatusText(t);
     return `
       <a class="card ${t.me.awaiting ? 'attention' : ''}" href="#tx/${t.id}">
-        ${t.me.awaiting ? `<span class="your-turn">${esc(mine)}</span>` : ''}
+        ${showTurn && t.me.awaiting ? `<span class="your-turn">${esc(mine)}</span>` : ''}
         <div class="card-head">
           <div class="grow">
             <div class="card-title">${esc(t.title)}</div>
@@ -895,6 +926,7 @@
           <span>Updated ${timeTag(t.updated_at)}</span>
           ${t.comments ? `<span>${t.comments} comment${t.comments > 1 ? 's' : ''}</span>` : ''}
           ${!t.me.awaiting && mine ? `<span class="tick">${esc(mine)}</span>` : ''}
+          ${t.status === 'sign' && !t.me.committed ? '<span class="muted">Commitments are closed, so you cannot sign</span>' : ''}
         </div>
       </a>`;
   }
@@ -1249,20 +1281,25 @@
   // Transaction detail
   // ------------------------------------------------------------------------
   async function renderDetail(id) {
+    const live = viewGuard();
     const view = shell('sign');
     view.innerHTML = '<div class="loading">Loading…</div>';
     try {
       const r = await api('get_transaction', { id });
+      if (!live()) return;
       S.detail = r.transaction;
     } catch (e) {
-      view.innerHTML = `<a class="back" href="#">← All transactions</a><div class="notice notice-error">${esc(e.message)}</div>`;
+      if (live()) view.innerHTML = `<a class="back" href="#">← All transactions</a>${loadError(e.message)}`;
       return;
     }
     drawDetail();
-    // Refresh while someone else holds the lock or it is idle; never while you are mid-turn.
+    // Refresh while someone else holds the lock or it is idle; never while you are mid-turn. An answer is
+    // dropped when the route has changed or when a newer answer (a lock, a submit) set the transaction meanwhile.
     poll(async () => {
       if (S.detail?.lock?.mine || dirtyDetail()) return;
+      const seen = S.detail;
       const r = await api('get_transaction', { id });
+      if (!live() || S.detail !== seen) return;
       S.detail = r.transaction;
       drawDetail();
     }, 12000);
@@ -1369,7 +1406,7 @@
             <summary>${changeTokens} token${changeTokens === 1 ? ' stays' : 's stay'} at the spending address</summary>
             ${change.map((o) => tokenLines(o.tokens)).join('')}
           </details>` : ''}
-        ${!change.length && sends.length ? `<div class="notice notice-warning small mt-8">No output goes back to the address
+        ${!r.inputs_unverified && !change.length && sends.length ? `<div class="notice notice-warning small mt-8">No output goes back to the address
           being spent from. If the wallet holds more than is being sent, check where the rest goes.</div>` : ''}
 ` : `<div class="notice notice-warning small mt-16">Sigma Sync could not work out where this transaction
         sends funds. Check every output in Minotaur.</div>`;
@@ -1378,6 +1415,9 @@
       <section class="panel mt-12 tx-details" aria-labelledby="details-title">
         <h2 id="details-title">Transaction details</h2>
         <p class="small muted">Decoded from the transaction itself.</p>
+        ${r.inputs_unverified ? `<div class="notice notice-warning small mt-8" data-review="unverified"><strong>Inputs unverified.</strong>
+          Sigma Sync could not match this request's input boxes to the inputs the transaction spends. It shows no
+          spending addresses and marks no output as change.</div>` : ''}
 
         ${outputsHtml}
 
@@ -1451,23 +1491,52 @@
     });
   }
 
-  // Every key of the multi-sig wallet, read from the transaction itself.
+  // Every key of the multi-sig wallet, round by round, and who the transaction waits on (SPEC Q3).
+  // A Minotaur 2.x request and a final CSTX mark no signature per key: the signing round is a count only.
   function signersHtml(t) {
     const list = t.signers || [];
     if (!list.length) return '';
-    const label = ['Waiting', 'Committed', 'Signed', 'Not taking part'];
+    const countOnly = t.review?.minotaur_format === '2' || t.review?.format === 'CSTX';
     const initials = (name) => (name || '?').replace(/[^\p{L}\p{N}]/gu, '').slice(0, 2).toUpperCase() || '?';
+    // A key's state is 0 empty, 1 committed, 2 signed, 3 not taking part (ErgoKit.pm:431).
+    const commitState = (k) => (k.state === 1 || k.state === 2 ? ['Committed', true]
+      : [k.state === 0 && t.status === 'commit' ? 'Not started' : 'Not taking part', false]);
+    const inPlay = (k) => (k.state === 1 ? isOpen(t) : k.state === 0 && t.status === 'commit');
+    const signState = (k) => (k.state === 2 ? ['Signed', true] : [inPlay(k) ? 'Not started' : 'Not taking part', false]);
+    const round = (key, label, [text, done]) => `<span class="round" data-round="${key}">
+      <span class="round-name">${label}</span><span class="${done ? 'tick' : 'muted'}" data-state>${text}</span></span>`;
+
+    const who = (k) => esc(k.mine ? 'you' : k.name || shortAddr(k.address));
+    const andList = (names) => (names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names[0]);
+    let waiting = '';
+    if (t.status === 'commit' || t.status === 'sign') {
+      const commit = t.status === 'commit';
+      const need = Math.max(0, t.signers_required - (commit ? t.commits : t.signatures));
+      const names = countOnly && !commit ? [] : list.filter((k) => k.state === (commit ? 0 : 1)).map(who);
+      const from = !names.length ? ''
+        : names.length > need ? ` from any ${need > 1 ? `${need} ` : ''}of ${names.join(', ')}`
+        : ` from ${andList(names)}`;
+      waiting = `Waiting for ${need} more ${commit ? 'commitment' : 'signature'}${need === 1 ? '' : 's'}${from}.`;
+    } else if (t.status === 'complete') {
+      waiting = 'All required signatures are in. Ready to broadcast.';
+    }
     return `
       <h3 class="mt-16">Signers <span class="faint small">${t.signers_required} of ${list.length} needed</span></h3>
-      <ul class="people">
-        ${list.map((k) => `<li>
+      ${waiting ? `<p class="small" data-waiting-on>${waiting}</p>` : ''}
+      ${countOnly ? `<p class="small muted" data-signers-note>This request does not say who signed, so the signing round
+        is a count only: ${t.signatures} of ${t.signers_required} signatures are in.</p>` : ''}
+      <ul class="people" data-signers>
+        ${list.map((k) => `<li data-signer="${esc(k.slot)}">
           <span class="slot slot-${k.state}" aria-hidden="true">${esc(k.name ? initials(k.name) : k.slot + 1)}</span>
           <span class="grow">
-            ${k.name ? `<strong>${esc(k.name)}</strong>${k.mine ? ' <span class="faint">(you)</span>' : ''}`
-              : '<span class="faint">Not on Sigma Sync yet</span>'}
+            ${k.name ? `<strong data-signer-name>${esc(k.name)}</strong>${k.mine ? ' <span class="faint">(you)</span>' : ''}`
+              : '<span class="faint" data-signer-name>Not on Sigma Sync yet</span>'}
             <div><code class="small faint" title="${esc(k.address)}">${esc(shortAddr(k.address))}</code></div>
           </span>
-          <span class="small ${k.state === 1 || k.state === 2 ? 'tick' : 'faint'}">${label[k.state] || ''}</span>
+          <span class="rounds small">
+            ${round('commit', 'Commitment', commitState(k))}
+            ${countOnly ? '' : round('sign', 'Signing', signState(k))}
+          </span>
         </li>`).join('')}
       </ul>`;
   }

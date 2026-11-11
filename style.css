@@ -26,10 +26,14 @@
   --radius: 10px;
   --radius-sm: 6px;
   --space-1: 8px;
+  --space-0: 2px;
   --space-2: 10px;
   --space-3: 12px;
   --space-4: 16px;
+  --space-5: 24px;
   --text-sm: .82rem;
+  --text-md: 1rem;
+  --chip-size: 24px;
   --weight-medium: 500;
   --hit-min: 28px; /* the least height of a link that stands alone in a row (U3 asks 24px) */
   --shadow: 0 1px 2px rgba(20, 18, 14, .06), 0 2px 8px rgba(20, 18, 14, .04);
@@ -263,6 +267,16 @@ textarea.payload[readonly] { color: var(--text-2); }
 .pill-lock { background: var(--error-soft); color: var(--error); }
 .tag { display: inline-block; padding: 1px 7px; border-radius: 4px; background: var(--surface-2); color: var(--text-2); font-size: .76rem; }
 
+/* --- Queue groups ------------------------------------------------------- */
+.group + .group { margin-top: var(--space-5); }
+.group-title { display: flex; align-items: center; gap: var(--space-1); margin: 0 0 var(--space-2); font-size: var(--text-md); }
+.group-count {
+  min-width: var(--chip-size); padding: 0 var(--space-1); border-radius: 999px; background: var(--surface-2); color: var(--text-2);
+  font-size: var(--text-sm); font-weight: 700; line-height: calc(var(--chip-size) - var(--space-0)); text-align: center;
+}
+/* The two groups that hold the signer's own steps stand out, as the tab count does. */
+.group[data-group=commit] .group-count, .group[data-group=sign] .group-count { background: var(--accent-soft); color: var(--accent-strong); }
+
 .progress { display: grid; gap: 8px; }
 .progress-row { display: grid; grid-template-columns: 96px 1fr auto; gap: 10px; align-items: center; font-size: .82rem; color: var(--text-2); }
 .bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
@@ -301,7 +315,11 @@ textarea.payload[readonly] { color: var(--text-2); }
 .addr { display: inline-flex; align-items: center; min-height: var(--hit-min); font-family: var(--mono); font-size: .8rem; overflow-wrap: anywhere; }
 
 .people { list-style: none; margin: 0; padding: 0; }
-.people li { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: .88rem; }
+.people li { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: .88rem; }
+.people .grow { flex: 1 1 10rem; }
+.rounds { display: grid; flex: none; gap: var(--space-0); margin-left: auto; width: min(14rem, 100%); }
+.round { display: flex; gap: var(--space-3); justify-content: space-between; }
+.round-name { color: var(--text-2); }
 .people li:last-child { border-bottom: 0; }
 .tick { color: var(--success); font-weight: 700; }
 

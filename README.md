@@ -20,14 +20,20 @@ Sigma Sync is a small web app that keeps one source of truth for each transactio
   force-unlock it.
 - **Every paste is checked.** It must be the same Ergo transaction, keep every earlier
   commitment and signature, and add yours. A stale or wrong paste is refused with an explanation.
-- **Clear progress.** Cards show commitments and signatures against the M-of-N threshold, who
-  holds the lock, and what is waiting on you. Each signer key shows whether its owner has
-  committed or signed. Each transaction has a description, comments,
-  and a full activity history.
+- **Clear progress.** The queue groups every open transaction by the step you owe: *Needs your
+  commitment*, *Needs your signature*, *Waiting for others* and *Ready to broadcast*, each with its
+  count. Closed transactions stay behind the filter. Cards show commitments and signatures against
+  the M-of-N threshold, who holds the lock, and how old the transaction is. The detail lists every
+  signer key with its state in each round (not started, committed, signed, not taking part) and says
+  whom the transaction waits on. A Minotaur 2.x request does not mark signatures per key, so its
+  signing round shows a count only. Each transaction has a description, comments, and a full
+  activity history.
 - **Review before you sign.** A *Transaction details* panel decodes the transaction itself: every
   payment with its ERG and tokens (names and decimals from the explorer) and destination, the
   fee, the change, and which wallet addresses it spends from, with a warning when it spends from
-  more than one. It ends with a reminder to verify everything again in Minotaur.
+  more than one. When the request's input boxes do not match the inputs it names, the panel says
+  "Inputs unverified" and shows no spending address and no change. It ends with a reminder to verify
+  everything again in Minotaur.
 - **Minotaur generation check.** Minotaur 3.0+ and 2.x write different request layouts and cannot
   read each other's. Sigma Sync detects the layout (it cannot tell 3.0 from 4.2.1 - those are
   identical) and refuses a paste from the wrong generation for the transaction's chosen version.
