@@ -20,9 +20,10 @@ use CGI qw(-utf8);
 use Digest::SHA qw(sha256_hex);
 use JSON::PP ();
 
-use AppConfig qw(cfg dbh seal unseal random_hex client_ip);
+use AppConfig qw(cfg dbh seal unseal random_hex client_ip ensure_wallet);
 use ErgoKit qw(address_decode address_from_tree build_login_request verify_login_response
-               verify_nautilus_auth sanitize_payload analyze_payload compare_hints payload_input_ids);
+               verify_nautilus_auth wallet_from_address
+               sanitize_payload analyze_payload compare_hints payload_input_ids);
 
 # Large enough for a full batch of big requests (MAX_BATCH entries of a few hundred KB).
 $CGI::POST_MAX = 32 * 1024 * 1024;
@@ -39,6 +40,11 @@ my %LIMIT = (title => 120, description => 10_000, comment => 4000, payload => 1_
 # Used as "... FROM transactions t WHERE ... AND $VISIBLE" with $ME->{id} bound.
 my $VISIBLE = q{EXISTS (SELECT 1 FROM transaction_keys tk JOIN member_keys mk ON mk.pk = tk.pk
                          WHERE tk.transaction_id = t.id AND mk.member_id = ?)};
+
+# A wallet is visible to the current account when it holds one of its keys (SPEC W4).
+# Used as "... FROM wallets w WHERE ... AND $WALLET_VISIBLE" with $ME->{id} bound.
+my $WALLET_VISIBLE = q{EXISTS (SELECT 1 FROM wallet_keys wk JOIN member_keys mk ON mk.pk = wk.pk
+                                WHERE wk.wallet_id = w.id AND mk.member_id = ?)};
 
 # ---------------------------------------------------------------------------
 # Routing
@@ -66,6 +72,10 @@ my %MEMBER = (
     get_account        => \&act_get_account,
     update_account     => \&act_update_account,
     unlink_address     => \&act_unlink_address,
+    register_wallet    => \&act_register_wallet,
+    list_wallets       => \&act_list_wallets,
+    get_wallet         => \&act_get_wallet,
+    rename_wallet      => \&act_rename_wallet,
 );
 my %ADMIN = (
     admin_members  => \&act_admin_members,
@@ -1225,6 +1235,87 @@ sub act_mark_broadcast {
                 WHERE id = ? AND status = 'complete'}, undef, $id);
     log_event('broadcast', '', $id);
     return act_get_transaction();
+}
+
+# ---------------------------------------------------------------------------
+# Wallets: what each signer sees of a registered multi-sig wallet. Every refusal
+# comes before the first write.
+# ---------------------------------------------------------------------------
+sub load_wallet {
+    my ($id) = @_;
+    my $w = dbh()->selectrow_hashref("SELECT w.* FROM wallets w WHERE w.id = ? AND $WALLET_VISIBLE", undef, $id, $ME->{id});
+    fail('Wallet not found.') unless $w;    # same answer whether it exists or not (SPEC W4)
+    return $w;
+}
+
+sub wallet_reply {
+    my ($w) = @_;
+    my $keys = dbh()->selectall_arrayref(q{
+        SELECT wk.pk, wk.slot, mk.member_id, mk.address, m.display_name
+          FROM wallet_keys wk LEFT JOIN member_keys mk ON mk.pk = wk.pk LEFT JOIN members m ON m.id = mk.member_id
+         WHERE wk.wallet_id = ? ORDER BY wk.slot}, { Slice => {} }, $w->{id});
+    return { wallet => {
+        id               => $w->{id} + 0,
+        name             => unseal($w->{name_enc}, 'wallet.name'),
+        address          => $w->{address},
+        network          => $w->{network},
+        signers_required => $w->{signers_required} + 0,
+        signers_total    => $w->{signers_total} + 0,
+        keys             => [ map { {
+            pk      => $_->{pk},
+            slot    => $_->{slot} + 0,
+            name    => $_->{display_name},
+            address => $_->{address} // address_from_tree("\x00\x08\xcd" . pack('H*', $_->{pk}), $w->{network}),
+            mine    => ($_->{member_id} // 0) == $ME->{id} ? 1 : 0,
+        } } @$keys ],
+    } };
+}
+
+sub act_register_wallet {
+    my $name = clean_text(param('name'), $LIMIT{wallet}, 'Wallet name');
+    my ($w, $why) = wallet_from_address(param('address') =~ s/\s+//gr, cfg('NETWORK', 'mainnet'));
+    fail($why) unless $w;
+    # The keys come from the address, never from a stored wallet, so this answer is the same
+    # whether or not the wallet is registered (SPEC W3).
+    my %mine = map { $_ => 1 } @{ my_pks() };
+    fail('None of the addresses on your account is a signer of this wallet. If you sign with another wallet '
+        . 'or address, link it on the Account tab first.') unless grep { $mine{$_} } @{ $w->{keys} };
+    my $db = dbh();
+    $db->begin_work;
+    my ($id, $created) = ensure_wallet($w, $name, $ME->{id});
+    log_event('wallet_registered', $id) if $created;    # the id only, never the name (SPEC W5)
+    $db->commit;
+    my $reply = wallet_reply(load_wallet($id));
+    $reply->{created} = $created;
+    return $reply;
+}
+
+sub act_list_wallets {
+    my $rows = dbh()->selectall_arrayref("SELECT w.* FROM wallets w WHERE $WALLET_VISIBLE ORDER BY w.id",
+        { Slice => {} }, $ME->{id});
+    return { wallets => [ map { {
+        id               => $_->{id} + 0,
+        name             => unseal($_->{name_enc}, 'wallet.name'),
+        signers_required => $_->{signers_required} + 0,
+        signers_total    => $_->{signers_total} + 0,
+    } } @$rows ] };
+}
+
+sub act_get_wallet {
+    return wallet_reply(load_wallet(int_param('id')));
+}
+
+sub act_rename_wallet {
+    my $id = int_param('id');
+    my $name = clean_text(param('name'), $LIMIT{wallet}, 'Wallet name');
+    fail('Give the wallet a name.') unless length $name;
+    load_wallet($id);
+    my $db = dbh();
+    $db->begin_work;
+    $db->do('UPDATE wallets SET name_enc = ? WHERE id = ?', undef, seal($name, 'wallet.name'), $id);
+    log_event('wallet_renamed', $id);    # the id only, never the name (SPEC W5)
+    $db->commit;
+    return wallet_reply(load_wallet($id));
 }
 
 # ---------------------------------------------------------------------------

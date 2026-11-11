@@ -73,6 +73,31 @@ CREATE TABLE IF NOT EXISTS batches (
     CONSTRAINT fk_batch_creator FOREIGN KEY (created_by) REFERENCES members(id)
 ) ENGINE=InnoDB;
 
+-- Multi-sig wallets, registered from their Minotaur address. A wallet is stored once,
+-- under the SHA-256 of its address. The name is shared by its signers and encrypted.
+CREATE TABLE IF NOT EXISTS wallets (
+    id                INT AUTO_INCREMENT PRIMARY KEY,
+    network           VARCHAR(8)   NOT NULL,
+    address           TEXT         NOT NULL,
+    address_sha256    CHAR(64)     NOT NULL,
+    signers_required  TINYINT UNSIGNED NOT NULL,
+    signers_total     TINYINT UNSIGNED NOT NULL,
+    name_enc          TEXT         NOT NULL,
+    created_by        INT          NULL,             -- null when added by the command line or a migration
+    created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_wallet_address (address_sha256)
+) ENGINE=InnoDB;
+
+-- The keys of each wallet in script order. An account sees a wallet only if it holds one.
+CREATE TABLE IF NOT EXISTS wallet_keys (
+    wallet_id       INT          NOT NULL,
+    pk              CHAR(66)     NOT NULL,
+    slot            TINYINT UNSIGNED NOT NULL,
+    PRIMARY KEY (wallet_id, pk),
+    KEY ix_walletkey_pk (pk),
+    CONSTRAINT fk_walletkey_wallet FOREIGN KEY (wallet_id) REFERENCES wallets(id)
+) ENGINE=InnoDB;
+
 -- A multi-sig transaction moving through the commitment and signing rounds.
 -- status: commit -> sign -> complete -> broadcast   (or cancelled)
 CREATE TABLE IF NOT EXISTS transactions (
@@ -96,10 +121,12 @@ CREATE TABLE IF NOT EXISTS transactions (
     locked_at         DATETIME     NULL,
     batch_id          INT          NULL,
     batch_seq         SMALLINT UNSIGNED NULL,
+    wallet_id         INT          NULL,
     KEY ix_tx_status (status, updated_at),
     KEY ix_tx_batch (batch_id, batch_seq),
     CONSTRAINT fk_tx_creator FOREIGN KEY (created_by) REFERENCES members(id),
-    CONSTRAINT fk_tx_lock FOREIGN KEY (lock_member_id) REFERENCES members(id)
+    CONSTRAINT fk_tx_lock FOREIGN KEY (lock_member_id) REFERENCES members(id),
+    CONSTRAINT fk_tx_wallet FOREIGN KEY (wallet_id) REFERENCES wallets(id)
 ) ENGINE=InnoDB;
 
 -- The signer keys of each transaction, read from the transaction itself, with the

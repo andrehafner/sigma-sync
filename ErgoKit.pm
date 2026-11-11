@@ -26,6 +26,7 @@ use Exporter 'import';
 our @EXPORT_OK = qw(
     blake2b256 address_decode address_from_tree
     build_login_request verify_login_response verify_nautilus_auth
+    wallet_from_address wallet_tree
     sanitize_payload analyze_payload compare_hints payload_input_ids
 );
 
@@ -507,6 +508,62 @@ sub _skip_minotaur_multisig_body {
     for my $i (1 .. $n) {
         die "not a multi-sig tree\n" unless _u8($r) == 0x73 && _vlq($r) == $i;
     }
+}
+
+# ---------------------------------------------------------------------------
+# Multi-sig wallets (SPEC W2)
+# ---------------------------------------------------------------------------
+
+# The Minotaur wallet script from M and the 33-byte keys, which it sorts as Minotaur does
+# (../minotaur-wallet/apps/wallet/src/action/address.ts:22-38). M is a zig-zag int: 2 * M.
+sub wallet_tree {
+    my ($m, $keys) = @_;
+    my @keys = sort @$keys;
+    my $n = @keys;
+    return "\x10" . vlq($n + 1) . "\x04" . vlq(2 * $m) . join('', map { "\x08\xcd$_" } @keys)
+         . "\x98\x73\x00\x83" . vlq($n) . "\x08" . join('', map { "\x73" . vlq($_) } 1 .. $n);
+}
+
+my $NOT_A_WALLET = 'This address is not a Minotaur multi-sig wallet.';
+
+# Reads M and the keys from a wallet address on $network. Returns
+# { network, address, m, keys => [hex, in script order] }, or (undef, reason).
+sub wallet_from_address {
+    my ($address, $network) = @_;
+    # Base58 decoding is quadratic here, so the length is checked first. 3,000 characters
+    # hold a wallet of 50 keys and not one of 60.
+    return (undef, 'That address is too long (max 3000 characters).') if length $address > 3000;
+    my $info = address_decode($address) or return (undef, 'That is not a valid Ergo address.');
+    return (undef, 'This is the address of a single key. Use the address of the multi-sig wallet.')
+        if $info->{type} eq 'P2PK';
+    return (undef, 'This is a pay-to-script-hash (P2SH) address, which hides its script. Use the address of the multi-sig wallet.')
+        if $info->{type} eq 'P2SH';
+    return (undef, "Use a $network address.") if $info->{network} ne $network;
+
+    my ($m, @keys);
+    eval {
+        my $r = _reader($info->{tree});
+        die "layout\n" unless _u8($r) == 0x10;
+        my $count = _vlq($r);
+        die "layout\n" unless $count >= 2 && _u8($r) == 0x04;
+        my $zigzag = _vlq($r);
+        die "layout\n" if $zigzag & 1;
+        $m = $zigzag / 2;
+        for (2 .. $count) {
+            die "layout\n" unless _take($r, 2) eq "\x08\xcd";
+            push @keys, _take($r, 33);
+        }
+        1;
+    } or return (undef, $NOT_A_WALLET);
+    return (undef, 'Sigma Sync takes a wallet that needs more than one and fewer than all of its signatures. '
+        . "With M = 1 or M = N it cannot read the signer keys of the wallet's transactions.") unless $m > 1 && $m < @keys;
+    return (undef, 'A key in this wallet is not a valid public key.') if grep { !ec_decompress($_) } @keys;
+    my %seen;
+    return (undef, 'A key appears twice in this wallet.') if grep { $seen{$_}++ } @keys;
+    return (undef, 'The keys of this wallet are not in ascending order.') if grep { $keys[$_] lt $keys[$_ - 1] } 1 .. $#keys;
+    # Whatever follows the keys, and the form of every number, must be what Minotaur writes.
+    return (undef, $NOT_A_WALLET) unless wallet_tree($m, \@keys) eq $info->{tree};
+    return { network => $network, address => $address, m => $m, keys => [ map { unpack 'H*', $_ } @keys ] };
 }
 
 # --- Register values (sigma constants), read only to skip over them -------------

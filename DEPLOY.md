@@ -179,6 +179,19 @@ Adds `auth_challenges.method`; every existing challenge stays a Minotaur challen
 twice. Fresh installs get it from `schema.sql`. Then set `SITE_HOST` in the env file to offer
 Nautilus sign-in.
 
+### Migration 004 - wallet registry
+
+```bash
+sudo mysqldump sigmasync > ~/sigmasync-before-004.sql     # backup
+cd /data/AAP_Storage/apps/sigmasync
+git pull && sudo ./redeploy.sh
+sudo mysql sigmasync < tools/migrate-004-wallets.sql
+```
+
+Adds the `wallets` and `wallet_keys` tables and `transactions.wallet_id`, with a foreign key to
+`wallets`. Safe to run twice. Fresh installs get it from `schema.sql`. Wallet names are sealed
+with `DATA_KEY` like the other encrypted columns.
+
 ## Backups
 
 - `mysqldump --single-transaction sigmasync > sigmasync-$(date +%F).sql` on the usual DB backup

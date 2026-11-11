@@ -14,7 +14,8 @@
 | Role | Can | Granted by |
 |---|---|---|
 | Visitor (not signed in) | See the sign-in page; request and complete a sign-in challenge | - |
-| Account | Choose a display name; link/unlink extra wallet addresses (each proven by signature); start a transaction for a multi-sig wallet one of its keys signs for | Automatic on first wallet sign-in |
+| Account | Choose a display name; link/unlink extra wallet addresses (each proven by signature); start a transaction for a multi-sig wallet one of its keys signs for; register such a wallet by its address | Automatic on first wallet sign-in |
+| Signer of a wallet (an account holding one of the wallet's keys) | View it with its keys; rename it | Derived from the wallet address: the public keys in its multi-sig script |
 | Signer of a transaction (an account holding one of that transaction's signer keys) | View it; lock, submit, release the lock; vote to force-unlock another signer's lock; comment; mark it broadcast once complete; cancel it if they started it | Derived from the transaction itself: the public keys in its multi-sig proposition |
 | Admin | Everything an account can, plus disable/enable accounts, grant/revoke admin, read the audit log, cancel transactions **they are a signer of** | `ADMIN_ADDRESSES` in the env file (cannot be removed in the app), or the admin flag set by another admin |
 
@@ -35,8 +36,10 @@
 | `transaction_keys` | Signer public keys of each transaction and whether each has committed/signed | Low (public in the transaction) |
 | `auth_challenges` | One-time sign-in challenges: SHA-256 of token, address, sign-in method (Minotaur or Nautilus), unsigned challenge tx (Minotaur only), IP, expiry | Low; purged after 1 day |
 | `sessions` | SHA-256 of session token, CSRF token, member, IP, expiry | Moderate (session secrets; only hashes of the cookie value are stored) |
-| `transactions` | Title*, description*, wallet name, Minotaur version, threshold, Ergo tx ID, status, counts, lock holder | Moderate (treasury plans before they are public) |
+| `transactions` | Title*, description*, wallet name, Minotaur version, threshold, Ergo tx ID, status, counts, lock holder, registered wallet (not linked yet) | Moderate (treasury plans before they are public) |
 | `batches` | Batch title*, item count, creator, time | Moderate |
+| `wallets` | Multi-sig wallet address and its SHA-256 (unique), network, M and N, name*, who registered it | Low (public on-chain data), except the name |
+| `wallet_keys` | The public keys of each wallet in script order | Low (public in the address) |
 | `submissions` | Each pasted payload*, its SHA-256, round, counts, detected signer slot | Moderate (partially signed transactions; no private keys or secret nonces) |
 | `comments` | Comment text* | Moderate |
 | `unlock_votes` | Who voted to force-unlock which lock | Low |
@@ -64,6 +67,12 @@
   of one method is refused for a challenge of the other.
 - **Link address**: same challenge flow, with either method, with `purpose=link` while signed
   in; the proven key is added to the current account (refused if another account holds it).
+- **Wallet**: `register_wallet` takes a multi-sig address (at most 3,000 characters) -> it must be
+  a Minotaur M-of-N script on the server's network with 1 < M < N, valid keys in ascending order,
+  and rebuild byte for byte -> the account must hold one of its keys (checked against the
+  address before any lookup) -> the wallet and its keys are written once, under the unique
+  SHA-256 of the address. `rename_wallet` lets any signer of the wallet change its shared name.
+  Both log the wallet id only, never the name.
 - **Create**: Start Transaction form -> `create_transaction` -> payload analysed (must be a valid
   Minotaur multi-sig request; signer keys must be readable; one of the creator's keys must be a
   signer and already committed; threshold must match the wallet's; 20 per account per day) ->
@@ -98,6 +107,9 @@
   if the account holds one of the transaction's signer keys (`transaction_keys` joined to
   `member_keys`). The list query uses the same condition. Unauthorized and non-existent IDs get
   the same "Transaction not found" answer.
+- **Every wallet read or write** goes through `load_wallet()` or the same condition: the account
+  holds one of the wallet's keys (`wallet_keys` joined to `member_keys`). Unauthorized and
+  non-existent IDs get the same "Wallet not found" answer.
 - Turn rules are enforced server-side: an account can lock only while it owes the current round
   its step (commitment round: none of its keys committed; signing round: committed, not yet
   signed). A submission may only add the submitter's own commitment/signature, in one of the
@@ -127,9 +139,11 @@
 ## 8. Security controls
 
 - **SQL**: DBI placeholders for every query; no SQL string interpolation of input.
-- **Input validation**: addresses Base58/checksum/type/network validated; IDs numeric; version
-  allowlist pattern; text length limits (title 120, description 10,000, comment 4,000, payload
-  1 MB); control characters stripped; payloads parsed and checked before storage.
+- **Input validation**: addresses Base58/checksum/type/network validated; wallet addresses at
+  most 3,000 characters before decoding, and only the Minotaur multi-sig script; IDs numeric;
+  version allowlist pattern; text length limits (title 120, description 10,000, comment 4,000,
+  wallet name 80, payload 1 MB); control characters stripped; payloads parsed and checked
+  before storage.
 - **Output escaping**: all user content is HTML-escaped before rendering; payloads are shown in
   read-only textareas and copied via the Clipboard API as plain text.
 - **CSRF**: per-session token required on every authenticated action, plus SameSite=Strict

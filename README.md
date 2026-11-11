@@ -98,6 +98,20 @@ text that the wallet returned, except the addresses you choose from.
 Admins (from `ADMIN_ADDRESSES`, or promoted by another admin) can disable accounts and read the
 audit log. That is all.
 
+### Wallets
+
+The server keeps a registry of multi-sig wallets. The page does not offer it yet; the API does.
+
+- `register_wallet` takes the wallet's Minotaur address and a name. The server reads M and the
+  keys from the address and takes it only when it is a Minotaur M-of-N script on the server's
+  network, with 1 < M < N, valid keys in ascending order, at most 3,000 characters, and when one
+  of your proven addresses is one of its keys. A wallet is stored once: a second registration
+  returns the same wallet.
+- `list_wallets` and `get_wallet` show a wallet only to an account that holds one of its keys,
+  with every key and its owner's name. Anyone else gets "Wallet not found".
+- The name is shared by the wallet's signers and encrypted at rest. Any of them can change it
+  with `rename_wallet`. The audit log records the wallet id and the account, never the name.
+
 ### Rounds and statuses
 
 | Status | Meaning |
