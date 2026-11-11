@@ -73,6 +73,13 @@ wallet, for a new account and for linking an address:
 Each challenge stores its method, so an answer made for one method is refused for the other.
 Without `SITE_HOST` the server refuses the Nautilus method.
 
+The page offers **Sign in with Nautilus** under the address form when the server has `SITE_HOST`
+set and the Nautilus connector is in the page, also when the connector arrives after the page
+loaded. It connects, lists the wallet's used and unused addresses, lets you choose one and runs
+the three steps above. The Account tab links another address the same way. If Nautilus refuses
+to connect or to sign, the page shows one fixed message and changes nothing. It never shows
+text that the wallet returned, except the addresses you choose from.
+
 ### Who sees what
 
 - When a transaction is started, Sigma Sync reads the signer public keys out of the transaction

@@ -25,6 +25,12 @@
 
   --radius: 10px;
   --radius-sm: 6px;
+  --space-1: 8px;
+  --space-2: 10px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --text-sm: .82rem;
+  --weight-medium: 500;
   --shadow: 0 1px 2px rgba(20, 18, 14, .06), 0 2px 8px rgba(20, 18, 14, .04);
   --shadow-lg: 0 10px 40px rgba(20, 18, 14, .18);
 
@@ -185,6 +191,16 @@ textarea.payload[readonly] { color: var(--text-2); }
 .howto { margin: 0 0 14px; padding-left: 20px; color: var(--text-2); }
 .howto li + li { margin-top: 4px; }
 
+/* --- Wallet connector (Nautilus sign-in and link) ----------------------- */
+.or-divider { display: flex; align-items: center; gap: var(--space-3); margin: var(--space-4) 0; color: var(--text-2); font-size: var(--text-sm); }
+.or-divider::before, .or-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.wallet-status { margin: 0; padding: var(--space-3) 0; color: var(--text-2); text-align: center; }
+[data-nautilus=body] .hint { color: var(--text-2); }
+.addr-choice { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-1); }
+.addr-option { width: 100%; height: auto; padding: var(--space-2) var(--space-3); justify-content: space-between; gap: var(--space-3); text-align: left; }
+.addr-option code { min-width: 0; font-weight: var(--weight-medium); overflow-wrap: anywhere; }
+.addr-option .tag { flex-shrink: 0; }
+
 /* --- Tabs --------------------------------------------------------------- */
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 20px; overflow-x: auto; }
 .tab {
@@ -261,7 +277,7 @@ textarea.payload[readonly] { color: var(--text-2); }
 .detail-head h1 { margin: 0; overflow-wrap: anywhere; }
 .meta { display: flex; gap: 14px; flex-wrap: wrap; color: var(--text-2); font-size: .86rem; margin-top: 6px; }
 .detail { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) 400px; align-items: start; }
-@media (max-width: 960px) { .detail { grid-template-columns: 1fr; } .detail-side { order: -1; } }
+@media (max-width: 960px) { .detail { grid-template-columns: minmax(0, 1fr); } .detail-side { order: -1; } }
 .detail-side { position: sticky; top: 72px; }
 .detail > .panel { margin-top: 0; }
 @media (max-width: 960px) { .detail-side { position: static; } }

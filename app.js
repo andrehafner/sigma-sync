@@ -479,6 +479,139 @@
   }
 
   // ------------------------------------------------------------------------
+  // Nautilus: sign in or link an address with the browser wallet (SPEC L1 to L3, L6, L8)
+  // ------------------------------------------------------------------------
+  // Everything the wallet returns is untrusted data (I4). Its addresses are shown after a shape
+  // check and escaping. No other text of the wallet reaches the page: a refusal shows a fixed message.
+  const NAUTILUS_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{40,60}$/;
+  const NAUTILUS_MESSAGE = {
+    connect: 'Nautilus did not connect. Unlock Nautilus, approve the connection in its window and try again.',
+    sign: 'Nautilus did not sign the request. Approve it in the Nautilus window and try again.',
+  };
+
+  function nautilusConnector() {
+    const wallet = window.ergoConnector?.nautilus;
+    return typeof wallet?.connect === 'function' ? wallet : null;
+  }
+
+  // Connects and reads both address lists, used and unused. Resolves null when the wallet says no.
+  async function connectNautilus(wallet) {
+    if (!(await wallet.connect({ createErgoObject: false }))) return null;
+    const ctx = await wallet.getContext();
+    const lists = await Promise.all([ctx.get_used_addresses(), ctx.get_unused_addresses()]);
+    const choices = [];
+    lists.forEach((list, i) => {
+      if (!Array.isArray(list)) return;
+      list.forEach((address) => {
+        if (typeof address === 'string' && NAUTILUS_ADDRESS.test(address) && !choices.some((c) => c.address === address)) {
+          choices.push({ address, used: i === 0 });
+        }
+      });
+    });
+    return { ctx, choices };
+  }
+
+  // Runs the Nautilus steps inside `el`: connect, choose an address, ask for a challenge, call auth,
+  // send the text and the proof. `purpose` is 'login' or 'link'. onDone gets the auth_finish reply.
+  // The flow stops quietly when the page has drawn another view over `el`.
+  function mountNautilus(el, { purpose, label, hint, onDone }) {
+    el.innerHTML = '<p class="or-divider" aria-hidden="true">or</p><div class="stack" data-nautilus="body"></div>';
+    const body = $('[data-nautilus=body]', el);
+    const show = (html, focus = true) => {
+      body.innerHTML = html;
+      if (focus) $('[data-focus]', body)?.focus();
+    };
+    const retry = '<button type="button" class="btn btn-block" data-nautilus="retry" data-focus>Try again</button>';
+    const onRetry = () => { $('[data-nautilus=retry]', body).onclick = start; };
+
+    const idle = (focus) => {
+      show(`<button type="button" class="btn btn-block" data-nautilus="start" data-focus>${esc(label)}</button>
+        <p class="hint">${esc(hint)}</p>`, focus);
+      $('[data-nautilus=start]', body).onclick = start;
+    };
+    const wait = (text) => show(`<p class="wallet-status" role="status" tabindex="-1" data-nautilus="status" data-focus>${esc(text)}</p>`);
+    const fail = (message) => {
+      show(`<div class="notice notice-error" data-nautilus="error">${esc(message)}</div>${retry}`);
+      onRetry();
+    };
+    const empty = () => {
+      show(`<div class="notice notice-info" data-nautilus="empty">Nautilus offered no address. Add one in Nautilus, then try again.</div>${retry}`);
+      onRetry();
+    };
+    const choose = (ctx, choices) => {
+      const mine = new Set(purpose === 'link' ? S.me?.addresses : []);
+      const first = choices.findIndex((c) => !mine.has(c.address));
+      show(`<p class="step-label">Choose the address to use</p>
+        <ul class="addr-choice">${choices.map((c, i) => `
+          <li><button type="button" class="btn addr-option" data-nautilus-choice="${i}"${mine.has(c.address) ? ' disabled' : ''}${i === first ? ' data-focus' : ''}>
+            <code>${esc(c.address)}</code><span class="tag">${mine.has(c.address) ? 'Linked' : c.used ? 'Used' : 'Not used yet'}</span></button></li>`).join('')}
+        </ul>
+        <p class="hint">An address that only signs for a multi-sig wallet can be listed as not used yet.</p>
+        <button type="button" class="btn btn-ghost btn-sm" data-nautilus="cancel">Cancel</button>`);
+      $$('[data-nautilus-choice]', body).forEach((btn) => {
+        btn.onclick = () => sign(ctx, choices[Number(btn.dataset.nautilusChoice)].address);
+      });
+      $('[data-nautilus=cancel]', body).onclick = () => idle(true);
+    };
+
+    async function start() {
+      wait('Connecting to Nautilus. Approve the connection in its window if it asks.');
+      let found = null;
+      try {
+        const wallet = nautilusConnector();
+        found = wallet && await connectNautilus(wallet);
+      } catch (e) { /* the wallet refused: one fixed message below */ }
+      if (!el.isConnected) return;
+      if (!found) fail(NAUTILUS_MESSAGE.connect);
+      else if (!found.choices.length) empty();
+      else choose(found.ctx, found.choices);
+    }
+
+    async function sign(ctx, address) {
+      wait('Waiting for Nautilus. Approve the request in its window.');
+      let challenge;
+      try {
+        challenge = (await api('auth_start', { address, purpose, method: 'nautilus' })).challenge;
+      } catch (e) {
+        if (el.isConnected) fail(e.message);
+        return;
+      }
+      if (!el.isConnected) return;
+      let signed = null;
+      try { signed = await ctx.auth(address, challenge); } catch (e) { /* the wallet refused: one fixed message below */ }
+      if (!el.isConnected) return;
+      if (typeof signed?.signedMessage !== 'string' || typeof signed.proof !== 'string') { fail(NAUTILUS_MESSAGE.sign); return; }
+      let reply;
+      try {
+        reply = await api('auth_finish', { challenge, signed_message: signed.signedMessage, proof: signed.proof });
+      } catch (e) {
+        if (el.isConnected) fail(e.message);
+        return;
+      }
+      if (!el.isConnected) return;
+      try {
+        await onDone(reply);
+      } catch (e) {
+        if (el.isConnected) fail(e.message);
+      }
+    }
+
+    idle(false);
+  }
+
+  // The wallet's script can arrive after app.js, so the slot is filled when the connector is there
+  // at draw time and again when the wallet's event fires (L1). A filled slot is never redrawn.
+  let nautilusSlot = null;
+  function offerNautilus(el, options) {
+    const fill = () => {
+      if (!el.firstChild && S.config.nautilus === 1 && nautilusConnector()) mountNautilus(el, options);
+    };
+    nautilusSlot = { el, fill };
+    fill();
+  }
+  window.addEventListener('ergo-wallet:injected', () => { if (nautilusSlot?.el.isConnected) nautilusSlot.fill(); });
+
+  // ------------------------------------------------------------------------
   // Sign-in
   // ------------------------------------------------------------------------
   function renderSignIn(step = 'address', error = '') {
@@ -523,7 +656,14 @@
         </div>
         ${error ? `<div class="notice notice-error">${esc(error)}</div>` : ''}
         <button class="btn btn-primary btn-block" type="submit">Continue</button>
-      </form>`;
+      </form>
+      <div data-nautilus-slot></div>`;
+    offerNautilus($('[data-nautilus-slot]', panel), {
+      purpose: 'login',
+      label: 'Sign in with Nautilus',
+      hint: 'Nautilus asks you to connect, then to sign a one-time request. It is not a payment.',
+      onDone: (r) => startSession(r),
+    });
     $('#address').focus();
     $('#address-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
@@ -1697,7 +1837,21 @@
           spellcheck="false" placeholder="9…" aria-label="Address to link">
         ${error ? `<div class="notice notice-error">${esc(error)}</div>` : ''}
         <button class="btn btn-block" type="submit">Continue</button>
-      </form>`;
+      </form>
+      <div data-nautilus-slot></div>`;
+    // The answer may come after the signer left this view: then the new view stays as it is.
+    const linked = async () => {
+      toast('Address linked', 'success');
+      S.txs = [];
+      const data = await api('get_account');
+      if (panel.isConnected) drawAccount(data);
+    };
+    offerNautilus($('[data-nautilus-slot]', panel), {
+      purpose: 'link',
+      label: 'Link with Nautilus',
+      hint: 'Choose an address in Nautilus and sign a one-time request. It is not a payment.',
+      onDone: linked,
+    });
     $('#link-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
       const address = $('#link-address').value.replace(/\s+/g, '');
@@ -1707,7 +1861,7 @@
         mountChallenge(panel, ch, {
           submitLabel: 'Link address',
           onRestart: () => drawLinkPanel(),
-          onDone: async () => { toast('Address linked', 'success'); S.txs = []; drawAccount(await api('get_account')); },
+          onDone: linked,
         });
       } catch (e) { drawLinkPanel(e.message); }
     });
@@ -1834,7 +1988,7 @@
     try {
       const r = await api('session');
       if (r.signed_in) startSession(r);
-      else renderSignIn();
+      else { S.config = { nautilus: r.nautilus }; renderSignIn(); }
     } catch (e) {
       app().innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`;
     }
