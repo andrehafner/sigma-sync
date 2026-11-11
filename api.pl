@@ -546,6 +546,7 @@ sub tx_brief {
             ? { name => $names->{ $tx->{lock_member_id} }, since => $tx->{locked_at},
                 mine => $tx->{lock_member_id} == $ME->{id} ? 1 : 0 }
             : undef,
+        lock_seq => $tx->{lock_seq} + 0,
         comments => $comment_count // 0,
         me       => my_progress($tx, $states, $rounds),
         batch    => $tx->{batch_id} ? { id => $tx->{batch_id} + 0, seq => $tx->{batch_seq} + 0 } : undef,
@@ -577,11 +578,17 @@ sub act_list_transactions {
          ORDER BY FIELD(t.status,'commit','sign','complete','broadcast','cancelled'), t.updated_at DESC
          LIMIT 500
     }, { Slice => {} }, $ME->{id});
+    # Every lock the account holds, also on a transaction beyond the 500 rows above (SPEC B7).
+    my $held = dbh()->selectall_arrayref(qq{
+        SELECT t.* FROM transactions t WHERE t.lock_member_id = ? AND $VISIBLE ORDER BY t.id
+    }, { Slice => {} }, $ME->{id}, $ME->{id});
+    my $me = member_names([ $ME->{id} ]);
     my %wallets;
     my @wallets = grep { length && !$wallets{$_}++ } map { $_->{wallet_name} } @$txs;
     return {
         transactions => briefs($txs),
         wallet_names => [ @wallets[0 .. ($#wallets < 19 ? $#wallets : 19)] ],
+        held_locks   => [ map { my $b = tx_brief($_, $me); +{ map { $_ => $b->{$_} } qw(id title wallet lock lock_seq) } } @$held ],
     };
 }
 
@@ -1111,8 +1118,10 @@ sub insert_comment {
         undef, $tx_id, $ME->{id}, $sub_id, seal($body, 'comment.body'));
 }
 
+# With `seq`, the lock is taken only while the row's lock count is the one the caller read (SPEC B7).
 sub act_lock {
     my $id = int_param('id');
+    my $seq = length param('seq') ? int_param('seq') : undef;
     my $tx = load_tx($id);
     if (my $why = turn_refusal($tx, my_progress($tx, my_key_states($id)->{$id}, my_rounds($id)->{$id}))) {
         fail($why);
@@ -1120,20 +1129,34 @@ sub act_lock {
     my $n = dbh()->do(q{
         UPDATE transactions SET lock_member_id = ?, lock_seq = lock_seq + 1, locked_at = UTC_TIMESTAMP()
          WHERE id = ? AND lock_member_id IS NULL AND status IN ('commit','sign')
-    }, undef, $ME->{id}, $id);
+    } . (defined $seq ? ' AND lock_seq = ?' : ''), undef, $ME->{id}, $id, (defined $seq ? $seq : ()));
     unless ($n > 0) {
-        fail('This transaction is no longer open for signing.') unless is_open(load_tx($id));
+        my $now = load_tx($id);
+        fail('This transaction is no longer open for signing.') unless is_open($now);
+        fail('The lock on this transaction changed since you read it. Refresh and try again.')
+            if defined $seq && $now->{lock_seq} != $seq;
         fail('Someone else locked this transaction a moment ago. Refresh to see who.');
     }
     log_event('lock', '', $id);
     return act_get_transaction();
 }
 
+# With `seq`, first the cancel of a `lock` at that count that has not arrived yet, then the
+# release of the lock it took, whose count is `seq` + 1. Whichever the server handles first,
+# no lock of that request stays, and a newer lock of the account is never cleared (SPEC B7).
 sub act_release_lock {
     my $id = int_param('id');
-    load_tx($id);
-    my $n = dbh()->do('UPDATE transactions SET lock_member_id = NULL, locked_at = NULL WHERE id = ? AND lock_member_id = ?',
-        undef, $id, $ME->{id});
+    my $seq = length param('seq') ? int_param('seq') : undef;
+    my $tx = load_tx($id);
+    if (defined $seq && !turn_refusal($tx, my_progress($tx, my_key_states($id)->{$id}, my_rounds($id)->{$id}))
+        && dbh()->do(q{UPDATE transactions SET lock_seq = lock_seq + 1
+                        WHERE id = ? AND lock_member_id IS NULL AND lock_seq = ? AND status IN ('commit','sign')},
+                     undef, $id, $seq) > 0) {
+        log_event('lock_cancel', '', $id);
+        return act_get_transaction();
+    }
+    my $n = dbh()->do('UPDATE transactions SET lock_member_id = NULL, locked_at = NULL WHERE id = ? AND lock_member_id = ?'
+        . (defined $seq ? ' AND lock_seq = ?' : ''), undef, $id, $ME->{id}, (defined $seq ? $seq + 1 : ()));
     fail('You do not hold the lock on this transaction.') unless $n > 0;
     log_event('release', '', $id);
     return act_get_transaction();

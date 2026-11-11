@@ -88,7 +88,12 @@
   server-side and inserts the batch and one transaction per valid entry in one DB transaction
   (invalid entries only skipped on explicit confirmation; counts against the daily cap, default 200).
 - **Lock**: `lock` atomically sets the lock holder only if unlocked and open
-  (`UPDATE ... WHERE lock_member_id IS NULL`).
+  (`UPDATE ... WHERE lock_member_id IS NULL`), and raises the lock count `lock_seq`. With
+  `seq`, it locks only while `lock_seq` still equals it. `release_lock` with `seq` first cancels
+  a lock at that count that has not arrived yet (raises `lock_seq` if nobody holds the lock and
+  the caller may lock, logged as `lock_cancel`), then releases only the caller's lock whose count
+  is `seq` + 1, so a late release never clears a newer lock. Without `seq` both work as before.
+  The list reply names every lock the account holds (`held_locks`), beyond its 500 rows too.
 - **Submit**: lock holder pastes output -> `submit` (row locked with `SELECT ... FOR UPDATE`) ->
   payload must match the Ergo tx ID, keep every earlier commitment/signature, and add at least
   one -> new `submissions` row, per-key states, counts and status updated, lock released, event logged.
