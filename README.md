@@ -100,8 +100,14 @@ audit log. That is all.
 
 ### Wallets
 
-The server keeps a registry of multi-sig wallets. The page does not offer it yet; the API does.
+The server keeps a registry of multi-sig wallets, and the page has a **Wallets** tab for it.
 
+- The Wallets tab lists the wallets your keys sign for and registers one from its address and an
+  optional name. A wallet's own page shows its name (any signer can change it), its address with
+  a copy button, M of N, every key with its owner's name or "Not on Sigma Sync yet", the open
+  transactions, and below them the closed ones, 200 at a time with a "Show older" button.
+  The transaction list and the detail view show the wallet's name, or "No wallet" for a
+  transaction whose inputs disagree. The list's search matches that name.
 - `register_wallet` takes the wallet's Minotaur address and a name. The server reads M and the
   keys from the address and takes it only when it is a Minotaur M-of-N script on the server's
   network, with 1 < M < N, valid keys in ascending order, at most 3,000 characters, and when one

@@ -31,6 +31,7 @@
   --space-4: 16px;
   --text-sm: .82rem;
   --weight-medium: 500;
+  --hit-min: 28px; /* the least height of a link that stands alone in a row (U3 asks 24px) */
   --shadow: 0 1px 2px rgba(20, 18, 14, .06), 0 2px 8px rgba(20, 18, 14, .04);
   --shadow-lg: 0 10px 40px rgba(20, 18, 14, .18);
 
@@ -272,10 +273,11 @@ textarea.payload[readonly] { color: var(--text-2); }
 .empty { text-align: center; padding: 48px 16px; color: var(--text-3); border: 1px dashed var(--border-strong); border-radius: var(--radius); }
 
 /* --- Detail ------------------------------------------------------------- */
-.back { display: inline-flex; gap: 6px; align-items: center; margin-bottom: 12px; color: var(--text-2); text-decoration: none; font-weight: 600; font-size: .9rem; }
+.back { display: inline-flex; gap: 6px; align-items: center; min-height: var(--hit-min); margin-bottom: 12px; color: var(--text-2); text-decoration: none; font-weight: 600; font-size: .9rem; }
 .detail-head { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 18px; }
 .detail-head h1 { margin: 0; overflow-wrap: anywhere; }
-.meta { display: flex; gap: 14px; flex-wrap: wrap; color: var(--text-2); font-size: .86rem; margin-top: 6px; }
+.meta { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; color: var(--text-2); font-size: .86rem; margin-top: 6px; }
+.meta a { display: inline-flex; align-items: center; min-height: var(--hit-min); }
 .detail { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) 400px; align-items: start; }
 @media (max-width: 960px) { .detail { grid-template-columns: minmax(0, 1fr); } .detail-side { order: -1; } }
 .detail-side { position: sticky; top: 72px; }
@@ -296,7 +298,7 @@ textarea.payload[readonly] { color: var(--text-2); }
 .outputs td { padding: 7px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
 .outputs td:last-child { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; padding-left: 12px; }
 .outputs tr:last-child td { border-bottom: 0; }
-.addr { font-family: var(--mono); font-size: .8rem; overflow-wrap: anywhere; }
+.addr { display: inline-flex; align-items: center; min-height: var(--hit-min); font-family: var(--mono); font-size: .8rem; overflow-wrap: anywhere; }
 
 .people { list-style: none; margin: 0; padding: 0; }
 .people li { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: .88rem; }
@@ -374,3 +376,7 @@ table.list tr.inactive td { color: var(--text-3); }
 .tx-details .addr { font-size: .78rem; }
 .verify { font-weight: 700; text-align: center; }
 .error-text { color: var(--error); }
+
+/* --- Wallets ------------------------------------------------------------ */
+.row-link { display: inline-flex; align-items: center; min-height: var(--hit-min); font-weight: var(--weight-medium); overflow-wrap: anywhere; }
+.wallet-address { display: block; margin-bottom: var(--space-2); overflow-wrap: anywhere; }

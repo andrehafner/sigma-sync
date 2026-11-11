@@ -18,6 +18,7 @@
     signin: null,
     pollTimer: null,
     qrTimers: new Set(),
+    view: 0, // counts the routes drawn, so a late answer can tell it is stale
   };
 
   const MINOTAUR_RELEASES = 'https://github.com/minotaur-ergo/minotaur-wallet/releases';
@@ -702,6 +703,7 @@
   // Routing & shell
   // ------------------------------------------------------------------------
   function route() {
+    S.view += 1;
     if (!S.me) return renderSignIn();
     stopPolling();
     stopQrTimers();
@@ -710,6 +712,9 @@
     if (m) return renderDetail(Number(m[1]));
     if (hash === 'start') return renderStart();
     if (hash === 'batch') return renderBatch();
+    if (hash === 'wallets') return renderWallets();
+    const w = hash.match(/^wallet\/(\d+)$/);
+    if (w) return renderWallet(w[1]);
     if (hash === 'account') return renderAccount();
     if (hash === 'admin' && S.me.is_admin) return renderAdmin();
     return renderList();
@@ -729,6 +734,7 @@
       ['sign', 'Sign Transactions', awaiting],
       ['start', 'Start Transaction'],
       ['batch', 'Start Batch'],
+      ['wallets', 'Wallets'],
       ['account', 'Account'],
       ...(S.me.is_admin ? [['admin', 'Admin']] : []),
     ];
@@ -829,7 +835,7 @@
     };
     const q = S.search.toLowerCase();
     const list = S.txs.filter(filters[S.filter] || filters.active).filter((t) => !q
-      || [t.title, t.wallet_name, t.created_by, t.ergo_tx_id, `#${t.id}`].some((v) => (v || '').toLowerCase().includes(q)));
+      || [t.title, t.wallet?.name, t.created_by, t.ergo_tx_id, `#${t.id}`].some((v) => (v || '').toLowerCase().includes(q)));
 
     const stat = (key, value, label, attention) => `
       <button type="button" class="stat ${attention && value ? 'attention' : ''}" data-filter="${key}" aria-pressed="${S.filter === key}">
@@ -853,7 +859,7 @@
         </select>
         <a class="btn btn-primary" href="#start">Start transaction</a>
       </div>
-      ${list.length ? `<div class="cards">${list.map(card).join('')}</div>` : `
+      ${list.length ? `<div class="cards">${list.map((t) => card(t)).join('')}</div>` : `
         <div class="empty">${S.txs.length ? 'Nothing matches this filter.' : 'No transactions for your wallets yet. They appear here when someone starts one for a multi-sig wallet one of your addresses signs for.'}</div>`}`;
 
     paintBars(view);
@@ -870,7 +876,7 @@
     el.setSelectionRange(el.value.length, el.value.length);
   }
 
-  function card(t) {
+  function card(t, showWallet = true) {
     const mine = myStatusText(t);
     return `
       <a class="card ${t.me.awaiting ? 'attention' : ''}" href="#tx/${t.id}">
@@ -878,7 +884,7 @@
         <div class="card-head">
           <div class="grow">
             <div class="card-title">${esc(t.title)}</div>
-            <div class="card-sub">#${t.id}${t.wallet_name ? ` · ${esc(t.wallet_name)}` : ''} · ${esc(versionLabel(t.minotaur_version))}</div>
+            <div class="card-sub">#${t.id}${showWallet ? ` · ${t.wallet ? esc(walletName(t.wallet)) : 'No wallet'}` : ''} · ${esc(versionLabel(t.minotaur_version))}</div>
           </div>
           ${statusPill(t.status)}
         </div>
@@ -1281,7 +1287,7 @@
           <div class="meta">
             <span>#${t.id}</span>
             ${t.batch ? `<span class="tag">Batch item ${t.batch.seq} of ${t.batch.count}</span>` : ''}
-            ${t.wallet_name ? `<span>${esc(t.wallet_name)}</span>` : ''}
+            <span>${t.wallet ? `<a class="row-link" href="#wallet/${esc(t.wallet.id)}">${esc(walletName(t.wallet))}</a>` : 'No wallet'}</span>
             <span><a href="${esc(releaseUrl(t.minotaur_version))}" target="_blank" rel="noopener">${esc(versionLabel(t.minotaur_version))}</a></span>
             <span>Started by ${esc(t.created_by)} · ${timeTag(t.created_at)}</span>
             ${t.ergo_tx_id ? `<span>TX <a href="${esc(explorer)}" target="_blank" rel="noopener" class="mono">${esc(shortId(t.ergo_tx_id))}</a>
@@ -1868,6 +1874,243 @@
   }
 
   // ------------------------------------------------------------------------
+  // Wallets: the registry of multi-sig wallets (SPEC W3 to W7)
+  // ------------------------------------------------------------------------
+  const walletName = (w) => w.name || 'Unnamed wallet';
+
+  // An answer is drawn only while the route that asked for it is still on screen (Q8, Q9).
+  function viewGuard() {
+    const seq = S.view;
+    return () => seq === S.view && !!S.me;
+  }
+
+  const loadError = (message) => `
+    <div class="notice notice-error">${esc(message)}</div>
+    <div class="mt-12"><button type="button" class="btn" data-retry>Try again</button></div>`;
+
+  async function renderWallets() {
+    const live = viewGuard();
+    const view = shell('wallets');
+    view.innerHTML = `
+      <div class="detail">
+        <section class="panel" aria-labelledby="wallets-title">
+          <div class="panel-title"><h2 id="wallets-title">Your wallets</h2></div>
+          <div id="wallet-list"></div>
+        </section>
+        <form class="panel" id="wallet-form" novalidate>
+          <div class="panel-title"><h2>Register a wallet</h2></div>
+          <p class="muted small">Paste the address of a multi-sig wallet you sign for, not your own signing address.
+          One of the addresses on your account must be one of its signers. Its signers then see it here.</p>
+          <div class="field">
+            <label for="w-address">Wallet address</label>
+            <input type="text" id="w-address" required autocomplete="off" autocapitalize="off" autocorrect="off"
+              spellcheck="false" placeholder="The multi-sig wallet's address">
+          </div>
+          <div class="field">
+            <label for="w-name">Name <span class="faint">(optional)</span></label>
+            <input type="text" id="w-name" maxlength="80" autocomplete="off" placeholder="e.g. Sigmanauts Treasury 2.0">
+            <p class="hint">Shared by every signer of the wallet. Any of them can change it.</p>
+          </div>
+          <div id="w-error"></div>
+          <div class="row mt-12"><span class="spacer"></span>
+            <button class="btn btn-primary" type="submit">Register wallet</button></div>
+        </form>
+      </div>`;
+    loadWalletList(live);
+
+    $('#wallet-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const btn = $('button[type=submit]', ev.target);
+      const error = $('#w-error');
+      const address = $('#w-address').value.replace(/\s+/g, '');
+      error.innerHTML = '';
+      if (!address) { error.innerHTML = '<div class="notice notice-error mt-12">Paste the wallet address.</div>'; return; }
+      btn.disabled = true;
+      try {
+        const r = await api('register_wallet', { address, name: $('#w-name').value });
+        toast(r.created ? 'Wallet registered' : 'This wallet was already registered. Its name is unchanged.', 'success');
+        if (!live()) return;
+        ev.target.reset();
+        loadWalletList(live);
+      } catch (e) {
+        if (live()) error.innerHTML = `<div class="notice notice-error mt-12">${esc(e.message)}</div>`;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  async function loadWalletList(live) {
+    const box = $('#wallet-list');
+    // A second load of this list (after a registration) makes an older answer stale, even on the same route.
+    const seq = String((Number(box.dataset.seq) || 0) + 1);
+    box.dataset.seq = seq;
+    const newest = () => live() && box.dataset.seq === seq;
+    if (!box.firstChild) box.innerHTML = '<div class="loading">Loading wallets…</div>';
+    let list;
+    try {
+      list = (await api('list_wallets')).wallets;
+    } catch (e) {
+      if (newest()) box.innerHTML = loadError(e.message);
+      return;
+    }
+    if (!newest()) return;
+    box.innerHTML = list.length
+      ? `<div class="cards" data-wallets="list">${list.map((w) => `
+          <a class="card" href="#wallet/${esc(w.id)}" data-wallet-card>
+            <div class="card-head">
+              <div class="grow">
+                <div class="card-title">${esc(walletName(w))}</div>
+                <div class="card-sub">Wallet #${esc(w.id)}</div>
+              </div>
+              <span class="tag">${esc(w.signers_required)} of ${esc(w.signers_total)} signatures</span>
+            </div>
+          </a>`).join('')}</div>`
+      : `<div class="empty" data-wallets="empty">No wallets yet. Register the multi-sig wallet you sign for with
+          its address. A wallet also appears here when someone starts a transaction for it.</div>`;
+  }
+
+  async function renderWallet(id) {
+    const live = viewGuard();
+    const view = shell('wallets');
+    const back = '<a class="back" href="#wallets">← All wallets</a>';
+    view.innerHTML = `${back}<div class="loading">Loading wallet…</div>`;
+    let wallet;
+    try {
+      wallet = (await api('get_wallet', { id })).wallet;
+    } catch (e) {
+      if (live()) view.innerHTML = back + loadError(e.message);
+      return;
+    }
+    if (live()) drawWallet(wallet, live);
+  }
+
+  const closedRow = (t) => `
+    <tr>
+      <td><a class="row-link" href="#tx/${esc(t.id)}">${esc(t.title)}</a><div class="small faint">#${esc(t.id)}</div></td>
+      <td>${statusPill(t.status)}</td>
+      <td>${t.closed_at ? timeTag(t.closed_at) : ''}</td>
+    </tr>`;
+
+  function drawWallet(w, live) {
+    const view = $('#view');
+    view.innerHTML = `
+      <a class="back" href="#wallets">← All wallets</a>
+      <div class="detail-head">
+        <div class="grow">
+          <h1 id="wallet-title">${esc(walletName(w))}</h1>
+          <div class="meta">
+            <span>Wallet #${esc(w.id)}</span>
+            <span>${esc(w.signers_required)} of ${esc(w.signers_total)} signatures needed</span>
+          </div>
+        </div>
+      </div>
+      <div class="detail">
+        <div>
+          <section class="panel">
+            <div class="panel-title"><h2>Signers</h2></div>
+            <ul class="people" data-wallet="keys">${w.keys.map((k) => `
+              <li data-key="${esc(k.slot)}">
+                <span class="slot" aria-hidden="true">${esc(k.slot + 1)}</span>
+                <span class="grow">
+                  ${k.name ? `<strong>${esc(k.name)}</strong>${k.mine ? ' <span class="faint">(you)</span>' : ''}`
+                    : '<span class="faint">Not on Sigma Sync yet</span>'}
+                  <div><code class="small faint" title="${esc(k.address)}">${esc(shortAddr(k.address))}</code></div>
+                </span>
+              </li>`).join('')}
+            </ul>
+          </section>
+          <section class="panel" data-wallet="open">
+            <div class="panel-title"><h2>Open transactions</h2></div>
+            ${w.open.length ? `<div class="cards">${w.open.map((t) => card(t, false)).join('')}</div>`
+              : '<p class="faint">No open transactions.</p>'}
+          </section>
+          <section class="panel" data-wallet="closed">
+            <div class="panel-title"><h2>History</h2></div>
+            ${w.closed.length ? `<div class="table-wrap"><table class="list">
+                <thead><tr><th>Transaction</th><th>Result</th><th>Closed</th></tr></thead>
+                <tbody>${w.closed.map(closedRow).join('')}</tbody>
+              </table></div>` : '<p class="faint">No closed transactions yet.</p>'}
+            ${w.closed_more ? `<div class="mt-12" data-wallet="more">
+                <div data-wallet="older-error"></div>
+                <button type="button" class="btn" data-wallet="older">Show older</button>
+              </div>` : ''}
+          </section>
+        </div>
+        <aside class="detail-side">
+          <form class="panel" id="rename-form" novalidate>
+            <div class="panel-title"><h2>Name</h2></div>
+            <div class="field">
+              <label for="w-rename">Wallet name</label>
+              <input type="text" id="w-rename" maxlength="80" required autocomplete="off" value="${esc(w.name)}">
+              <p class="hint">Shared by every signer of the wallet. Any of them can change it.</p>
+            </div>
+            <div id="rename-error"></div>
+            <div class="row mt-12"><span class="spacer"></span>
+              <button class="btn btn-primary" type="submit">Save name</button></div>
+          </form>
+          <section class="panel">
+            <div class="panel-title"><h2>Address</h2></div>
+            <code class="wallet-address" data-wallet="address">${esc(w.address)}</code>
+            <button type="button" class="btn btn-sm" data-copy="${esc(w.address)}" data-wallet="address-copy"
+              aria-label="Copy wallet address">Copy</button>
+          </section>
+        </aside>
+      </div>`;
+    paintBars(view);
+
+    $('#rename-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const btn = $('button[type=submit]', ev.target);
+      const error = $('#rename-error');
+      error.innerHTML = '';
+      btn.disabled = true;
+      try {
+        const r = (await api('rename_wallet', { id: w.id, name: $('#w-rename').value })).wallet;
+        if (!live()) return;
+        $('#wallet-title').textContent = walletName(r);
+        $('#w-rename').value = r.name;
+        toast('Name saved', 'success');
+      } catch (e) {
+        if (live()) error.innerHTML = `<div class="notice notice-error mt-12">${esc(e.message)}</div>`;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    const more = $('[data-wallet=more]', view);
+    if (!more) return;
+    const older = $('[data-wallet=older]', more);
+    older.addEventListener('click', async () => {
+      const rows = $('[data-wallet=closed] tbody', view);
+      const problem = $('[data-wallet=older-error]', more);
+      older.disabled = true;
+      older.textContent = 'Loading…';
+      problem.innerHTML = '';
+      try {
+        const page = (await api('get_wallet', { id: w.id, before: w.closed[w.closed.length - 1].id })).wallet;
+        if (!live()) return;
+        const added = rows.children.length;
+        w.closed.push(...page.closed);
+        rows.insertAdjacentHTML('beforeend', page.closed.map(closedRow).join(''));
+        if (page.closed_more) {
+          older.disabled = false;
+          older.textContent = 'Show older';
+        } else {
+          more.remove();
+          // The button had the focus: put it on the first new row, not on the page.
+          rows.children[added]?.querySelector('a')?.focus();
+        }
+      } catch (e) {
+        if (!live()) return;
+        problem.innerHTML = `<div class="notice notice-error mb-16">${esc(e.message)}</div>`;
+        older.disabled = false;
+        older.textContent = 'Show older';
+      }
+    });
+  }
+
+  // ------------------------------------------------------------------------
   // Admin: account moderation and the audit log. No access to transactions.
   // ------------------------------------------------------------------------
   async function renderAdmin() {
@@ -1973,6 +2216,7 @@
     if (copy) { copyText(copy.dataset.copy); return; }
     const filter = ev.target.closest('[data-filter]');
     if (filter) { S.filter = filter.dataset.filter; drawList(); return; }
+    if (ev.target.closest('[data-retry]')) { route(); return; }
     if (ev.target.closest('#user-chip [data-action=logout]')) {
       try { await api('logout'); } catch (e) { /* ignore */ }
       S.me = null;
