@@ -33,7 +33,7 @@
 | `members` | Display name, admin/active flags, last sign-in | Low (names are self-chosen pseudonyms) |
 | `member_keys` | Wallet addresses and public keys each account has proven it controls | Low (public on-chain data), but links addresses to one person |
 | `transaction_keys` | Signer public keys of each transaction and whether each has committed/signed | Low (public in the transaction) |
-| `auth_challenges` | One-time sign-in challenges: SHA-256 of token, address, unsigned challenge tx, IP, expiry | Low; purged after 1 day |
+| `auth_challenges` | One-time sign-in challenges: SHA-256 of token, address, sign-in method (Minotaur or Nautilus), unsigned challenge tx (Minotaur only), IP, expiry | Low; purged after 1 day |
 | `sessions` | SHA-256 of session token, CSRF token, member, IP, expiry | Moderate (session secrets; only hashes of the cookie value are stored) |
 | `transactions` | Title*, description*, wallet name, Minotaur version, threshold, Ergo tx ID, status, counts, lock holder | Moderate (treasury plans before they are public) |
 | `batches` | Batch title*, item count, creator, time | Moderate |
@@ -56,8 +56,14 @@
   transaction equals the issued one and verifies the Schnorr proof against the address's key ->
   the account holding that key is found (or created) and, if active, a session is created
   (HttpOnly, Secure, SameSite=Strict cookie); the challenge is marked used.
-- **Link address**: same challenge flow with `purpose=link` while signed in; the proven key is
-  added to the current account (refused if another account holds it).
+- **Sign-in with Nautilus** (only when `SITE_HOST` is set): `auth_start` with `method=nautilus`
+  stores a challenge marked Nautilus and returns only the token -> the Nautilus wallet signs
+  `token;host;seconds;random` -> `auth_finish` reads the method from the stored challenge, checks
+  the token, that the host equals `SITE_HOST`, that the time is within 5 minutes of the
+  challenge's life, and the Schnorr proof against the address's key -> then as above. An answer
+  of one method is refused for a challenge of the other.
+- **Link address**: same challenge flow, with either method, with `purpose=link` while signed
+  in; the proven key is added to the current account (refused if another account holds it).
 - **Create**: Start Transaction form -> `create_transaction` -> payload analysed (must be a valid
   Minotaur multi-sig request; signer keys must be readable; one of the creator's keys must be a
   signer and already committed; threshold must match the wallet's; 20 per account per day) ->
@@ -82,7 +88,8 @@
 ## 5. Authentication & authorization
 
 - Identity = control of an Ergo wallet key, proven by a Schnorr signature over a one-time
-  challenge transaction. The challenge box does not exist on-chain, so the signed result cannot
+  challenge: a challenge transaction (Minotaur) or a text naming the challenge and the site's
+  host (Nautilus). The challenge box does not exist on-chain, so the signed result cannot
   be broadcast or move funds. Challenges expire after 15 minutes and are single-use.
 - Every API action except `session`, `auth_start`, `auth_finish` and `logout` calls
   `require_member()`: a valid, unexpired, non-idle session for an **active** account **and** a

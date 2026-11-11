@@ -31,13 +31,14 @@ CREATE TABLE IF NOT EXISTS member_keys (
     CONSTRAINT fk_key_member FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
--- One-time sign-in challenges (a Minotaur cold-signing request per attempt).
+-- One-time sign-in challenges: a Minotaur cold-signing request, or a token Nautilus signs.
 CREATE TABLE IF NOT EXISTS auth_challenges (
     id             INT AUTO_INCREMENT PRIMARY KEY,
     token_hash     CHAR(64)     NOT NULL,
     address        VARCHAR(64)  NOT NULL,
     member_id      INT          NULL,              -- set when linking an extra address
-    message_hex    TEXT         NOT NULL,
+    method         VARCHAR(10)  NOT NULL DEFAULT 'minotaur',   -- minotaur or nautilus
+    message_hex    TEXT         NOT NULL,          -- empty for nautilus
     ip             VARCHAR(45)  NOT NULL,
     created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     expires_at     DATETIME     NOT NULL,

@@ -56,6 +56,23 @@ Sigma Sync is a small web app that keeps one source of truth for each transactio
    the Ergo Fiat-Shamir proof format; see [`ErgoKit.pm`](ErgoKit.pm)). The first sign-in creates
    an account; you then pick the name your co-signers see.
 
+#### Sign-in with Nautilus
+
+When the env file sets `SITE_HOST`, the server also accepts a sign-in from the Nautilus browser
+wallet, for a new account and for linking an address:
+
+1. `auth_start` with `method=nautilus` returns a one-time challenge (64 hex characters) and no
+   Minotaur request.
+2. Nautilus's `auth(address, challenge)` signs the text `challenge;host;seconds;random` and
+   returns the text and its proof.
+3. `auth_finish` checks that the stored challenge was issued for Nautilus and for this address,
+   that the host in the text is `SITE_HOST`, that the time is no more than 5 minutes outside the
+   challenge's life, and verifies the proof with the same Schnorr code. From there it continues
+   exactly as the Minotaur sign-in.
+
+Each challenge stores its method, so an answer made for one method is refused for the other.
+Without `SITE_HOST` the server refuses the Nautilus method.
+
 ### Who sees what
 
 - When a transaction is started, Sigma Sync reads the signer public keys out of the transaction
@@ -163,7 +180,8 @@ plus MariaDB.
 ```bash
 mysql -u root < schema.sql            # then create a user as shown at the end of schema.sql
 cp sigmasync.env.example dev.env      # fill in DB_*, DATA_KEY, ADMIN_ADDRESSES;
-                                      # set COOKIE_SECURE=0 and COOKIE_PATH=/ for local HTTP
+                                      # set COOKIE_SECURE=0 and COOKIE_PATH=/ for local HTTP,
+                                      # and SITE_HOST=127.0.0.1:8080 for Nautilus sign-in
 APP_ENV_FILE=$PWD/dev.env python3 tools/dev-server.py 8080
 prove -I. t/                          # unit tests
 ```

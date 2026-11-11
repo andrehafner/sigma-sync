@@ -22,7 +22,7 @@ use JSON::PP ();
 
 use AppConfig qw(cfg dbh seal unseal random_hex client_ip);
 use ErgoKit qw(address_decode address_from_tree build_login_request verify_login_response
-               sanitize_payload analyze_payload compare_hints payload_input_ids);
+               verify_nautilus_auth sanitize_payload analyze_payload compare_hints payload_input_ids);
 
 # Large enough for a full batch of big requests (MAX_BATCH entries of a few hundred KB).
 $CGI::POST_MAX = 32 * 1024 * 1024;
@@ -211,7 +211,16 @@ sub client_config {
         explorer_api_url     => cfg('EXPLORER_API_URL', 'https://api.ergoplatform.com/api/v1/transactions/'),
         explorer_token_url   => cfg('EXPLORER_TOKEN_API_URL', 'https://api.ergoplatform.com/api/v1/tokens/'),
         explorer_address_url => cfg('EXPLORER_ADDRESS_URL', 'https://explorer.ergoplatform.com/en/addresses/'),
+        nautilus             => nautilus_on(),
     };
+}
+
+# SPEC L1, L4: the Nautilus method needs the site's host, the second field of the signed text.
+sub nautilus_on { return length cfg('SITE_HOST', '') ? 1 : 0 }
+
+sub site_host {
+    fail('Sign-in with Nautilus is not available on this site.') unless nautilus_on();
+    return cfg('SITE_HOST');
 }
 
 sub valid_address {
@@ -229,13 +238,18 @@ sub valid_address {
 # ---------------------------------------------------------------------------
 sub act_session {
     load_session();
-    return { signed_in => 0 } unless $ME;
+    return { signed_in => 0, nautilus => nautilus_on() } unless $ME;
     return { signed_in => 1, member => public_member($ME), csrf => $SESSION->{csrf_token},
              config => client_config() };
 }
 
 # purpose=login (default) starts a sign-in; purpose=link (signed in) proves an extra address.
+# method=nautilus asks for a token for Nautilus's auth(); without it the challenge is Minotaur's.
 sub act_auth_start {
+    my $method = param('method');
+    fail('Unknown sign-in method.') unless $method eq '' || $method eq 'nautilus';
+    my $nautilus = $method eq 'nautilus';
+    site_host() if $nautilus;
     my $address = param('address') =~ s/\s+//gr;
     my $link = param('purpose') eq 'link';
     if ($link) {
@@ -254,8 +268,14 @@ sub act_auth_start {
     fail('Too many sign-in attempts. Wait a few minutes and try again.') if $recent >= 20;
 
     my $token = random_hex(32);
-    my $req = build_login_request(address => $address, nonce => pack('H*', random_hex(32)));
     my $ttl = cfg('CHALLENGE_MINUTES', 15) + 0;
+    if ($nautilus) {
+        $db->do(q{INSERT INTO auth_challenges (token_hash, address, member_id, method, message_hex, ip, expires_at)
+                  VALUES (?,?,?,'nautilus','',?, UTC_TIMESTAMP() + INTERVAL ? MINUTE)},
+            undef, sha256_hex($token), $address, ($link ? $ME->{id} : undef), client_ip(), $ttl);
+        return { challenge => $token, method => 'nautilus', expires_minutes => $ttl };
+    }
+    my $req = build_login_request(address => $address, nonce => pack('H*', random_hex(32)));
     $db->do(q{INSERT INTO auth_challenges (token_hash, address, member_id, message_hex, ip, expires_at)
               VALUES (?,?,?,?,?, UTC_TIMESTAMP() + INTERVAL ? MINUTE)},
         undef, sha256_hex($token), $address, ($link ? $ME->{id} : undef), unpack('H*', $req->{message}),
@@ -269,27 +289,39 @@ sub act_auth_finish {
     fail('Sign-in request not found. Start again.') unless $token =~ /^[0-9a-f]{64}$/;
     my $db = dbh();
     my $ch = $db->selectrow_hashref(q{
-        SELECT id, address, member_id, message_hex FROM auth_challenges
+        SELECT id, address, member_id, method, message_hex,
+               UNIX_TIMESTAMP(created_at) AS issued, UNIX_TIMESTAMP(expires_at) AS expires
+          FROM auth_challenges
          WHERE token_hash = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()
     }, undef, sha256_hex($token));
     fail('This request has expired or was already used. Start again.') unless $ch;
 
-    my $response = param('response');
-    fail('Paste the signed result from Minotaur.') unless length $response;
-    fail('That is far too long to be a signed result.') if length $response > 200_000;
-
+    # The method is the stored challenge's, never the request's (SPEC L4, L10).
     my $info = address_decode($ch->{address});
-    my ($ok, $why, $signed_message) = verify_login_response(
-        response => $response, expected_message => pack('H*', $ch->{message_hex}), pk => $info->{pk});
-    if (!$ok && $signed_message) {
-        # Minotaur keeps the previous signed result on screen when a new request is scanned
-        # in the same session (it then shows no password prompt). Recognise that case.
-        my ($old) = $db->selectrow_array(
-            'SELECT id FROM auth_challenges WHERE address = ? AND message_hex = ? AND id <> ?',
-            undef, $ch->{address}, unpack('H*', $signed_message), $ch->{id});
-        $why = 'Minotaur gave you the result of an earlier sign-in instead of signing this new request '
-             . '(it did not ask for your password, right?). This is a Minotaur quirk: fully close and reopen '
-             . 'Minotaur, then scan or paste the request shown here again.' if $old;
+    my ($ok, $why);
+    if ($ch->{method} eq 'nautilus') {
+        ($ok, $why) = verify_nautilus_auth(
+            signed_message => param('signed_message'), proof => param('proof'), challenge => $token,
+            host => site_host(), pk => $info->{pk},
+            not_before => $ch->{issued} - 300, not_after => $ch->{expires} + 300);
+    } else {
+        my $response = param('response');
+        fail('Paste the signed result from Minotaur.') unless length $response;
+        fail('That is far too long to be a signed result.') if length $response > 200_000;
+
+        my $signed_message;
+        ($ok, $why, $signed_message) = verify_login_response(
+            response => $response, expected_message => pack('H*', $ch->{message_hex}), pk => $info->{pk});
+        if (!$ok && $signed_message) {
+            # Minotaur keeps the previous signed result on screen when a new request is scanned
+            # in the same session (it then shows no password prompt). Recognise that case.
+            my ($old) = $db->selectrow_array(
+                'SELECT id FROM auth_challenges WHERE address = ? AND message_hex = ? AND id <> ?',
+                undef, $ch->{address}, unpack('H*', $signed_message), $ch->{id});
+            $why = 'Minotaur gave you the result of an earlier sign-in instead of signing this new request '
+                 . '(it did not ask for your password, right?). This is a Minotaur quirk: fully close and reopen '
+                 . 'Minotaur, then scan or paste the request shown here again.' if $old;
+        }
     }
     unless ($ok) {
         # A wrong paste (e.g. the request itself) does not burn the challenge.
