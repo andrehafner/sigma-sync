@@ -108,9 +108,17 @@ The server keeps a registry of multi-sig wallets. The page does not offer it yet
   of your proven addresses is one of its keys. A wallet is stored once: a second registration
   returns the same wallet.
 - `list_wallets` and `get_wallet` show a wallet only to an account that holds one of its keys,
-  with every key and its owner's name. Anyone else gets "Wallet not found".
+  with every key and its owner's name. Anyone else gets "Wallet not found". `get_wallet` also
+  lists the wallet's open transactions and its closed ones, newest first, 200 at a time
+  (`before` takes the last id shown).
 - The name is shared by the wallet's signers and encrypted at rest. Any of them can change it
   with `rename_wallet`. The audit log records the wallet id and the account, never the name.
+- Starting a transaction links it to its wallet when every input is a box of the same M-of-N
+  wallet, and registers the wallet if nobody has, named after the transaction's wallet name.
+  A start never renames a registered wallet. A transaction whose inputs disagree has no wallet.
+  Every transaction carries its wallet's id and name, or none.
+- An operator can add a wallet before any signer does:
+  `APP_ENV_FILE=... perl tools/add-wallet.pl '<address>' '<name>'` prints its id.
 
 ### Rounds and statuses
 

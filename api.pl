@@ -22,7 +22,7 @@ use JSON::PP ();
 
 use AppConfig qw(cfg dbh seal unseal random_hex client_ip ensure_wallet);
 use ErgoKit qw(address_decode address_from_tree build_login_request verify_login_response
-               verify_nautilus_auth wallet_from_address
+               verify_nautilus_auth wallet_from_address wallet_from_request
                sanitize_payload analyze_payload compare_hints payload_input_ids);
 
 # Large enough for a full batch of big requests (MAX_BATCH entries of a few hundred KB).
@@ -32,6 +32,7 @@ my $JSON = JSON::PP->new->utf8->canonical;
 my $cgi  = CGI->new;
 my @cookies;
 my ($ME, $SESSION);
+my %WALLET_OF;    # wallet_of_tx's answers, for this request
 
 my %LIMIT = (title => 120, description => 10_000, comment => 4000, payload => 1_000_000,
              wallet => 80, name => 40);
@@ -525,6 +526,7 @@ sub turn_refusal {
 
 sub tx_brief {
     my ($tx, $names, $states, $comment_count, $rounds) = @_;
+    my $wallet = wallet_of_tx($tx->{wallet_id});
     return {
         id               => $tx->{id} + 0,
         title            => unseal($tx->{title_enc}, 'transaction.title'),
@@ -547,32 +549,38 @@ sub tx_brief {
         comments => $comment_count // 0,
         me       => my_progress($tx, $states, $rounds),
         batch    => $tx->{batch_id} ? { id => $tx->{batch_id} + 0, seq => $tx->{batch_seq} + 0 } : undef,
+        wallet   => $wallet ? { id => $wallet->{id}, name => $wallet->{name} } : undef,
     };
 }
 
-sub act_list_transactions {
-    my $db = dbh();
-    my $txs = $db->selectall_arrayref(qq{
-        SELECT t.* FROM transactions t
-         WHERE $VISIBLE
-           AND (t.status IN ('commit','sign','complete') OR t.closed_at > UTC_TIMESTAMP() - INTERVAL 180 DAY)
-         ORDER BY FIELD(t.status,'commit','sign','complete','broadcast','cancelled'), t.updated_at DESC
-         LIMIT 500
-    }, { Slice => {} }, $ME->{id});
+# Briefs of transactions the caller already read under the visibility condition.
+sub briefs {
+    my ($txs) = @_;
     my @ids = map { $_->{id} } @$txs;
     my %comments;
     if (@ids) {
-        %comments = map { $_->[0] => $_->[1] } @{ $db->selectall_arrayref(
+        %comments = map { $_->[0] => $_->[1] } @{ dbh()->selectall_arrayref(
             'SELECT transaction_id, COUNT(*) FROM comments WHERE transaction_id IN (' . join(',', ('?') x @ids)
             . ') GROUP BY transaction_id', undef, @ids) };
     }
     my $states = my_key_states();
     my $rounds = my_rounds();
     my $names = member_names([ map { ($_->{created_by}, $_->{lock_member_id}) } @$txs ]);
+    return [ map { tx_brief($_, $names, $states->{ $_->{id} }, $comments{ $_->{id} }, $rounds->{ $_->{id} }) } @$txs ];
+}
+
+sub act_list_transactions {
+    my $txs = dbh()->selectall_arrayref(qq{
+        SELECT t.* FROM transactions t
+         WHERE $VISIBLE
+           AND (t.status IN ('commit','sign','complete') OR t.closed_at > UTC_TIMESTAMP() - INTERVAL 180 DAY)
+         ORDER BY FIELD(t.status,'commit','sign','complete','broadcast','cancelled'), t.updated_at DESC
+         LIMIT 500
+    }, { Slice => {} }, $ME->{id});
     my %wallets;
     my @wallets = grep { length && !$wallets{$_}++ } map { $_->{wallet_name} } @$txs;
     return {
-        transactions => [ map { tx_brief($_, $names, $states->{ $_->{id} }, $comments{ $_->{id} }, $rounds->{ $_->{id} }) } @$txs ],
+        transactions => briefs($txs),
         wallet_names => [ @wallets[0 .. ($#wallets < 19 ? $#wallets : 19)] ],
     };
 }
@@ -628,6 +636,7 @@ sub act_get_transaction {
 
     my $brief = tx_brief($tx, $names, my_key_states($id)->{$id}, scalar @$comments, my_rounds($id)->{$id});
     $brief->{description} = unseal($tx->{description_enc}, 'transaction.description');
+    $brief->{wallet}{address} = wallet_of_tx($tx->{wallet_id})->{address} if $brief->{wallet};
     $brief->{timeline}    = \@timeline;
     $brief->{signers}     = [ map { {
         slot    => $_->{slot} + 0,
@@ -850,8 +859,9 @@ sub tracked_as {
     return $dupe;
 }
 
-# Inserts a checked transaction with its signer keys and first submission. Caller
-# holds the DB transaction.
+# Inserts a checked transaction with its signer keys and first submission, and links it to
+# the wallet its inputs name, which a start registers when nobody has (SPEC W3, W7). Caller
+# holds the DB transaction, so a refused start leaves no wallet behind.
 sub insert_transaction {
     my (%t) = @_;
     my ($a, $keys) = @t{qw(analysis keys)};
@@ -859,11 +869,17 @@ sub insert_transaction {
     my $commits  = $a->{committed} // 0;
     my $status   = $commits >= $required ? 'sign' : 'commit';
     my $db = dbh();
+    my ($wallet_id, $created);
+    if (my $w = wallet_from_request($a, cfg('NETWORK', 'mainnet'))) {
+        # A registered wallet keeps its name; a new one takes the start's (SPEC W3).
+        ($wallet_id, $created) = ensure_wallet($w, $t{wallet}, $ME->{id});
+        log_event('wallet_registered', $wallet_id) if $created;    # the id only (SPEC W5)
+    }
     $db->do(q{INSERT INTO transactions (title_enc, description_enc, wallet_name, minotaur_version,
-                signers_required, signers_total, ergo_tx_id, status, commits, created_by, batch_id, batch_seq)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)}, undef,
+                signers_required, signers_total, ergo_tx_id, status, commits, created_by, batch_id, batch_seq, wallet_id)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)}, undef,
         seal($t{title}, 'transaction.title'), seal($t{description}, 'transaction.description'), $t{wallet}, $t{version},
-        $required, scalar @$keys, $a->{tx_id}, $status, $commits, $ME->{id}, $t{batch_id}, $t{batch_seq});
+        $required, scalar @$keys, $a->{tx_id}, $status, $commits, $ME->{id}, $t{batch_id}, $t{batch_seq}, $wallet_id);
     my $tx_id = $db->last_insert_id(undef, undef, 'transactions', 'id');
     my $sth = $db->prepare('INSERT INTO transaction_keys (transaction_id, pk, slot, state) VALUES (?,?,?,?)');
     $sth->execute($tx_id, $keys->[$_], $_, $a->{key_states}{ $keys->[$_] } // 0) for 0 .. $#$keys;
@@ -1248,12 +1264,41 @@ sub load_wallet {
     return $w;
 }
 
+# The wallet a brief names: id, name and address, read under the wallet visibility
+# condition. A transaction's keys are its wallet's keys (SPEC W7), so whoever sees the
+# transaction sees its wallet.
+sub wallet_of_tx {
+    my ($id) = @_;
+    return undef unless $id;
+    return $WALLET_OF{$id} //= do {
+        my $w = dbh()->selectrow_hashref("SELECT w.id, w.name_enc, w.address FROM wallets w WHERE w.id = ? AND $WALLET_VISIBLE",
+            undef, $id, $ME->{id});
+        $w && { id => $w->{id} + 0, name => unseal($w->{name_enc}, 'wallet.name'), address => $w->{address} };
+    };
+}
+
+use constant WALLET_PAGE => 200;
+
+# A wallet with its keys, its open transactions and its closed ones newest first, a page
+# at a time below the id $before (SPEC W6). Transactions are read under the visibility
+# condition (SPEC I2).
 sub wallet_reply {
-    my ($w) = @_;
-    my $keys = dbh()->selectall_arrayref(q{
+    my ($w, $before) = @_;
+    my $db = dbh();
+    my $keys = $db->selectall_arrayref(q{
         SELECT wk.pk, wk.slot, mk.member_id, mk.address, m.display_name
           FROM wallet_keys wk LEFT JOIN member_keys mk ON mk.pk = wk.pk LEFT JOIN members m ON m.id = mk.member_id
          WHERE wk.wallet_id = ? ORDER BY wk.slot}, { Slice => {} }, $w->{id});
+    my $open = $db->selectall_arrayref(qq{
+        SELECT t.* FROM transactions t WHERE t.wallet_id = ? AND t.status IN ('commit','sign','complete') AND $VISIBLE
+         ORDER BY t.id DESC}, { Slice => {} }, $w->{id}, $ME->{id});
+    my $closed = $db->selectall_arrayref(qq{
+        SELECT t.* FROM transactions t WHERE t.wallet_id = ? AND t.status IN ('broadcast','cancelled') AND $VISIBLE}
+        . (defined $before ? ' AND t.id < ?' : '') . ' ORDER BY t.id DESC LIMIT ' . (WALLET_PAGE + 1),
+        { Slice => {} }, $w->{id}, $ME->{id}, (defined $before ? $before : ()));
+    my $more = @$closed > WALLET_PAGE ? 1 : 0;
+    splice @$closed, WALLET_PAGE if $more;
+    my @briefs = @{ briefs([ @$open, @$closed ]) };
     return { wallet => {
         id               => $w->{id} + 0,
         name             => unseal($w->{name_enc}, 'wallet.name'),
@@ -1268,6 +1313,9 @@ sub wallet_reply {
             address => $_->{address} // address_from_tree("\x00\x08\xcd" . pack('H*', $_->{pk}), $w->{network}),
             mine    => ($_->{member_id} // 0) == $ME->{id} ? 1 : 0,
         } } @$keys ],
+        open             => [ splice @briefs, 0, scalar @$open ],
+        closed           => \@briefs,
+        closed_more      => $more,
     } };
 }
 
@@ -1302,7 +1350,8 @@ sub act_list_wallets {
 }
 
 sub act_get_wallet {
-    return wallet_reply(load_wallet(int_param('id')));
+    my $id = int_param('id');
+    return wallet_reply(load_wallet($id), length param('before') ? int_param('before') : undef);
 }
 
 sub act_rename_wallet {

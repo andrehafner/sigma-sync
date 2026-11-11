@@ -186,11 +186,28 @@ sudo mysqldump sigmasync > ~/sigmasync-before-004.sql     # backup
 cd /data/AAP_Storage/apps/sigmasync
 git pull && sudo ./redeploy.sh
 sudo mysql sigmasync < tools/migrate-004-wallets.sql
+sudo APP_ENV_FILE=/data/AAP_Storage/secrets/sigmasync.env perl tools/migrate-004-wallets.pl --dry-run
+sudo APP_ENV_FILE=/data/AAP_Storage/secrets/sigmasync.env perl tools/migrate-004-wallets.pl
 ```
 
-Adds the `wallets` and `wallet_keys` tables and `transactions.wallet_id`, with a foreign key to
-`wallets`. Safe to run twice. Fresh installs get it from `schema.sql`. Wallet names are sealed
-with `DATA_KEY` like the other encrypted columns.
+The `.sql` file adds the `wallets` and `wallet_keys` tables and `transactions.wallet_id`, with a
+foreign key to `wallets`. Safe to run twice. Fresh installs get it from `schema.sql`. Wallet
+names are sealed with `DATA_KEY` like the other encrypted columns.
+
+The `.pl` file connects with the app's own credentials and links every existing transaction
+whose inputs all name the same M-of-N wallet, registering that wallet when needed. A wallet
+without a name takes the newest non-empty wallet name among its transactions; a name is never
+written over. Transactions whose inputs disagree keep no wallet. It runs as one DB transaction;
+`--dry-run` shows what it would do and rolls it back. Re-running it changes nothing.
+
+To add a wallet before any signer registers it:
+
+```bash
+sudo APP_ENV_FILE=/data/AAP_Storage/secrets/sigmasync.env perl tools/add-wallet.pl '<address>' '<name>'
+```
+
+It applies the same checks as the app and prints the wallet id. A wallet that is already
+registered keeps its name.
 
 ## Backups
 

@@ -36,9 +36,9 @@
 | `transaction_keys` | Signer public keys of each transaction and whether each has committed/signed | Low (public in the transaction) |
 | `auth_challenges` | One-time sign-in challenges: SHA-256 of token, address, sign-in method (Minotaur or Nautilus), unsigned challenge tx (Minotaur only), IP, expiry | Low; purged after 1 day |
 | `sessions` | SHA-256 of session token, CSRF token, member, IP, expiry | Moderate (session secrets; only hashes of the cookie value are stored) |
-| `transactions` | Title*, description*, wallet name, Minotaur version, threshold, Ergo tx ID, status, counts, lock holder, registered wallet (not linked yet) | Moderate (treasury plans before they are public) |
+| `transactions` | Title*, description*, wallet name, Minotaur version, threshold, Ergo tx ID, status, counts, lock holder, registered wallet | Moderate (treasury plans before they are public) |
 | `batches` | Batch title*, item count, creator, time | Moderate |
-| `wallets` | Multi-sig wallet address and its SHA-256 (unique), network, M and N, name*, who registered it | Low (public on-chain data), except the name |
+| `wallets` | Multi-sig wallet address and its SHA-256 (unique), network, M and N, name*, who registered it (none for the command line and the migration) | Low (public on-chain data), except the name |
 | `wallet_keys` | The public keys of each wallet in script order | Low (public in the address) |
 | `submissions` | Each pasted payload*, its SHA-256, round, counts, detected signer slot | Moderate (partially signed transactions; no private keys or secret nonces) |
 | `comments` | Comment text* | Moderate |
@@ -72,12 +72,16 @@
   and rebuild byte for byte -> the account must hold one of its keys (checked against the
   address before any lookup) -> the wallet and its keys are written once, under the unique
   SHA-256 of the address. `rename_wallet` lets any signer of the wallet change its shared name.
-  Both log the wallet id only, never the name.
+  Both log the wallet id only, never the name. `get_wallet` lists the wallet's open
+  transactions and its closed ones, 200 at a time, read under the transaction visibility rule.
+  `tools/add-wallet.pl` adds a wallet from the command line with the same checks.
 - **Create**: Start Transaction form -> `create_transaction` -> payload analysed (must be a valid
   Minotaur multi-sig request; signer keys must be readable; one of the creator's keys must be a
   signer and already committed; threshold must match the wallet's; 20 per account per day) ->
   `transactions`, its `transaction_keys`, the first `submissions` row (+ optional `comments`)
-  inserted in one DB transaction.
+  inserted in one DB transaction. When every input names the same M and keys, the transaction
+  is linked to that wallet, which the same DB transaction registers if it is new (named after
+  the transaction's wallet name; an existing wallet keeps its name).
 - **Batch**: Start Batch form -> `batch_preview` (read-only: every entry checked exactly as a
   single start, plus duplicates within the batch and already-tracked transactions; at most 100
   entries) -> `create_batch` re-checks everything server-side and inserts the batch and one

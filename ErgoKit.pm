@@ -26,7 +26,7 @@ use Exporter 'import';
 our @EXPORT_OK = qw(
     blake2b256 address_decode address_from_tree
     build_login_request verify_login_response verify_nautilus_auth
-    wallet_from_address wallet_tree
+    wallet_from_address wallet_from_request wallet_tree
     sanitize_payload analyze_payload compare_hints payload_input_ids
 );
 
@@ -526,13 +526,19 @@ sub wallet_tree {
 
 my $NOT_A_WALLET = 'This address is not a Minotaur multi-sig wallet.';
 
+# The longest wallet address (SPEC W2). It is Base58 of a prefix byte, the script and a 4-byte
+# checksum, and Base58 carries log(256)/log(58) characters per byte, so a script longer than
+# this cannot fit in it.
+my $MAX_ADDRESS     = 3000;
+my $MAX_WALLET_TREE = int($MAX_ADDRESS * log(58) / log(256)) + 1 - 5;
+
 # Reads M and the keys from a wallet address on $network. Returns
 # { network, address, m, keys => [hex, in script order] }, or (undef, reason).
 sub wallet_from_address {
     my ($address, $network) = @_;
     # Base58 decoding is quadratic here, so the length is checked first. 3,000 characters
     # hold a wallet of 50 keys and not one of 60.
-    return (undef, 'That address is too long (max 3000 characters).') if length $address > 3000;
+    return (undef, "That address is too long (max $MAX_ADDRESS characters).") if length $address > $MAX_ADDRESS;
     my $info = address_decode($address) or return (undef, 'That is not a valid Ergo address.');
     return (undef, 'This is the address of a single key. Use the address of the multi-sig wallet.')
         if $info->{type} eq 'P2PK';
@@ -555,15 +561,42 @@ sub wallet_from_address {
         }
         1;
     } or return (undef, $NOT_A_WALLET);
-    return (undef, 'Sigma Sync takes a wallet that needs more than one and fewer than all of its signatures. '
-        . "With M = 1 or M = N it cannot read the signer keys of the wallet's transactions.") unless $m > 1 && $m < @keys;
-    return (undef, 'A key in this wallet is not a valid public key.') if grep { !ec_decompress($_) } @keys;
-    my %seen;
-    return (undef, 'A key appears twice in this wallet.') if grep { $seen{$_}++ } @keys;
-    return (undef, 'The keys of this wallet are not in ascending order.') if grep { $keys[$_] lt $keys[$_ - 1] } 1 .. $#keys;
+    my $why = _wallet_refusal($m, \@keys);
+    return (undef, $why) if $why;
     # Whatever follows the keys, and the form of every number, must be what Minotaur writes.
     return (undef, $NOT_A_WALLET) unless wallet_tree($m, \@keys) eq $info->{tree};
     return { network => $network, address => $address, m => $m, keys => [ map { unpack 'H*', $_ } @keys ] };
+}
+
+# The checks of W2 on M and the 33-byte keys in script order. Returns a reason, or undef.
+sub _wallet_refusal {
+    my ($m, $keys) = @_;
+    return 'Sigma Sync takes a wallet that needs more than one and fewer than all of its signatures. '
+        . "With M = 1 or M = N it cannot read the signer keys of the wallet's transactions." unless $m > 1 && $m < @$keys;
+    return 'A key in this wallet is not a valid public key.' if grep { !ec_decompress($_) } @$keys;
+    my %seen;
+    return 'A key appears twice in this wallet.' if grep { $seen{$_}++ } @$keys;
+    return 'The keys of this wallet are not in ascending order.' if grep { $keys->[$_] lt $keys->[$_ - 1] } 1 .. $#$keys;
+    return undef;
+}
+
+# The wallet of a request (SPEC W7): every input names the same M and the same keys, and
+# that wallet passes W2. $a is what analyze_payload returns. Returns what
+# wallet_from_address returns for the wallet's address, or undef.
+sub wallet_from_request {
+    my ($a, $network) = @_;
+    my ($keys, $required) = @$a{qw(input_keys input_required)};
+    return undef unless $keys && @$keys;
+    # The script is 10 bytes plus at least 37 per key, so the key count alone refuses a wallet
+    # too long for an address before any key is checked or any address encoded.
+    return undef if 10 + 37 * @{ $keys->[0] } > $MAX_WALLET_TREE;
+    my $shape = join ',', $required->[0], @{ $keys->[0] };
+    return undef if grep { join(',', $required->[$_], @{ $keys->[$_] }) ne $shape } 1 .. $#$keys;
+    my @keys = map { pack 'H*', $_ } @{ $keys->[0] };
+    return undef if _wallet_refusal($required->[0], \@keys);
+    my $address = address_from_tree(wallet_tree($required->[0], \@keys), $network);
+    return undef if length $address > $MAX_ADDRESS;
+    return { network => $network, address => $address, m => $required->[0], keys => [ @{ $keys->[0] } ] };
 }
 
 # --- Register values (sigma constants), read only to skip over them -------------
@@ -652,9 +685,9 @@ sub _parse_reduced {
     }
 
     # Each input's reduced proposition: a threshold atLeast(M, keys) for multi-sig boxes,
-    # or a single key. Keys are listed in sorted order, which is also the order of
+    # or a single key (M = 1). Keys are listed in sorted order, which is also the order of
     # Minotaur's hint slots.
-    my @input_keys;
+    my (@input_keys, @input_required);
     my $readable = 1;
     for my $i (1 .. $n_in) {
         my $op = _u8($r);
@@ -668,9 +701,11 @@ sub _parse_reduced {
             }
             last unless $readable;
             @tx{qw(required signers)} = ($k, $n) if $i == 1;
+            push @input_required, $k;
         } elsif ($op == 0xcd) {
             push @keys, unpack 'H*', _take($r, 33);
             @tx{qw(required signers)} = (1, 1) if $i == 1;
+            push @input_required, 1;
         } else {
             $readable = 0;
             last;
@@ -678,7 +713,7 @@ sub _parse_reduced {
         _vlq($r);    # cost
         push @input_keys, [ sort @keys ];
     }
-    $tx{input_keys} = \@input_keys if $readable;
+    @tx{qw(input_keys input_required)} = (\@input_keys, \@input_required) if $readable;
 
     # Outputs. Contract trees without a size field cannot be measured without a full
     # ErgoTree parser, so for those every possible length is tried and the one after
@@ -872,8 +907,8 @@ sub analyze_payload {
 
     my $tx = eval { _parse_reduced(decode_base64($d->{tx})) };
     unless ($tx) { $res{error} = 'The transaction inside the payload could not be read. It may be truncated.'; return \%res }
-    @res{qw(tx_id required signers outputs outputs_partial input_keys input_ids)}
-        = @$tx{qw(tx_id required signers outputs outputs_partial input_keys input_ids)};
+    @res{qw(tx_id required signers outputs outputs_partial input_keys input_required input_ids)}
+        = @$tx{qw(tx_id required signers outputs outputs_partial input_keys input_required input_ids)};
 
     # Hints: current builds use "hints" (matrix input x signer slot); the oldest builds
     # used "commitments" + "signed".
