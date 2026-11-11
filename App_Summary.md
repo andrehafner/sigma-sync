@@ -83,10 +83,10 @@
   is linked to that wallet, which the same DB transaction registers if it is new (named after
   the transaction's wallet name; an existing wallet keeps its name).
 - **Batch**: Start Batch form -> `batch_preview` (read-only: every entry checked exactly as a
-  single start, plus duplicates within the batch and already-tracked transactions; at most 100
-  entries) -> `create_batch` re-checks everything server-side and inserts the batch and one
-  transaction per valid entry in one DB transaction (invalid entries only skipped on explicit
-  confirmation; counts against the daily cap, default 200).
+  single start, plus duplicates within the batch, already-tracked transactions and boxes an open
+  transaction already spends; at most 100 entries) -> `create_batch` re-checks everything
+  server-side and inserts the batch and one transaction per valid entry in one DB transaction
+  (invalid entries only skipped on explicit confirmation; counts against the daily cap, default 200).
 - **Lock**: `lock` atomically sets the lock holder only if unlocked and open
   (`UPDATE ... WHERE lock_member_id IS NULL`).
 - **Submit**: lock holder pastes output -> `submit` (row locked with `SELECT ... FOR UPDATE`) ->
@@ -110,7 +110,9 @@
 - **Every transaction read or write** goes through `load_tx()`, whose query only returns the row
   if the account holds one of the transaction's signer keys (`transaction_keys` joined to
   `member_keys`). The list query uses the same condition. Unauthorized and non-existent IDs get
-  the same "Transaction not found" answer.
+  the same "Transaction not found" answer. The Start Batch check looks for box clashes only among
+  open transactions the account can see. A duplicate Ergo transaction is always refused, and named
+  only when the account can see it.
 - **Every wallet read or write** goes through `load_wallet()` or the same condition: the account
   holds one of the wallet's keys (`wallet_keys` joined to `member_keys`). Unauthorized and
   non-existent IDs get the same "Wallet not found" answer.

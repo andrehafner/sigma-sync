@@ -852,11 +852,14 @@ sub daily_quota_left {
     return cfg('DAILY_TX_LIMIT', 200) - $recent;
 }
 
+# The open transaction of this Ergo transaction id, with whether the account can see it.
+# Only a visible one may be named (SPEC I10). Returns nothing when none is tracked.
 sub tracked_as {
     my ($ergo_tx_id) = @_;
-    my ($dupe) = dbh()->selectrow_array(
-        q{SELECT id FROM transactions WHERE ergo_tx_id = ? AND status <> 'cancelled'}, undef, $ergo_tx_id);
-    return $dupe;
+    my ($dupe, $visible) = dbh()->selectrow_array(
+        qq{SELECT t.id, $VISIBLE FROM transactions t WHERE t.ergo_tx_id = ? AND t.status <> 'cancelled'},
+        undef, $ME->{id}, $ergo_tx_id);
+    return $dupe ? ($dupe, $visible) : ();
 }
 
 # Inserts a checked transaction with its signer keys and first submission, and links it to
@@ -910,7 +913,9 @@ sub act_create_transaction {
     if ($a->{required} && $a->{required} != $required) {
         fail("This multi-sig wallet needs $a->{required} of $a->{signers} signatures. Set \"Signatures required\" to $a->{required}.");
     }
-    if (my $dupe = tracked_as($a->{tx_id})) { fail("This Ergo transaction is already being tracked (#$dupe).") }
+    if (my ($dupe, $visible) = tracked_as($a->{tx_id})) {
+        fail('This Ergo transaction is already being tracked' . ($visible ? " (#$dupe)." : '.'));
+    }
 
     my $db = dbh();
     $db->begin_work;
@@ -975,9 +980,9 @@ sub check_batch {
                 $r{decoded} = @{ $a->{outputs} || [] } ? 1 : 0;
                 if (my $first = $seen{ $a->{tx_id} }) {
                     $r{error} = "Same transaction as entry $first.";
-                } elsif (my $dupe = tracked_as($a->{tx_id})) {
-                    $r{error} = "Already tracked as #$dupe.";
-                    $r{tracked} = $dupe + 0;
+                } elsif (my ($dupe, $visible) = tracked_as($a->{tx_id})) {
+                    $r{error} = $visible ? "Already tracked as #$dupe." : 'Already tracked.';
+                    $r{tracked} = $dupe + 0 if $visible;
                 }
                 $seen{ $a->{tx_id} } //= $i;
                 $r{ok} = $r{error} ? 0 : 1;
@@ -990,11 +995,12 @@ sub check_batch {
         push @out, \%r;
     }
 
-    # Boxes already being spent by open transactions: a second spender can never confirm.
+    # Boxes already being spent by open transactions the account can see (SPEC I10): a second
+    # spender can never confirm. A spend of the same box is of the same wallet, so its signers see it.
     my %open_spends;
-    my $open = dbh()->selectall_arrayref(q{
+    my $open = dbh()->selectall_arrayref(qq{
         SELECT t.id, (SELECT s.payload_enc FROM submissions s WHERE s.transaction_id = t.id ORDER BY s.id LIMIT 1)
-          FROM transactions t WHERE t.status IN ('commit','sign','complete')});
+          FROM transactions t WHERE t.status IN ('commit','sign','complete') AND $VISIBLE}, undef, $ME->{id});
     for my $row (@$open) {
         my $ids = payload_input_ids(unseal($row->[1], 'submission.payload')) or next;
         $open_spends{$_} //= $row->[0] for @$ids;
