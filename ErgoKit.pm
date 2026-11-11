@@ -826,8 +826,8 @@ sub _choose_outputs {
 }
 
 sub _parse_box_summary {
-    my ($b64) = @_;
-    my $r = _reader(decode_base64($b64));
+    my ($bytes) = @_;
+    my $r = _reader($bytes);
     my %b = (value => _vlq($r));
     $b{address} = address_from_tree(_read_tree($r));
     _vlq($r);    # creation height
@@ -860,7 +860,7 @@ sub payload_input_ids {
 #   format   => 'MSR' | 'CSTX' | 'text'
 #   valid    => 1 if the payload is a well-formed format we understand
 #   tx_id, required, signers, committed, signed, hints (matrix of strings),
-#   outputs, inputs_value, error
+#   outputs, inputs_value, inputs_unverified, error
 sub analyze_payload {
     my ($text) = @_;
     my %res = (format => 'text', valid => 0);
@@ -948,11 +948,22 @@ sub analyze_payload {
     $res{signed}    = $signed // 0;
     $res{signers} //= scalar @{ $hints[0] // [] } || undef;
 
-    # Input value (best effort) from the serialized input boxes.
-    my $boxes = _as_list($d->{boxes});
+    # Input boxes are trusted only when each input has exactly one box whose hash is the id
+    # the input names (SPEC Q10). A box that matches no input is ignored. Otherwise the
+    # request is read as having no boxes: no inputs, no change, outputs not cross-checked.
+    my (%box_of, %matches);
+    for my $b (@{ _as_list($d->{boxes}) }) {
+        next if ref $b || !defined $b;
+        my $bytes = decode_base64($b);
+        my $id = unpack 'H*', blake2b256($bytes);
+        $box_of{$id} = $bytes;
+        $matches{$id}++;
+    }
+    my ($ids, %spent) = ($tx->{input_ids} || []);
+    my $verified = @$ids && !grep { ($matches{$_} // 0) != 1 || $spent{$_}++ } @$ids;
     my ($total, %in_tokens, @in_addr, %by_addr) = (0);
-    for my $b (@$boxes) {
-        my $s = eval { _parse_box_summary($b) } or do { $total = undef; last };
+    for my $id ($verified ? @$ids : ()) {
+        my $s = eval { _parse_box_summary($box_of{$id}) } or do { $verified = 0; last };
         $total += $s->{value};
         $in_tokens{$_} += $s->{tokens}{$_} for keys %{ $s->{tokens} || {} };
         push @in_addr, $s->{address} unless $by_addr{ $s->{address} };
@@ -961,10 +972,10 @@ sub analyze_payload {
         $a->{boxes}++;
         $a->{tokens}{$_} = 1 for keys %{ $s->{tokens} || {} };
     }
+    $res{inputs_unverified} = $verified ? 0 : 1;
     # Pick the output parse that makes sense against the inputs (see _choose_outputs).
     if ($tx->{output_parses}) {
-        my $inputs_known = defined $total && @$boxes;
-        my ($outs, $certain) = _choose_outputs($tx->{output_parses}, ($inputs_known ? $total : undef),
+        my ($outs, $certain) = _choose_outputs($tx->{output_parses}, ($verified ? $total : undef),
             \%in_tokens, $tx->{input_ids}[0]);
         if ($outs) {
             _set_box_ids($outs, $tx->{tx_id});
@@ -975,7 +986,7 @@ sub analyze_payload {
         }
     }
 
-    if (defined $total && @$boxes) {
+    if ($verified) {
         $res{inputs_value}  = "$total";
         $res{inputs_tokens} = [ map { { id => $_, amount => "$in_tokens{$_}" } } sort keys %in_tokens ];
         $res{inputs} = [ map { { address => $_->{address}, value => "$_->{value}", boxes => $_->{boxes},

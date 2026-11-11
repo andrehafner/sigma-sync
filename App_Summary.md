@@ -192,6 +192,10 @@
 - Payload checks understand Minotaur's current (`hints`) and older (`commitments`) formats.
   Only Minotaur multi-sig transactions are supported (their keys are what scopes access).
 - Output decoding is best effort: outputs carrying registers are not decoded (flagged in the UI).
+- The decoded view trusts a request's input boxes only when each input has exactly one box whose
+  hash is the id the input names; a box that matches no input is ignored. Otherwise the inputs
+  are reported as unverified: none are listed, no output is marked as change, and the outputs
+  are marked uncertain, because the starter chooses the boxes a request carries.
 - "Mark as broadcast" is trusted from any signer; the page shows the explorer's on-chain status
   next to it but the server does not verify it.
 - Force-unlock relies on the honesty of two members; votes and overrides are logged.

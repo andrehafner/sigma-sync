@@ -672,6 +672,7 @@ sub act_get_transaction {
             outputs         => $d->{outputs},
             outputs_partial => $d->{outputs_partial} ? 1 : 0,
             outputs_uncertain => $d->{outputs_uncertain} ? 1 : 0,
+            inputs_unverified => ($d->{inputs_unverified} // 1) ? 1 : 0,
             inputs          => $d->{inputs},
             inputs_value    => $d->{inputs_value},
             inputs_tokens   => $d->{inputs_tokens},
@@ -795,7 +796,7 @@ sub update_key_states {
 sub act_analyze {
     my $payload = sanitize_payload(param('payload'));
     my $a = analyze_payload($payload);
-    my %out = map { $_ => $a->{$_} } qw(format valid error warning tx_id required signers committed signed outputs outputs_partial inputs_value minotaur_format);
+    my %out = map { $_ => $a->{$_} } qw(format valid error warning tx_id required signers committed signed outputs outputs_partial inputs_value inputs_unverified minotaur_format);
     if ($a->{input_keys}) {
         my %mine = map { $_ => 1 } @{ my_pks() };
         my @my_keys = grep { $mine{$_} } @{ tx_keys($a) };
