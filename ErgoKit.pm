@@ -25,7 +25,8 @@ use Math::BigInt try => 'GMP';    # pure-Perl fallback works, ~10x slower (~0.9 
 use Exporter 'import';
 our @EXPORT_OK = qw(
     blake2b256 address_decode address_from_tree
-    build_login_request verify_login_response
+    build_login_request verify_login_response verify_nautilus_auth
+    wallet_from_address wallet_from_request wallet_tree
     sanitize_payload analyze_payload compare_hints payload_input_ids
 );
 
@@ -360,6 +361,35 @@ sub verify_login_response {
         : (0, 'Signature check failed. Make sure you signed with the wallet for this address.');
 }
 
+# Verifies the text and proof that Nautilus's auth(address, challenge) returned, with the
+# checks of SPEC L4 in their order. The text is "challenge;host;seconds;random" and the
+# proof is the single-key proof verify_login_response checks, over the text's bytes (L9).
+#   challenge: the stored token; host: SITE_HOST; pk: 33 bytes of the stored address
+#   not_before, not_after: Unix seconds, the challenge's life widened by 300 each side
+# Returns (1) on success or (0, reason).
+sub verify_nautilus_auth {
+    my (%arg) = @_;
+    my $text   = $arg{signed_message} // '';
+    my @fields = split /;/, $text, -1;
+    my $not_nautilus = 'The wallet did not return a Nautilus sign-in text.';
+    return (0, $not_nautilus) unless $text =~ /\A[\x20-\x7e]{1,300}\z/ && @fields == 4;
+    my ($challenge, $host, $seconds, $rand) = @fields;
+
+    return (0, 'This signature is for a different sign-in request. Start again and use the newest request.')
+        unless length $challenge && $challenge eq ($arg{challenge} // '');
+    return (0, 'This signature was made for another site.')
+        unless length $host && $host eq ($arg{host} // '');
+    return (0, 'The time in the signed text is outside the sign-in window. Check the clock of this computer.')
+        unless $seconds =~ /\A[0-9]+\z/ && $seconds >= $arg{not_before} && $seconds <= $arg{not_after};
+    return (0, $not_nautilus) unless $rand =~ /\A[0-9a-fA-F]{64}\z/;
+
+    my $proof = $arg{proof} // '';
+    return (0, 'The wallet did not produce a signature.') unless $proof =~ /\A[0-9a-fA-F]{112}\z/;
+    return schnorr_verify($arg{pk}, $text, pack('H*', $proof))
+        ? (1)
+        : (0, 'Signature check failed. Make sure you signed with the wallet for this address.');
+}
+
 # Verifies a Fiat-Shamir proof for a single ProveDlog(pk) leaf, as produced by Ergo
 # wallets: proof = challenge (24 bytes) || z (32 bytes).
 sub schnorr_verify {
@@ -480,6 +510,95 @@ sub _skip_minotaur_multisig_body {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Multi-sig wallets (SPEC W2)
+# ---------------------------------------------------------------------------
+
+# The Minotaur wallet script from M and the 33-byte keys, which it sorts as Minotaur does
+# (../minotaur-wallet/apps/wallet/src/action/address.ts:22-38). M is a zig-zag int: 2 * M.
+sub wallet_tree {
+    my ($m, $keys) = @_;
+    my @keys = sort @$keys;
+    my $n = @keys;
+    return "\x10" . vlq($n + 1) . "\x04" . vlq(2 * $m) . join('', map { "\x08\xcd$_" } @keys)
+         . "\x98\x73\x00\x83" . vlq($n) . "\x08" . join('', map { "\x73" . vlq($_) } 1 .. $n);
+}
+
+my $NOT_A_WALLET = 'This address is not a Minotaur multi-sig wallet.';
+
+# The longest wallet address (SPEC W2). It is Base58 of a prefix byte, the script and a 4-byte
+# checksum, and Base58 carries log(256)/log(58) characters per byte, so a script longer than
+# this cannot fit in it.
+my $MAX_ADDRESS     = 3000;
+my $MAX_WALLET_TREE = int($MAX_ADDRESS * log(58) / log(256)) + 1 - 5;
+
+# Reads M and the keys from a wallet address on $network. Returns
+# { network, address, m, keys => [hex, in script order] }, or (undef, reason).
+sub wallet_from_address {
+    my ($address, $network) = @_;
+    # Base58 decoding is quadratic here, so the length is checked first. 3,000 characters
+    # hold a wallet of 50 keys and not one of 60.
+    return (undef, "That address is too long (max $MAX_ADDRESS characters).") if length $address > $MAX_ADDRESS;
+    my $info = address_decode($address) or return (undef, 'That is not a valid Ergo address.');
+    return (undef, 'This is the address of a single key. Use the address of the multi-sig wallet.')
+        if $info->{type} eq 'P2PK';
+    return (undef, 'This is a pay-to-script-hash (P2SH) address, which hides its script. Use the address of the multi-sig wallet.')
+        if $info->{type} eq 'P2SH';
+    return (undef, "Use a $network address.") if $info->{network} ne $network;
+
+    my ($m, @keys);
+    eval {
+        my $r = _reader($info->{tree});
+        die "layout\n" unless _u8($r) == 0x10;
+        my $count = _vlq($r);
+        die "layout\n" unless $count >= 2 && _u8($r) == 0x04;
+        my $zigzag = _vlq($r);
+        die "layout\n" if $zigzag & 1;
+        $m = $zigzag / 2;
+        for (2 .. $count) {
+            die "layout\n" unless _take($r, 2) eq "\x08\xcd";
+            push @keys, _take($r, 33);
+        }
+        1;
+    } or return (undef, $NOT_A_WALLET);
+    my $why = _wallet_refusal($m, \@keys);
+    return (undef, $why) if $why;
+    # Whatever follows the keys, and the form of every number, must be what Minotaur writes.
+    return (undef, $NOT_A_WALLET) unless wallet_tree($m, \@keys) eq $info->{tree};
+    return { network => $network, address => $address, m => $m, keys => [ map { unpack 'H*', $_ } @keys ] };
+}
+
+# The checks of W2 on M and the 33-byte keys in script order. Returns a reason, or undef.
+sub _wallet_refusal {
+    my ($m, $keys) = @_;
+    return 'Sigma Sync takes a wallet that needs more than one and fewer than all of its signatures. '
+        . "With M = 1 or M = N it cannot read the signer keys of the wallet's transactions." unless $m > 1 && $m < @$keys;
+    return 'A key in this wallet is not a valid public key.' if grep { !ec_decompress($_) } @$keys;
+    my %seen;
+    return 'A key appears twice in this wallet.' if grep { $seen{$_}++ } @$keys;
+    return 'The keys of this wallet are not in ascending order.' if grep { $keys->[$_] lt $keys->[$_ - 1] } 1 .. $#$keys;
+    return undef;
+}
+
+# The wallet of a request (SPEC W7): every input names the same M and the same keys, and
+# that wallet passes W2. $a is what analyze_payload returns. Returns what
+# wallet_from_address returns for the wallet's address, or undef.
+sub wallet_from_request {
+    my ($a, $network) = @_;
+    my ($keys, $required) = @$a{qw(input_keys input_required)};
+    return undef unless $keys && @$keys;
+    # The script is 10 bytes plus at least 37 per key, so the key count alone refuses a wallet
+    # too long for an address before any key is checked or any address encoded.
+    return undef if 10 + 37 * @{ $keys->[0] } > $MAX_WALLET_TREE;
+    my $shape = join ',', $required->[0], @{ $keys->[0] };
+    return undef if grep { join(',', $required->[$_], @{ $keys->[$_] }) ne $shape } 1 .. $#$keys;
+    my @keys = map { pack 'H*', $_ } @{ $keys->[0] };
+    return undef if _wallet_refusal($required->[0], \@keys);
+    my $address = address_from_tree(wallet_tree($required->[0], \@keys), $network);
+    return undef if length $address > $MAX_ADDRESS;
+    return { network => $network, address => $address, m => $required->[0], keys => [ @{ $keys->[0] } ] };
+}
+
 # --- Register values (sigma constants), read only to skip over them -------------
 # Type codes follow sigmastate's TypeSerializer: primitives 1-9, then Coll, nested
 # Coll, Option, Option[Coll] and pair constructors in blocks of 12, tuples at 96.
@@ -566,9 +685,9 @@ sub _parse_reduced {
     }
 
     # Each input's reduced proposition: a threshold atLeast(M, keys) for multi-sig boxes,
-    # or a single key. Keys are listed in sorted order, which is also the order of
+    # or a single key (M = 1). Keys are listed in sorted order, which is also the order of
     # Minotaur's hint slots.
-    my @input_keys;
+    my (@input_keys, @input_required);
     my $readable = 1;
     for my $i (1 .. $n_in) {
         my $op = _u8($r);
@@ -582,9 +701,11 @@ sub _parse_reduced {
             }
             last unless $readable;
             @tx{qw(required signers)} = ($k, $n) if $i == 1;
+            push @input_required, $k;
         } elsif ($op == 0xcd) {
             push @keys, unpack 'H*', _take($r, 33);
             @tx{qw(required signers)} = (1, 1) if $i == 1;
+            push @input_required, 1;
         } else {
             $readable = 0;
             last;
@@ -592,7 +713,7 @@ sub _parse_reduced {
         _vlq($r);    # cost
         push @input_keys, [ sort @keys ];
     }
-    $tx{input_keys} = \@input_keys if $readable;
+    @tx{qw(input_keys input_required)} = (\@input_keys, \@input_required) if $readable;
 
     # Outputs. Contract trees without a size field cannot be measured without a full
     # ErgoTree parser, so for those every possible length is tried and the one after
@@ -705,8 +826,8 @@ sub _choose_outputs {
 }
 
 sub _parse_box_summary {
-    my ($b64) = @_;
-    my $r = _reader(decode_base64($b64));
+    my ($bytes) = @_;
+    my $r = _reader($bytes);
     my %b = (value => _vlq($r));
     $b{address} = address_from_tree(_read_tree($r));
     _vlq($r);    # creation height
@@ -739,7 +860,7 @@ sub payload_input_ids {
 #   format   => 'MSR' | 'CSTX' | 'text'
 #   valid    => 1 if the payload is a well-formed format we understand
 #   tx_id, required, signers, committed, signed, hints (matrix of strings),
-#   outputs, inputs_value, error
+#   outputs, inputs_value, inputs_unverified, error
 sub analyze_payload {
     my ($text) = @_;
     my %res = (format => 'text', valid => 0);
@@ -786,8 +907,8 @@ sub analyze_payload {
 
     my $tx = eval { _parse_reduced(decode_base64($d->{tx})) };
     unless ($tx) { $res{error} = 'The transaction inside the payload could not be read. It may be truncated.'; return \%res }
-    @res{qw(tx_id required signers outputs outputs_partial input_keys input_ids)}
-        = @$tx{qw(tx_id required signers outputs outputs_partial input_keys input_ids)};
+    @res{qw(tx_id required signers outputs outputs_partial input_keys input_required input_ids)}
+        = @$tx{qw(tx_id required signers outputs outputs_partial input_keys input_required input_ids)};
 
     # Hints: current builds use "hints" (matrix input x signer slot); the oldest builds
     # used "commitments" + "signed".
@@ -827,11 +948,22 @@ sub analyze_payload {
     $res{signed}    = $signed // 0;
     $res{signers} //= scalar @{ $hints[0] // [] } || undef;
 
-    # Input value (best effort) from the serialized input boxes.
-    my $boxes = _as_list($d->{boxes});
+    # Input boxes are trusted only when each input has exactly one box whose hash is the id
+    # the input names (SPEC Q10). A box that matches no input is ignored. Otherwise the
+    # request is read as having no boxes: no inputs, no change, outputs not cross-checked.
+    my (%box_of, %matches);
+    for my $b (@{ _as_list($d->{boxes}) }) {
+        next if ref $b || !defined $b;
+        my $bytes = decode_base64($b);
+        my $id = unpack 'H*', blake2b256($bytes);
+        $box_of{$id} = $bytes;
+        $matches{$id}++;
+    }
+    my ($ids, %spent) = ($tx->{input_ids} || []);
+    my $verified = @$ids && !grep { ($matches{$_} // 0) != 1 || $spent{$_}++ } @$ids;
     my ($total, %in_tokens, @in_addr, %by_addr) = (0);
-    for my $b (@$boxes) {
-        my $s = eval { _parse_box_summary($b) } or do { $total = undef; last };
+    for my $id ($verified ? @$ids : ()) {
+        my $s = eval { _parse_box_summary($box_of{$id}) } or do { $verified = 0; last };
         $total += $s->{value};
         $in_tokens{$_} += $s->{tokens}{$_} for keys %{ $s->{tokens} || {} };
         push @in_addr, $s->{address} unless $by_addr{ $s->{address} };
@@ -840,10 +972,10 @@ sub analyze_payload {
         $a->{boxes}++;
         $a->{tokens}{$_} = 1 for keys %{ $s->{tokens} || {} };
     }
+    $res{inputs_unverified} = $verified ? 0 : 1;
     # Pick the output parse that makes sense against the inputs (see _choose_outputs).
     if ($tx->{output_parses}) {
-        my $inputs_known = defined $total && @$boxes;
-        my ($outs, $certain) = _choose_outputs($tx->{output_parses}, ($inputs_known ? $total : undef),
+        my ($outs, $certain) = _choose_outputs($tx->{output_parses}, ($verified ? $total : undef),
             \%in_tokens, $tx->{input_ids}[0]);
         if ($outs) {
             _set_box_ids($outs, $tx->{tx_id});
@@ -854,7 +986,7 @@ sub analyze_payload {
         }
     }
 
-    if (defined $total && @$boxes) {
+    if ($verified) {
         $res{inputs_value}  = "$total";
         $res{inputs_tokens} = [ map { { id => $_, amount => "$in_tokens{$_}" } } sort keys %in_tokens ];
         $res{inputs} = [ map { { address => $_->{address}, value => "$_->{value}", boxes => $_->{boxes},

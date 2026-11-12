@@ -25,6 +25,18 @@
 
   --radius: 10px;
   --radius-sm: 6px;
+  --space-1: 8px;
+  --space-0: 2px;
+  --space-2: 10px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --text-sm: .82rem;
+  --text-md: 1rem;
+  --chip-size: 24px;
+  --weight-medium: 500;
+  --hit-min: 28px; /* the least height of a link that stands alone in a row (U3 asks 24px) */
+  --pick-size: 24px; /* a checkbox: U3 asks 24px */
   --shadow: 0 1px 2px rgba(20, 18, 14, .06), 0 2px 8px rgba(20, 18, 14, .04);
   --shadow-lg: 0 10px 40px rgba(20, 18, 14, .18);
 
@@ -156,6 +168,7 @@ textarea.payload[readonly] { color: var(--text-2); }
 .field-row { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
 .field-row + .field, .field + .field-row { margin-top: 14px; }
 .check { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+input[type=checkbox] { flex: none; width: var(--pick-size); height: var(--pick-size); margin: 0; accent-color: var(--accent); cursor: pointer; }
 
 /* --- Panels, cards ------------------------------------------------------ */
 .panel {
@@ -184,6 +197,16 @@ textarea.payload[readonly] { color: var(--text-2); }
 .steps li.done { background: var(--accent); }
 .howto { margin: 0 0 14px; padding-left: 20px; color: var(--text-2); }
 .howto li + li { margin-top: 4px; }
+
+/* --- Wallet connector (Nautilus sign-in and link) ----------------------- */
+.or-divider { display: flex; align-items: center; gap: var(--space-3); margin: var(--space-4) 0; color: var(--text-2); font-size: var(--text-sm); }
+.or-divider::before, .or-divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+.wallet-status { margin: 0; padding: var(--space-3) 0; color: var(--text-2); text-align: center; }
+[data-nautilus=body] .hint { color: var(--text-2); }
+.addr-choice { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-1); }
+.addr-option { width: 100%; height: auto; padding: var(--space-2) var(--space-3); justify-content: space-between; gap: var(--space-3); text-align: left; }
+.addr-option code { min-width: 0; font-weight: var(--weight-medium); overflow-wrap: anywhere; }
+.addr-option .tag { flex-shrink: 0; }
 
 /* --- Tabs --------------------------------------------------------------- */
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 20px; overflow-x: auto; }
@@ -246,6 +269,16 @@ textarea.payload[readonly] { color: var(--text-2); }
 .pill-lock { background: var(--error-soft); color: var(--error); }
 .tag { display: inline-block; padding: 1px 7px; border-radius: 4px; background: var(--surface-2); color: var(--text-2); font-size: .76rem; }
 
+/* --- Queue groups ------------------------------------------------------- */
+.group + .group { margin-top: var(--space-5); }
+.group-title { display: flex; align-items: center; gap: var(--space-1); margin: 0 0 var(--space-2); font-size: var(--text-md); }
+.group-count {
+  min-width: var(--chip-size); padding: 0 var(--space-1); border-radius: 999px; background: var(--surface-2); color: var(--text-2);
+  font-size: var(--text-sm); font-weight: 700; line-height: calc(var(--chip-size) - var(--space-0)); text-align: center;
+}
+/* The two groups that hold the signer's own steps stand out, as the tab count does. */
+.group[data-group=commit] .group-count, .group[data-group=sign] .group-count { background: var(--accent-soft); color: var(--accent-strong); }
+
 .progress { display: grid; gap: 8px; }
 .progress-row { display: grid; grid-template-columns: 96px 1fr auto; gap: 10px; align-items: center; font-size: .82rem; color: var(--text-2); }
 .bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
@@ -256,12 +289,13 @@ textarea.payload[readonly] { color: var(--text-2); }
 .empty { text-align: center; padding: 48px 16px; color: var(--text-3); border: 1px dashed var(--border-strong); border-radius: var(--radius); }
 
 /* --- Detail ------------------------------------------------------------- */
-.back { display: inline-flex; gap: 6px; align-items: center; margin-bottom: 12px; color: var(--text-2); text-decoration: none; font-weight: 600; font-size: .9rem; }
+.back { display: inline-flex; gap: 6px; align-items: center; min-height: var(--hit-min); margin-bottom: 12px; color: var(--text-2); text-decoration: none; font-weight: 600; font-size: .9rem; }
 .detail-head { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 18px; }
 .detail-head h1 { margin: 0; overflow-wrap: anywhere; }
-.meta { display: flex; gap: 14px; flex-wrap: wrap; color: var(--text-2); font-size: .86rem; margin-top: 6px; }
+.meta { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; color: var(--text-2); font-size: .86rem; margin-top: 6px; }
+.meta a { display: inline-flex; align-items: center; min-height: var(--hit-min); }
 .detail { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) 400px; align-items: start; }
-@media (max-width: 960px) { .detail { grid-template-columns: 1fr; } .detail-side { order: -1; } }
+@media (max-width: 960px) { .detail { grid-template-columns: minmax(0, 1fr); } .detail-side { order: -1; } }
 .detail-side { position: sticky; top: 72px; }
 .detail > .panel { margin-top: 0; }
 @media (max-width: 960px) { .detail-side { position: static; } }
@@ -280,10 +314,14 @@ textarea.payload[readonly] { color: var(--text-2); }
 .outputs td { padding: 7px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
 .outputs td:last-child { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; padding-left: 12px; }
 .outputs tr:last-child td { border-bottom: 0; }
-.addr { font-family: var(--mono); font-size: .8rem; overflow-wrap: anywhere; }
+.addr { display: inline-flex; align-items: center; min-height: var(--hit-min); font-family: var(--mono); font-size: .8rem; overflow-wrap: anywhere; }
 
 .people { list-style: none; margin: 0; padding: 0; }
-.people li { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: .88rem; }
+.people li { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: .88rem; }
+.people .grow { flex: 1 1 10rem; }
+.rounds { display: grid; flex: none; gap: var(--space-0); margin-left: auto; width: min(14rem, 100%); }
+.round { display: flex; gap: var(--space-3); justify-content: space-between; }
+.round-name { color: var(--text-2); }
 .people li:last-child { border-bottom: 0; }
 .tick { color: var(--success); font-weight: 700; }
 
@@ -358,3 +396,50 @@ table.list tr.inactive td { color: var(--text-3); }
 .tx-details .addr { font-size: .78rem; }
 .verify { font-weight: 700; text-align: center; }
 .error-text { color: var(--error); }
+
+/* --- Wallets ------------------------------------------------------------ */
+.row-link { display: inline-flex; align-items: center; min-height: var(--hit-min); font-weight: var(--weight-medium); overflow-wrap: anywhere; }
+.wallet-address { display: block; margin-bottom: var(--space-2); overflow-wrap: anywhere; }
+
+/* --- Select and review (Q4, Q5) ----------------------------------------- */
+/* A row with a checkbox has less width for the lock pill, which keeps its text on one line elsewhere. */
+.card-row .pill { white-space: normal; overflow-wrap: anywhere; }
+.group-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-1); flex-wrap: wrap; margin: 0 0 var(--space-2); }
+.group-head .group-title { margin: 0; }
+.card-row { display: flex; gap: var(--space-2); align-items: flex-start; min-width: 0; }
+.card-row > .card { flex: 1; min-width: 0; }
+.pick { flex: none; width: var(--pick-size); padding-top: var(--space-3); }
+.card-row.selected > .card { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.why { padding-left: var(--space-1); border-left: 3px solid var(--border-strong); color: var(--text-2); font-size: var(--text-sm); }
+.selection-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-3);
+  margin-bottom: var(--space-4); padding: var(--space-3) var(--space-4);
+  background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--border)); border-radius: var(--radius);
+}
+.select-notes { flex-basis: 100%; margin: 0; padding-left: var(--space-4); color: var(--text-2); font-size: var(--text-sm); }
+.flags { margin: 0; padding-left: var(--space-4); }
+
+/* --- The run and the connect offer (Q5, Q6) ----------------------------- */
+.run-rows { list-style: none; margin: var(--space-4) 0 0; padding: 0; display: grid; gap: var(--space-2); }
+.run-row {
+  display: flex; gap: var(--space-3); align-items: flex-start; justify-content: space-between;
+  padding: var(--space-3) var(--space-4); background: var(--surface);
+  border: 1px solid var(--border); border-radius: var(--radius);
+}
+.run-row[data-state=failed] { border-color: color-mix(in srgb, var(--error) 40%, var(--border)); }
+.run-row .why { margin-top: var(--space-1); overflow-wrap: anywhere; }
+.run-row .pill { flex: none; }
+.pill-run-locked, .pill-run-wallet, .pill-run-submitted { background: var(--info-soft); color: var(--info); }
+.pill-run-done { background: var(--success-soft); color: var(--success); }
+.pill-run-failed { background: var(--error-soft); color: var(--error); }
+.connect-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-3); margin-bottom: var(--space-4); }
+.connect-note { flex-basis: 100%; margin: 0; }
+/* --- The locks the account holds (B7) ------------------------------------ */
+.held-bar { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--space-2) var(--space-3); margin-bottom: var(--space-4); }
+.held-bar .grow { flex: 1 1 16rem; }
+.held-list { list-style: none; margin: var(--space-2) 0 0; padding: 0; display: grid; gap: var(--space-0); }
+.held-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--space-2); }
+.held-list .row-link { color: inherit; text-decoration: underline; }
+.held-note { flex-basis: 100%; margin: 0; }
+/* The hints of the review and the run read at 4.5:1 on the page: --text-3 does not (SPEC U3). */
+.hint.run-hint { color: var(--text-2); }

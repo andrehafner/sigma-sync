@@ -12,12 +12,26 @@
     txs: [],
     wallets: [],
     versions: null,
-    filter: 'active',
+    filter: 'queue',
     search: '',
     detail: null,
     signin: null,
     pollTimer: null,
     qrTimers: new Set(),
+    view: 0, // counts the routes drawn, so a late answer can tell it is stale
+    listSeq: 0, // counts the list fetches, so an older answer can tell a newer one has started
+    runWallet: null, // the context of a connected wallet that passed the B1 and Q7 checks, or null (Q4)
+    selection: new Set(), // ids of the rows picked for a run (Q4). It lives here so a redraw keeps it (Q9).
+    selGroup: '', // the group key of those rows: a selection holds one group
+    selNotes: [], // plain texts that say why the selection is not what the signer asked for
+    acks: new Map(), // id -> the reading of the flagged item that the signer ticked. A different reading drops the tick (Q5).
+    readings: new Map(), // id -> the reading the review screen shows now
+    review: [], // the items the review screen shows now: { id, t } or { id, error }. The confirm reads it (Q5).
+    run: null, // the run in progress or the last one: { kind, ctx, rows, active } (Q6). It lives here so a redraw and a route change keep it (Q9).
+    connect: { ask: false, note: '' }, // ask: the origin is not allowed yet, so the queue offers a connect button. note: what the last click found.
+    held: [], // the locks the account holds, from `held_locks` of the last list answer (B7). Never read from the rows of the list.
+    heldBusy: false, // the action that releases them is running
+    heldNote: '', // what the last release could not do
   };
 
   const MINOTAUR_RELEASES = 'https://github.com/minotaur-ergo/minotaur-wallet/releases';
@@ -134,7 +148,8 @@
   async function api(action, params = {}) {
     const form = new FormData();
     form.append('action', action);
-    if (S.csrf) form.append('csrf', S.csrf);
+    const token = S.csrf;
+    if (token) form.append('csrf', token);
     Object.entries(params).forEach(([k, v]) => {
       if (v !== undefined && v !== null) form.append(k, v);
     });
@@ -146,7 +161,8 @@
       throw new Error('Could not reach the server. Check your connection and try again.');
     }
     if (!data.success) {
-      if (data.signed_out && S.me) {
+      // Only the page's own session can be signed out by this answer: one for an older token changes nothing of the page.
+      if (data.signed_out && S.me && S.csrf === token) {
         S.me = null;
         S.csrf = '';
         renderSignIn();
@@ -479,12 +495,150 @@
   }
 
   // ------------------------------------------------------------------------
+  // Nautilus: sign in or link an address with the browser wallet (SPEC L1 to L3, L6, L8)
+  // ------------------------------------------------------------------------
+  // Everything the wallet returns is untrusted data (I4). Its addresses are shown after a shape
+  // check and escaping. No other text of the wallet reaches the page: a refusal shows a fixed message.
+  const NAUTILUS_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{40,60}$/;
+  const NAUTILUS_MESSAGE = {
+    connect: 'Nautilus did not connect. Unlock Nautilus, approve the connection in its window and try again.',
+    sign: 'Nautilus did not sign the request. Approve it in the Nautilus window and try again.',
+    noRuns: 'Nautilus is connected, but it cannot run transactions for your account here. Open them one at a time.',
+  };
+
+  function nautilusConnector() {
+    const wallet = window.ergoConnector?.nautilus;
+    return typeof wallet?.connect === 'function' ? wallet : null;
+  }
+
+  // Connects and reads both address lists, used and unused. Resolves null when the wallet says no.
+  async function connectNautilus(wallet) {
+    if (!(await wallet.connect({ createErgoObject: false }))) return null;
+    const ctx = await wallet.getContext();
+    const lists = await Promise.all([ctx.get_used_addresses(), ctx.get_unused_addresses()]);
+    const choices = [];
+    lists.forEach((list, i) => {
+      if (!Array.isArray(list)) return;
+      list.forEach((address) => {
+        if (typeof address === 'string' && NAUTILUS_ADDRESS.test(address) && !choices.some((c) => c.address === address)) {
+          choices.push({ address, used: i === 0 });
+        }
+      });
+    });
+    return { ctx, choices };
+  }
+
+  // Runs the Nautilus steps inside `el`: connect, choose an address, ask for a challenge, call auth,
+  // send the text and the proof. `purpose` is 'login' or 'link'. onDone gets the auth_finish reply.
+  // The flow stops quietly when the page has drawn another view over `el`.
+  function mountNautilus(el, { purpose, label, hint, onDone }) {
+    el.innerHTML = '<p class="or-divider" aria-hidden="true">or</p><div class="stack" data-nautilus="body"></div>';
+    const body = $('[data-nautilus=body]', el);
+    const show = (html, focus = true) => {
+      body.innerHTML = html;
+      if (focus) $('[data-focus]', body)?.focus();
+    };
+    const retry = '<button type="button" class="btn btn-block" data-nautilus="retry" data-focus>Try again</button>';
+    const onRetry = () => { $('[data-nautilus=retry]', body).onclick = start; };
+
+    const idle = (focus) => {
+      show(`<button type="button" class="btn btn-block" data-nautilus="start" data-focus>${esc(label)}</button>
+        <p class="hint">${esc(hint)}</p>`, focus);
+      $('[data-nautilus=start]', body).onclick = start;
+    };
+    const wait = (text) => show(`<p class="wallet-status" role="status" tabindex="-1" data-nautilus="status" data-focus>${esc(text)}</p>`);
+    const fail = (message) => {
+      show(`<div class="notice notice-error" data-nautilus="error">${esc(message)}</div>${retry}`);
+      onRetry();
+    };
+    const empty = () => {
+      show(`<div class="notice notice-info" data-nautilus="empty">Nautilus offered no address. Add one in Nautilus, then try again.</div>${retry}`);
+      onRetry();
+    };
+    const choose = (ctx, choices) => {
+      const mine = new Set(purpose === 'link' ? S.me?.addresses : []);
+      const first = choices.findIndex((c) => !mine.has(c.address));
+      show(`<p class="step-label">Choose the address to use</p>
+        <ul class="addr-choice">${choices.map((c, i) => `
+          <li><button type="button" class="btn addr-option" data-nautilus-choice="${i}"${mine.has(c.address) ? ' disabled' : ''}${i === first ? ' data-focus' : ''}>
+            <code>${esc(c.address)}</code><span class="tag">${mine.has(c.address) ? 'Linked' : c.used ? 'Used' : 'Not used yet'}</span></button></li>`).join('')}
+        </ul>
+        <p class="hint">An address that only signs for a multi-sig wallet can be listed as not used yet.</p>
+        <button type="button" class="btn btn-ghost btn-sm" data-nautilus="cancel">Cancel</button>`);
+      $$('[data-nautilus-choice]', body).forEach((btn) => {
+        btn.onclick = () => sign(ctx, choices[Number(btn.dataset.nautilusChoice)].address);
+      });
+      $('[data-nautilus=cancel]', body).onclick = () => idle(true);
+    };
+
+    async function start() {
+      wait('Connecting to Nautilus. Approve the connection in its window if it asks.');
+      let found = null;
+      try {
+        const wallet = nautilusConnector();
+        found = wallet && await connectNautilus(wallet);
+      } catch (e) { /* the wallet refused: one fixed message below */ }
+      if (!el.isConnected) return;
+      if (!found) fail(NAUTILUS_MESSAGE.connect);
+      else if (!found.choices.length) empty();
+      else choose(found.ctx, found.choices);
+    }
+
+    async function sign(ctx, address) {
+      wait('Waiting for Nautilus. Approve the request in its window.');
+      let challenge;
+      try {
+        challenge = (await api('auth_start', { address, purpose, method: 'nautilus' })).challenge;
+      } catch (e) {
+        if (el.isConnected) fail(e.message);
+        return;
+      }
+      if (!el.isConnected) return;
+      let signed = null;
+      try { signed = await ctx.auth(address, challenge); } catch (e) { /* the wallet refused: one fixed message below */ }
+      if (!el.isConnected) return;
+      if (typeof signed?.signedMessage !== 'string' || typeof signed.proof !== 'string') { fail(NAUTILUS_MESSAGE.sign); return; }
+      let reply;
+      try {
+        reply = await api('auth_finish', { challenge, signed_message: signed.signedMessage, proof: signed.proof });
+      } catch (e) {
+        if (el.isConnected) fail(e.message);
+        return;
+      }
+      if (!el.isConnected) return;
+      try {
+        await onDone(reply);
+      } catch (e) {
+        if (el.isConnected) fail(e.message);
+      }
+    }
+
+    idle(false);
+  }
+
+  // The wallet's script can arrive after app.js, so the slot is filled when the connector is there
+  // at draw time and again when the wallet's event fires (L1). A filled slot is never redrawn.
+  let nautilusSlot = null;
+  function offerNautilus(el, options) {
+    const fill = () => {
+      if (!el.firstChild && S.config.nautilus === 1 && nautilusConnector()) mountNautilus(el, options);
+    };
+    nautilusSlot = { el, fill };
+    fill();
+  }
+  window.addEventListener('ergo-wallet:injected', () => {
+    if (nautilusSlot?.el.isConnected) nautilusSlot.fill();
+    if ($('#tx-filter')) checkRunWallet(viewGuard());
+  });
+
+  // ------------------------------------------------------------------------
   // Sign-in
   // ------------------------------------------------------------------------
   function renderSignIn(step = 'address', error = '') {
     stopPolling();
     stopQrTimers();
     $('#user-chip').hidden = true;
+    resetRun();
     const si = S.signin || {};
     app().innerHTML = `
       <section class="signin">
@@ -523,7 +677,14 @@
         </div>
         ${error ? `<div class="notice notice-error">${esc(error)}</div>` : ''}
         <button class="btn btn-primary btn-block" type="submit">Continue</button>
-      </form>`;
+      </form>
+      <div data-nautilus-slot></div>`;
+    offerNautilus($('[data-nautilus-slot]', panel), {
+      purpose: 'login',
+      label: 'Sign in with Nautilus',
+      hint: 'Nautilus asks you to connect, then to sign a one-time request. It is not a payment.',
+      onDone: (r) => startSession(r),
+    });
     $('#address').focus();
     $('#address-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
@@ -562,6 +723,7 @@
   // Routing & shell
   // ------------------------------------------------------------------------
   function route() {
+    S.view += 1;
     if (!S.me) return renderSignIn();
     stopPolling();
     stopQrTimers();
@@ -570,6 +732,11 @@
     if (m) return renderDetail(Number(m[1]));
     if (hash === 'start') return renderStart();
     if (hash === 'batch') return renderBatch();
+    if (hash === 'review') return renderReview();
+    if (hash === 'run') return renderRun();
+    if (hash === 'wallets') return renderWallets();
+    const w = hash.match(/^wallet\/(\d+)$/);
+    if (w) return renderWallet(w[1]);
     if (hash === 'account') return renderAccount();
     if (hash === 'admin' && S.me.is_admin) return renderAdmin();
     return renderList();
@@ -589,6 +756,7 @@
       ['sign', 'Sign Transactions', awaiting],
       ['start', 'Start Transaction'],
       ['batch', 'Start Batch'],
+      ['wallets', 'Wallets'],
       ['account', 'Account'],
       ...(S.me.is_admin ? [['admin', 'Admin']] : []),
     ];
@@ -608,13 +776,16 @@
     S.pollTimer = null;
   }
 
+  // The next tick is armed only while the route that asked for the poll is on screen. An answer that
+  // arrives after a route change must not draw into the new route or start a poll of the old one (Q8).
   function poll(fn, ms) {
     stopPolling();
+    const seq = S.view;
     S.pollTimer = setTimeout(async () => {
       if (document.visibilityState === 'visible') {
         try { await fn(); } catch (e) { /* next tick */ }
       }
-      poll(fn, ms);
+      if (seq === S.view) poll(fn, ms);
     }, ms);
   }
 
@@ -627,19 +798,41 @@
   };
   const isOpen = (t) => t.status === 'commit' || t.status === 'sign';
 
+  // False when a newer fetch has started or the session it started in has ended: that answer is dropped before it changes anything.
+  // The selection is reconciled with every answer that is kept, whether or not a view draws it.
   async function fetchList() {
+    const seq = ++S.listSeq;
+    const session = S.csrf;
     const r = await api('list_transactions');
+    if (seq !== S.listSeq || session !== S.csrf) return false;
     S.txs = r.transactions;
+    S.held = r.held_locks || [];
     S.wallets = r.wallet_names || [];
+    reconcileSelection();
+    return true;
   }
 
   async function renderList() {
+    const live = viewGuard();
     const view = shell('sign');
-    if (!S.txs.length) view.innerHTML = '<div class="loading">Loading transactions…</div>';
-    try { await fetchList(); } catch (e) { view.innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`; return; }
+    // The poll does nothing while a run is open: the run changes the rows, and a fresh list would race its submits (Q9).
+    const refresh = async () => {
+      if (!S.run?.active && await fetchList() && live()) drawList(true);
+    };
+    // A run that is open owns the list: it draws what the page has and asks for nothing until the run ends (Q9).
+    if (S.run?.active) {
+      drawList();
+      poll(refresh, 30000);
+      return;
+    }
+    view.innerHTML = '<div class="loading">Loading transactions…</div>';
+    let fresh;
+    try { fresh = await fetchList(); } catch (e) { if (live()) view.innerHTML = loadError(e.message); return; }
+    if (!fresh || !live()) return;
     if (location.hash.replace(/^#/, '') !== '' && location.hash !== '#sign') return;
     drawList();
-    poll(async () => { await fetchList(); drawList(true); }, 30000);
+    poll(refresh, 30000);
+    checkRunWallet(live);
   }
 
   function progressBars(t) {
@@ -671,9 +864,21 @@
     return '';
   }
 
+  // The groups of the queue, in the order of SPEC Q1. A row is in the first group whose test it meets.
+  // The test reads `status` and `me.can_act` alone, so every signer's page agrees with the server's turn rules.
+  const QUEUE_GROUPS = [
+    ['commit', 'Needs your commitment', (t) => t.status === 'commit' && t.me.can_act],
+    ['sign', 'Needs your signature', (t) => t.status === 'sign' && t.me.can_act],
+    ['waiting', 'Waiting for others', (t) => isOpen(t) && !t.me.can_act],
+    ['ready', 'Ready to broadcast', (t) => t.status === 'complete'],
+  ];
+  // Closed rows stay behind the filter: only the Closed and All filters let any through.
+  const CLOSED_GROUP = ['closed', 'Closed', (t) => t.status === 'broadcast' || t.status === 'cancelled'];
+
   function drawList(keepFocus = false) {
     const view = $('#view');
     if (!view) return;
+    const refocus = keepFocus ? focusSelector() : '';
     const counts = {
       awaiting: S.txs.filter((t) => t.me.awaiting).length,
       active: S.txs.filter(isOpen).length,
@@ -681,15 +886,19 @@
       done: S.txs.filter((t) => t.status === 'broadcast' && (Date.now() - parseTs(t.closed_at)) < 30 * 86400000).length,
     };
     const filters = {
+      queue: (t) => isOpen(t) || t.status === 'complete',
       awaiting: (t) => t.me.awaiting,
       active: isOpen,
       complete: (t) => t.status === 'complete',
-      closed: (t) => t.status === 'broadcast' || t.status === 'cancelled',
+      closed: CLOSED_GROUP[2],
       all: () => true,
     };
     const q = S.search.toLowerCase();
-    const list = S.txs.filter(filters[S.filter] || filters.active).filter((t) => !q
-      || [t.title, t.wallet_name, t.created_by, t.ergo_tx_id, `#${t.id}`].some((v) => (v || '').toLowerCase().includes(q)));
+    const list = S.txs.filter(filters[S.filter] || filters.queue).filter((t) => !q
+      || [t.title, t.wallet?.name, t.created_by, t.ergo_tx_id, `#${t.id}`].some((v) => (v || '').toLowerCase().includes(q)));
+    const groups = [...QUEUE_GROUPS, CLOSED_GROUP]
+      .map(([key, title, test]) => [key, title, list.filter(test)])
+      .filter(([, , rows]) => rows.length);
 
     const stat = (key, value, label, attention) => `
       <button type="button" class="stat ${attention && value ? 'attention' : ''}" data-filter="${key}" aria-pressed="${S.filter === key}">
@@ -708,17 +917,25 @@
         <input type="search" id="tx-search" placeholder="Search title, wallet, creator, TX ID…" value="${esc(searchValue)}" aria-label="Search transactions">
         <span class="spacer"></span>
         <select id="tx-filter" aria-label="Filter">
-          ${[['active', 'In progress'], ['awaiting', 'Waiting on you'], ['complete', 'Ready to broadcast'], ['closed', 'Closed'], ['all', 'All']]
+          ${[['queue', 'Queue'], ['active', 'In progress'], ['awaiting', 'Waiting on you'], ['complete', 'Ready to broadcast'], ['closed', 'Closed'], ['all', 'All']]
             .map(([v, l]) => `<option value="${v}" ${S.filter === v ? 'selected' : ''}>${l}</option>`).join('')}
         </select>
         <a class="btn btn-primary" href="#start">Start transaction</a>
       </div>
-      ${list.length ? `<div class="cards">${list.map(card).join('')}</div>` : `
-        <div class="empty">${S.txs.length ? 'Nothing matches this filter.' : 'No transactions for your wallets yet. They appear here when someone starts one for a multi-sig wallet one of your addresses signs for.'}</div>`}`;
+      ${runBarHtml()}${heldBarHtml()}${connectBarHtml()}${selectionBarHtml()}
+      ${groups.length ? groups.map(([key, title, rows]) => `
+        <section class="group" data-group="${key}" aria-labelledby="group-${key}">
+          ${canPick() && rows.some(selectable) ? `<div class="group-head">${groupHeading(key, title, rows.length)}
+            <button type="button" class="btn btn-sm" data-select-all="${key}" aria-label="Select all in ${esc(title)}">Select all</button></div>`
+            : groupHeading(key, title, rows.length)}
+          <div class="cards">${rows.map((t) => (canPick() ? pickRow(t) : card(t, true, false))).join('')}</div>
+        </section>`).join('') : `
+        <div class="empty" data-queue="empty">${S.txs.length ? 'Nothing matches this filter.' : 'No transactions for your wallets yet. They appear here when someone starts one for a multi-sig wallet one of your addresses signs for.'}</div>`}`;
 
     paintBars(view);
     updateTabCount();
-    if (keepFocus && document.activeElement?.id === 'tx-search') $('#tx-search').focus();
+    // The focus returns without a scroll: a list refresh must not move the page (Q9).
+    if (keepFocus && refocus) $(refocus)?.focus({ preventScroll: true });
     $('#tx-search').addEventListener('input', (ev) => { S.search = ev.target.value; drawList(true); placeCaret(); });
     $('#tx-filter').addEventListener('change', (ev) => { S.filter = ev.target.value; drawList(); });
   }
@@ -730,27 +947,774 @@
     el.setSelectionRange(el.value.length, el.value.length);
   }
 
-  function card(t) {
+  const groupHeading = (key, title, count) => `
+    <h2 class="group-title" id="group-${key}"><span data-group-title>${title}</span> <span class="group-count" data-group-count>${count}</span></h2>`;
+
+  // `showTurn` is false inside a group: the heading already says what the signer owes.
+  // `why` is the reason a row cannot be picked for a run. It stands in for the two lines that say the same.
+  function card(t, showWallet = true, showTurn = true, why = '') {
     const mine = myStatusText(t);
     return `
       <a class="card ${t.me.awaiting ? 'attention' : ''}" href="#tx/${t.id}">
-        ${t.me.awaiting ? `<span class="your-turn">${esc(mine)}</span>` : ''}
+        ${showTurn && t.me.awaiting ? `<span class="your-turn">${esc(mine)}</span>` : ''}
         <div class="card-head">
           <div class="grow">
             <div class="card-title">${esc(t.title)}</div>
-            <div class="card-sub">#${t.id}${t.wallet_name ? ` · ${esc(t.wallet_name)}` : ''} · ${esc(versionLabel(t.minotaur_version))}</div>
+            <div class="card-sub">#${t.id}${showWallet ? ` · ${t.wallet ? esc(walletName(t.wallet)) : 'No wallet'}` : ''} · ${esc(versionLabel(t.minotaur_version))}</div>
           </div>
           ${statusPill(t.status)}
         </div>
         ${isOpen(t) || t.status === 'complete' ? progressBars(t) : ''}
         ${t.lock ? `<div><span class="pill pill-lock">Locked by ${esc(t.lock.mine ? 'you' : t.lock.name)} · ${timeTag(t.lock.since)}</span></div>` : ''}
+        ${why ? `<div class="why" data-why>${esc(why)}</div>` : ''}
         <div class="card-foot">
           <span>By ${esc(t.created_by)} · ${timeTag(t.created_at)}</span>
           <span>Updated ${timeTag(t.updated_at)}</span>
           ${t.comments ? `<span>${t.comments} comment${t.comments > 1 ? 's' : ''}</span>` : ''}
-          ${!t.me.awaiting && mine ? `<span class="tick">${esc(mine)}</span>` : ''}
+          ${!t.me.awaiting && mine && !why ? `<span class="tick">${esc(mine)}</span>` : ''}
+          ${!why && t.status === 'sign' && !t.me.committed ? '<span class="muted">Commitments are closed, so you cannot sign</span>' : ''}
         </div>
       </a>`;
+  }
+
+  // ------------------------------------------------------------------------
+  // Pick rows for a run (SPEC Q4, Q9, B1, B2)
+  // ------------------------------------------------------------------------
+  const RUN_MAX = 20; // B2: one wallet call holds at most 20 items
+  const GROUPS = [...QUEUE_GROUPS, CLOSED_GROUP];
+  const groupOf = (t) => GROUPS.find(([, , test]) => test(t))?.[0];
+  const groupLabel = (key) => GROUPS.find(([k]) => k === key)?.[1] || '';
+  // The server's turn rule (`me.can_act`) and the lock decide, as section 2 of queue-patterns.md has it.
+  const selectable = (t) => !!t.me.can_act && !(t.lock && !t.lock.mine);
+
+  // Why a row cannot be picked, as plain text, or '' when it can.
+  function whyNot(t) {
+    if (selectable(t)) return '';
+    if (t.me.can_act) return `${t.lock.name || 'A co-signer'} holds the lock, taken ${ago(t.lock.since)}.`;
+    if (t.status === 'commit') return t.me.committed ? 'You committed. Waiting for others.' : 'None of your keys has an open commitment slot.';
+    if (t.status === 'sign') return t.me.signed ? 'You signed.' : 'Commitments are closed, so you cannot sign.';
+    return t.status === 'complete' ? 'Nothing left to sign.' : 'This transaction is closed.';
+  }
+
+  function clearSelection() {
+    S.selection.clear();
+    S.acks.clear();
+    S.selGroup = '';
+  }
+
+  // Selecting is on while the wallet passes the checks and no run is open: a run owns the list and the review (Q9).
+  function canPick() {
+    return !!S.runWallet && !S.run?.active;
+  }
+
+  function resetRun() {
+    S.runWallet = null;
+    S.run = null;
+    S.held = [];
+    S.heldBusy = false;
+    S.heldNote = '';
+    S.review = [];
+    S.connect = { ask: false, note: '' };
+    S.selNotes = [];
+    clearSelection();
+  }
+
+  // Run actions need a wallet that passes three checks (SPEC B1, Q7). The page calls `connect()` by itself only when
+  // the origin is allowed already: it never opens a connect window of its own. When it is not, `ask` is true and the
+  // queue offers a button for the signer's click. The context has `multisig` as an own property, with version 1: the
+  // context is frozen but its prototype is not, so a plain read could find a `multisig` any script added there.
+  // One of its addresses belongs to the signed-in account. Any failure of the wallet reads as "no".
+  async function findRunWallet() {
+    const wallet = nautilusConnector();
+    if (!wallet) return { ctx: null, ask: false };
+    try {
+      if (!(await wallet.isAuthorized())) return { ctx: null, ask: true };
+      if (!(await wallet.connect({ createErgoObject: false }))) return { ctx: null, ask: false };
+      const ctx = await wallet.getContext();
+      if (!Object.hasOwn(ctx, 'multisig') || ctx.multisig?.version !== 1) return { ctx: null, ask: false };
+      const lists = await Promise.all([ctx.get_used_addresses(), ctx.get_unused_addresses()]);
+      const mine = S.me?.addresses || [];
+      return { ctx: lists.flat().some((a) => mine.includes(a)) ? ctx : null, ask: false };
+    } catch (e) {
+      return { ctx: null, ask: false };
+    }
+  }
+
+  // Draws the list again only when the answer changes what shows.
+  async function checkRunWallet(live) {
+    const { ctx, ask } = await findRunWallet();
+    if (!live()) return;
+    const changed = !!ctx !== !!S.runWallet || ask !== S.connect.ask;
+    S.runWallet = ctx;
+    S.connect.ask = ask;
+    if (ctx) S.connect.note = '';
+    if (changed) drawList(true);
+  }
+
+  // The signer's click: connect, then the same checks as at load. A "no" shows one fixed message (L8).
+  async function connectRunWallet() {
+    const live = viewGuard();
+    const btn = $('[data-connect-wallet]');
+    if (btn) btn.disabled = true;
+    let granted = false;
+    try { granted = !!(await nautilusConnector()?.connect({ createErgoObject: false })); } catch (e) { /* the wallet said no: the message below */ }
+    if (!live()) return;
+    if (!granted) {
+      S.connect.note = NAUTILUS_MESSAGE.connect;
+    } else {
+      const found = await findRunWallet();
+      if (!live()) return;
+      S.runWallet = found.ctx;
+      S.connect = { ask: found.ask, note: found.ctx ? '' : NAUTILUS_MESSAGE.noRuns };
+    }
+    drawList(true);
+    if (S.runWallet) $('[data-select-all], [data-select]')?.focus({ preventScroll: true });
+  }
+
+  // The queue's offer to connect. The note is the page's own text, never the wallet's.
+  function connectBarHtml() {
+    if (!S.connect.ask && !S.connect.note) return '';
+    return `
+      <section class="notice notice-info connect-bar" data-connect aria-label="Nautilus">
+        <span>Connect Nautilus to select transactions and run them in one go.</span>
+        ${S.connect.ask ? '<button type="button" class="btn btn-sm" data-connect-wallet="1">Connect Nautilus</button>' : ''}
+        ${S.connect.note ? `<p class="connect-note" role="alert" data-connect-note>${esc(S.connect.note)}</p>` : ''}
+      </section>`;
+  }
+
+  // A selector that finds the focused control of the list again after the list is drawn anew (Q9).
+  function focusSelector() {
+    const el = document.activeElement;
+    if (!el || !$('#view')?.contains(el)) return '';
+    for (const attr of ['id', 'data-select', 'data-select-all', 'data-clear-selection', 'data-filter', 'data-connect-wallet', 'data-held-release', 'data-run-action', 'href']) {
+      const value = el.getAttribute(attr);
+      if (value) return attr === 'id' ? `#${CSS.escape(value)}` : `[${attr}="${CSS.escape(value)}"]`;
+    }
+    return '';
+  }
+
+  // Drops the rows that a list answer made unselectable, and says why. Runs when a list answer is kept.
+  function reconcileSelection() {
+    for (const id of [...S.selection]) {
+      const t = S.txs.find((x) => x.id === id);
+      const why = !t ? 'It is no longer in your queue.' : whyNot(t) || (groupOf(t) === S.selGroup ? '' : 'It moved to another group.');
+      if (!why) continue;
+      S.selection.delete(id);
+      S.acks.delete(id);
+      S.selNotes.push(`#${id}${t ? ` ${t.title}` : ''} left your selection. ${why}`);
+    }
+    if (!S.selection.size) S.selGroup = '';
+  }
+
+  function pick(id, on) {
+    const t = S.txs.find((x) => x.id === id);
+    S.selNotes = [];
+    if (!t || whyNot(t)) return drawList(true);
+    if (!on) {
+      S.selection.delete(id);
+      S.acks.delete(id);
+    } else {
+      const group = groupOf(t);
+      if (S.selection.size && S.selGroup !== group) {
+        clearSelection();
+        S.selNotes.push(`Started a new selection in ${groupLabel(group)}. A run covers one group.`);
+      }
+      if (S.selection.size >= RUN_MAX) {
+        S.selNotes.push(`A run holds at most ${RUN_MAX} transactions. Clear one before you add #${id}.`);
+      } else {
+        S.selection.add(id);
+        S.selGroup = group;
+      }
+    }
+    if (!S.selection.size) S.selGroup = '';
+    drawList(true);
+  }
+
+  // "Select all" takes the selectable rows the list shows for the group, up to the cap.
+  function pickAll(group) {
+    const ids = $$(`[data-group="${group}"] [data-select]`).map((el) => Number(el.dataset.select));
+    clearSelection();
+    S.selNotes = [];
+    S.selection = new Set(ids.slice(0, RUN_MAX));
+    S.selGroup = ids.length ? group : '';
+    if (ids.length > RUN_MAX) S.selNotes.push(`Selected the first ${RUN_MAX} of ${ids.length}. A run holds at most ${RUN_MAX} transactions.`);
+    drawList(true);
+  }
+
+  const selNotesHtml = (attr) =>
+    S.selNotes.length ? `<ul class="select-notes" ${attr}>${S.selNotes.map((m) => `<li>${esc(m)}</li>`).join('')}</ul>` : '';
+
+  function selectionBarHtml() {
+    const n = S.selection.size;
+    if (!n && !S.selNotes.length) return '';
+    return `
+      <section class="selection-bar" data-selection aria-label="Selection">
+        ${n && S.runWallet ? `<strong data-select-count>${n} selected</strong> <span class="muted">in ${esc(groupLabel(S.selGroup))}</span>
+          <span class="spacer"></span>
+          <a class="btn btn-primary btn-sm" href="#review">Review</a>
+          <button type="button" class="btn btn-sm" data-clear-selection="1">Clear</button>` : ''}
+        ${n && !S.runWallet ? `<p class="muted" data-wallet-away>Your wallet is not available, so run actions are hidden. Your selection of ${n} stays.</p>` : ''}
+        ${selNotesHtml('data-select-note')}
+      </section>`;
+  }
+
+  // The checkbox sits outside the card: a control inside a link is not valid markup.
+  function pickRow(t) {
+    const why = whyNot(t);
+    const on = S.selection.has(t.id);
+    return `
+      <div class="card-row ${on ? 'selected' : ''}">
+        <span class="pick">${why ? '' : `<input type="checkbox" data-select="${t.id}" ${on ? 'checked' : ''} aria-label="Select #${t.id} ${esc(t.title)}">`}</span>
+        ${card(t, true, false, why)}
+      </div>`;
+  }
+
+  // ------------------------------------------------------------------------
+  // Review before a run (SPEC Q5)
+  // ------------------------------------------------------------------------
+  // The review reads the newest list first, so an id that the list no longer holds never gets an item. A fetch
+  // started here also makes an older list answer that is still on its way drop itself (listSeq).
+  async function renderReview() {
+    const live = viewGuard();
+    const view = shell('sign');
+    const back = '<a class="back" href="#">← Back to the queue</a>';
+    if (S.run?.active) {
+      view.innerHTML = `${back}
+        <p class="muted" data-review-blocked>A run is open. Review a new selection after it ends. <a href="#run">View run</a></p>`;
+      return;
+    }
+    S.review = [];
+    if (S.selection.size) {
+      view.innerHTML = '<div class="loading">Loading the review…</div>';
+      try { await fetchList(); } catch (e) { if (live()) view.innerHTML = back + loadError(e.message); return; }
+      if (!live()) return;
+    }
+    const ids = [...S.selection];
+    if (!ids.length) {
+      view.innerHTML = `${back}
+        <div class="empty" data-review-empty>Nothing is selected. Pick transactions in the queue to review them.</div>
+        ${selNotesHtml('data-review-note')}`;
+      return;
+    }
+    const items = await Promise.all(ids.map(async (id) => {
+      try { return { id, t: (await api('get_transaction', { id })).transaction }; } catch (e) { return { id, error: e.message }; }
+    }));
+    if (live()) drawReview(items);
+  }
+
+  function drawReview(items) {
+    const view = $('#view');
+    if (!view) return;
+    // A tick holds for the reading the signer saw. Boxes can change with the Ergo transaction id the same, so compare all of the decoded view.
+    S.readings = new Map(items.filter((i) => i.t).map((i) => [i.id, JSON.stringify([i.t.review, i.t.ergo_tx_id])]));
+    for (const [id, seen] of S.acks) if (S.readings.has(id) && S.readings.get(id) !== seen) S.acks.delete(id);
+    S.review = items;
+    view.innerHTML = `
+      <a class="back" href="#">← Back to the queue</a>
+      <h1>Review ${items.length} transaction${items.length === 1 ? '' : 's'}</h1>
+      <p class="muted">${esc(groupLabel(S.selGroup))}. Decoded by Sigma Sync from each request. Your wallet shows its own review of every item.
+        Your selection stays in the queue.</p>
+      ${selNotesHtml('data-review-note')}
+      <div class="stack" data-review-list>${items.map(reviewItemHtml).join('')}</div>
+      <div class="row mt-16">
+        <button type="button" class="btn btn-primary" data-run-confirm aria-describedby="run-hint"></button>
+        <a class="btn" href="#">Back to the queue</a>
+        ${items.some((i) => i.error) ? '<button type="button" class="btn" data-retry>Try again</button>' : ''}
+      </div>
+      <p class="hint run-hint" id="run-hint" data-run-hint></p>`;
+    fillTokenNames(view);
+    syncConfirm();
+  }
+
+  // Why the run cannot start yet, as plain text, or '' when it can (Q5, Q6).
+  function confirmBlock() {
+    if (S.run?.active) return 'A run is already open. It must end first.';
+    if (S.heldBusy) return 'Wait until the locks are released. The list is still giving them back.';
+    if (S.run?.rows.some((r) => r.held)) return 'A lock of the last run may still be held. Release the locks of the last run first.';
+    if (!S.runWallet) return 'Your wallet is not available, so a run cannot start.';
+    if (!S.review.length || S.review.some((i) => i.error)) return 'Every transaction must load first. Use Try again.';
+    const open = S.review.filter((i) => reviewFlags(i.t).length && !S.acks.has(i.id)).length;
+    return open ? `Tick the warning of ${open} transaction${open === 1 ? '' : 's'} to turn this on.` : '';
+  }
+
+  // The one confirm. It stays off until every flagged item has its tick, and the page says what is missing.
+  function syncConfirm() {
+    const btn = $('[data-run-confirm]');
+    if (!btn) return;
+    const why = confirmBlock();
+    btn.disabled = !!why;
+    btn.textContent = `Confirm and ${S.selGroup === 'sign' ? 'sign' : 'commit'} ${S.review.length}`;
+    $('[data-run-hint]').textContent = why || 'Your wallet shows its own review of the list and asks once.';
+  }
+
+  // What makes an item need its own tick (Q5): the server's doubts about its reading, and a payment to a contract.
+  function reviewFlags(t) {
+    const r = t.review;
+    if (!r) return [['No decoded view', 'Sigma Sync has no decoded view of this transaction.']];
+    const flags = [];
+    if (r.inputs_unverified) flags.push(['unverified', 'Inputs unverified', 'The input boxes of this request do not match the inputs it spends, so no amount is cross-checked.']);
+    if (r.outputs_partial) flags.push(['partial', 'Outputs partial', 'Sigma Sync could not read every output.']);
+    if (r.outputs_uncertain) flags.push(['uncertain', 'Outputs uncertain', 'Some outputs pay to contracts Sigma Sync cannot read fully, or could not be cross-checked against the inputs.']);
+    else if ((r.outputs || []).some((o) => o.is_contract)) flags.push(['contract', 'Pays to a smart contract', 'Check the contract in your wallet.']);
+    return flags;
+  }
+
+  function reviewSendHtml(o) {
+    return `
+      <div class="send" data-review-send>
+        <div class="send-amount">${esc(erg(o.value))}</div>
+        ${(o.tokens || []).map((tk) => `<div class="token-line">${tokenHtml(tk.id, tk.amount)}</div>`).join('')}
+        <div class="small muted mt-8">to ${o.to_input_address ? '<span class="tag">same address it spends from</span>'
+          : o.is_multisig ? '<span class="tag">multi-sig address</span>'
+          : o.is_contract ? '<span class="tag">smart contract</span>' : ''}</div>
+        <div class="mono anywhere" data-review-to>${esc(o.address)}</div>
+      </div>`;
+  }
+
+  function reviewItemHtml({ id, t, error }) {
+    if (error) {
+      return `<section class="panel" data-review-item="${id}"><div class="notice notice-error">Could not load #${id}: ${esc(error)}</div></section>`;
+    }
+    const outputs = t.review?.outputs || [];
+    const sends = outputs.filter((o) => !o.is_fee && !o.is_change);
+    const fee = outputs.filter((o) => o.is_fee).reduce((n, o) => n + BigInt(o.value), 0n).toString();
+    const flags = reviewFlags(t);
+    const gone = whyNot(t);
+    return `
+      <section class="panel" data-review-item="${id}" aria-labelledby="review-${id}">
+        <div class="card-head">
+          <div class="grow">
+            <h2 id="review-${id}"><a class="row-link" href="#tx/${id}">${esc(t.title)}</a></h2>
+            <div class="meta">
+              <span>#${id}</span>
+              <span data-review-wallet>${t.wallet ? esc(walletName(t.wallet)) : 'No wallet'}</span>
+              <span data-review-m>${esc(t.signers_required)} of ${esc(t.signers_total)} signatures</span>
+            </div>
+          </div>
+          ${statusPill(t.status)}
+        </div>
+        ${gone ? `<div class="notice notice-error small mt-12" data-review-gone>It cannot be run now. ${esc(gone)}</div>` : ''}
+        <h3 class="mt-16">Pays</h3>
+        ${!outputs.length ? '<p class="small muted">Sigma Sync could not read the outputs.</p>'
+          : sends.length ? sends.map(reviewSendHtml).join('') : '<p class="small muted">Nothing leaves the wallet except the fee.</p>'}
+        <dl class="kv mt-12"><dt>Network fee</dt><dd data-review-fee>${outputs.length ? esc(erg(fee)) : 'Unknown'}</dd></dl>
+        ${t.ergo_tx_id ? `<p class="small mt-12">Ergo transaction ID <code class="anywhere" data-review-txid>${esc(t.ergo_tx_id)}</code></p>` : ''}
+        ${flags.length ? `
+          <div class="notice notice-warning mt-12" data-review-flags>
+            <ul class="flags">${flags.map(([key, label, text]) => `<li data-flag="${esc(key)}"><strong>${esc(label)}.</strong> ${esc(text)}</li>`).join('')}</ul>
+            <label class="check mt-8"><input type="checkbox" data-ack="${id}" ${S.acks.has(id) ? 'checked' : ''}>
+              I have read ${flags.length > 1 ? 'these warnings' : 'this warning'} for #${id}.</label>
+          </div>` : ''}
+      </section>`;
+  }
+
+  // ------------------------------------------------------------------------
+  // Run the selection (SPEC Q5, Q6, Q9, B2, B3, B6, B8, I4, I6)
+  // ------------------------------------------------------------------------
+  // The page reads each item, locks the ones whose lock it does not hold, makes one wallet call and submits each
+  // answer. The server's submit checks decide what is stored (I6): the page works out no status. Everything the wallet
+  // returns is untrusted: the page reads five fields of a result, shows its text as text and submits only an MSR (B8).
+  // It never asks the wallet for a nonce or a key (B5).
+  const RUN_STATE = { waiting: 'Waiting', locked: 'Lock taken', wallet: 'In the wallet', submitted: 'Submitted', done: 'Done', failed: 'Failed' };
+  const WALLET_CODE = {
+    declined: 'You declined it in the wallet.',
+    refused: 'The wallet refused this item.',
+    wallet_locked: 'The wallet is locked. Unlock it and retry.',
+    unsupported: 'The wallet cannot handle this request.',
+  };
+  const WALLET_FAILED = 'The wallet did not finish this item.';
+  const WALLET_BROKEN = 'The wallet call failed, or its answer did not match what was sent. Nothing was submitted.';
+  const NOT_MSR = 'The wallet answered with something that is not a signed request, so it was not sent to the server.';
+  const CHANGED = 'This transaction changed since you reviewed it, so nothing was sent to the wallet. Select it again and review it.';
+  const STOPPED = 'The run stopped before this item finished.';
+  const LOCK_LEFT = 'The lock may still be held.';
+  // The refusal of `release_lock` when the account holds no lock (api.pl, act_release_lock). It is the one answer that proves a lock is gone.
+  const NOT_HELD = 'You do not hold the lock on this transaction.';
+
+  // B8: a request is an MSR when it is {"MSR": "<json text of an object>"} and nothing else.
+  function isMsr(text) {
+    if (typeof text !== 'string') return false;
+    try {
+      const outer = JSON.parse(text);
+      const keys = outer && typeof outer === 'object' ? Object.keys(outer) : [];
+      if (keys.length !== 1 || keys[0] !== 'MSR' || typeof outer.MSR !== 'string') return false;
+      const inner = JSON.parse(outer.MSR);
+      return !!inner && typeof inner === 'object' && !Array.isArray(inner);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // The wallet's answer as a plain list of the five fields the page reads, or null when it is not the list the call
+  // asked for: same length, same order, same ids (B3). `ok` counts only as the boolean true.
+  function readAnswers(list, rows) {
+    try {
+      if (!Array.isArray(list) || list.length !== rows.length) return null;
+      const out = [];
+      for (const [i, row] of rows.entries()) {
+        const { id, ok, request, code, message } = list[i];
+        if (id !== String(row.id)) return null;
+        out.push({ ok: ok === true, request, code, message });
+      }
+      return out;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // What the signer confirmed: the Ergo transaction and what the server decoded from it. A co-signer's honest step turns a
+  // CSR into an MSR, so the two format fields stay out: an added commitment does not invalidate a review (F1).
+  function readingOf(t) {
+    const { format, minotaur_format: shape, ...seen } = t.review || {};
+    return JSON.stringify([seen, t.ergo_tx_id]);
+  }
+
+  function startRun() {
+    if (confirmBlock()) return;
+    const rows = S.review.map(({ id, t }) => ({
+      id, title: t.title, state: 'waiting', own: false, text: '', kept: null, reason: '', detail: '', note: '',
+      held: false, // the account may hold this item's lock: asked for, or its own. Only the server's answer clears it.
+      count: 0, // the release count of that lock: the `seq` of its release (B7). Set whenever `held` is.
+      reading: readingOf(t), // the reading the signer confirmed. The locked request must decode to the same one.
+    }));
+    const run = { kind: S.selGroup === 'sign' ? 'sign' : 'commit', ctx: S.runWallet, rows, active: false };
+    S.run = run;
+    clearSelection();
+    S.selNotes = [];
+    location.hash = '#run';
+    runRound(run, rows);
+  }
+
+  function retryRun() {
+    const run = S.run;
+    if (run && !run.active && !S.heldBusy) runRound(run, run.rows.filter((r) => r.state === 'failed'));
+  }
+
+  // Gives one lock back by its count (B7). Only the server's own answer settles it: a release that went through, or
+  // its refusal that the account holds no lock. Any other failure (a lost answer, a server error) leaves the lock
+  // possibly held, and the row says so.
+  async function freeLock(row) {
+    if (!row.held) return;
+    try {
+      await api('release_lock', { id: row.id, seq: row.count });
+    } catch (e) {
+      if (e.message !== NOT_HELD) {
+        row.note = `${LOCK_LEFT} ${e.message}`;
+        return;
+      }
+    }
+    row.held = false;
+    row.note = '';
+  }
+
+  // The one exit of a round, whatever way it ended: a row that did not finish fails, and every lock that may be held goes back.
+  // A session that ended has no way to release anything: the locks stay until the signer returns.
+  async function giveBack(run, rows) {
+    for (const row of rows) {
+      if (S.run !== run) return;
+      if (row.state !== 'done' && row.state !== 'failed') Object.assign(row, { state: 'failed', reason: STOPPED });
+      await freeLock(row);
+    }
+  }
+
+  // Asks the server again for every lock the run may still hold. It calls no wallet.
+  async function releaseHeld() {
+    const run = S.run;
+    if (!run || run.active || S.heldBusy) return;
+    run.active = true;
+    run.releasing = true;
+    drawRun(run);
+    try {
+      await giveBack(run, run.rows);
+    } finally {
+      run.releasing = false;
+      endRun(run);
+    }
+  }
+
+  // One round over `rows`: the first run, or a retry of the failed ones. The run stops quietly when the session ended
+  // (S.run is gone then): the locks stay until the signer returns.
+  async function runRound(run, rows) {
+    run.active = true;
+    rows.forEach((row) => Object.assign(row, { state: 'waiting', reason: '', detail: '', note: '' }));
+    drawRun(run);
+    try {
+      await runItems(run, rows);
+    } finally {
+      await giveBack(run, rows);
+      endRun(run);
+    }
+  }
+
+  async function runItems(run, rows) {
+    const alive = () => S.run === run;
+    const draw = () => drawRun(run);
+    const fail = (row, reason, detail = '') => {
+      Object.assign(row, { state: 'failed', reason, detail });
+      draw();
+    };
+    // Sends one answer. A refusal keeps the answer for a retry and gives the lock back (Q6).
+    const send = async (row, request) => {
+      row.state = 'submitted';
+      draw();
+      try {
+        await api('submit', { id: row.id, payload: request });
+        if (!alive()) return;
+        row.kept = null;
+        row.held = false; // the server clears the lock with the stored step
+        row.state = 'done';
+        draw();
+      } catch (e) {
+        if (!alive()) return;
+        row.kept = { request, sent: row.text };
+        fail(row, e.message);
+        await freeLock(row);
+      }
+    };
+
+    // One item after another: read it, then lock it unless the account holds its lock already (boundary 3).
+    const locked = [];
+    for (const row of rows) {
+      try {
+        const t = (await api('get_transaction', { id: row.id })).transaction;
+        if (!alive()) return;
+        row.own = !!t.lock?.mine;
+        row.held = row.own; // the server's answer about this account's lock
+        // The release count (B7): the `seq` of the lock this run asks for, or the count before the own lock it adopted.
+        row.count = row.own ? t.lock_seq - 1 : t.lock_seq;
+        let got = t;
+        if (!row.own) {
+          row.held = true; // asked for: the lock may be taken even when its answer never arrives
+          got = (await api('lock', { id: row.id, seq: t.lock_seq })).transaction;
+          if (!alive()) return;
+        }
+        if (readingOf(got) !== row.reading) {
+          // The signer confirmed another reading. This request never reaches the wallet.
+          row.kept = null;
+          fail(row, CHANGED);
+          await freeLock(row);
+          if (!alive()) return;
+        } else if (typeof got.payload?.text === 'string') {
+          row.text = got.payload.text;
+          row.state = 'locked';
+          locked.push(row);
+          draw();
+        } else {
+          fail(row, 'The server sent no request for this transaction.');
+          await freeLock(row);
+          if (!alive()) return;
+        }
+      } catch (e) {
+        if (!alive()) return;
+        fail(row, e.message);
+        await freeLock(row);
+        if (!alive()) return;
+      }
+    }
+
+    // The retry rule (Q6): the kept answer goes to the server when the stored request is the one the wallet got.
+    // Otherwise the wallet is asked again.
+    const reuse = locked.filter((r) => r.kept && r.kept.sent === r.text);
+    const ask = locked.filter((r) => !reuse.includes(r));
+    ask.forEach((r) => { r.kept = null; });
+    for (const row of reuse) {
+      await send(row, row.kept.request);
+      if (!alive()) return;
+    }
+    if (!ask.length) return;
+
+    ask.forEach((r) => { r.state = 'wallet'; });
+    draw();
+    let list = null;
+    // The wallet contract's `id` is a string (B2): the wallet refuses a number before it opens its window.
+    try { list = await run.ctx.multisig[run.kind](ask.map((r) => ({ id: String(r.id), request: r.text }))); } catch (e) { /* the call failed: every row of it fails below */ }
+    if (!alive()) return;
+    const answers = readAnswers(list, ask);
+    if (!answers) {
+      ask.forEach((row) => fail(row, WALLET_BROKEN));
+      for (const row of ask) {
+        await freeLock(row);
+        if (!alive()) return;
+      }
+      return;
+    }
+    for (const [i, row] of ask.entries()) {
+      const a = answers[i];
+      if (a.ok && isMsr(a.request)) {
+        await send(row, a.request);
+      } else {
+        row.kept = null;
+        if (a.ok) fail(row, NOT_MSR);
+        else fail(row, typeof a.code === 'string' && Object.hasOwn(WALLET_CODE, a.code) ? WALLET_CODE[a.code] : WALLET_FAILED,
+          typeof a.message === 'string' ? a.message.slice(0, 300) : '');
+        await freeLock(row);
+      }
+      if (!alive()) return;
+    }
+  }
+
+  // The round is over: the summary shows, and a queue on screen reads the list again.
+  async function endRun(run) {
+    if (S.run !== run) return;
+    run.active = false;
+    drawRun(run);
+    $('[data-run-status]')?.focus();
+    if (!$('#tx-filter')) return;
+    const live = viewGuard();
+    try { if (await fetchList() && live()) drawList(true); } catch (e) { /* the next visit reads it */ }
+  }
+
+  function runAction(action) {
+    if (action === 'retry') retryRun();
+    if (action === 'release') releaseHeld();
+    if (action === 'dismiss' && S.run && !S.run.active && !S.run.rows.some((r) => r.held)) {
+      S.run = null;
+      drawList(true);
+    }
+  }
+
+  const runCounts = (run) => ({
+    total: run.rows.length,
+    done: run.rows.filter((r) => r.state === 'done').length,
+    failed: run.rows.filter((r) => r.state === 'failed').length,
+    held: run.rows.filter((r) => r.held).length,
+  });
+  const heldText = (n) => (n ? ` ${n} lock${n === 1 ? '' : 's'} may still be held.` : '');
+
+  const runRowHtml = (r) => `
+    <li class="run-row" data-run-row="${r.id}" data-state="${r.state}">
+      <div class="grow">
+        <a class="row-link" href="#tx/${r.id}">${esc(r.title)}</a>
+        <div class="small muted">#${r.id}</div>
+        ${r.reason ? `<div class="why" data-run-reason>${esc(r.reason)}</div>` : ''}
+        ${r.detail ? `<div class="why" data-run-message>${esc(`The wallet said: ${r.detail}`)}</div>` : ''}
+        ${r.note ? `<div class="${r.held ? 'why' : 'small muted'}" data-run-note>${esc(r.note)}</div>` : ''}
+      </div>
+      <span class="pill pill-run-${r.state}" data-run-state>${RUN_STATE[r.state]}</span>
+    </li>`;
+
+  function renderRun() {
+    const view = shell('sign');
+    if (!S.run) {
+      view.innerHTML = `<a class="back" href="#">← Back to the queue</a>
+        <div class="empty" data-run-empty>There is no run to show. Select transactions in the queue, review them and confirm.</div>`;
+      return;
+    }
+    view.innerHTML = '<div data-run-root></div>';
+    drawRun(S.run);
+  }
+
+  // The run's state lives in S.run. The view only shows it, so a redraw, a route change or a return loses nothing (Q9).
+  function drawRun(run) {
+    const root = $('[data-run-root]');
+    if (!root || S.run !== run) return;
+    const refocus = focusSelector();
+    const { total, done, failed, held } = runCounts(run);
+    const text = run.releasing ? 'Giving the locks back.'
+      : !run.active ? `Run finished. ${done} done${failed ? `, ${failed} failed` : ''}.${heldText(held)}`
+      : run.rows.some((r) => r.state === 'wallet') ? 'Waiting for your wallet. Approve the list in its window. It shows its own review of every item.'
+      : `Working through the list: ${done + failed} of ${total} finished.`;
+    root.innerHTML = `
+      <a class="back" href="#">← Back to the queue</a>
+      <h1>${run.kind === 'sign' ? 'Sign' : 'Commit'} ${total} transaction${total === 1 ? '' : 's'}</h1>
+      <div class="notice notice-${run.active ? 'info' : failed || held ? 'warning' : 'success'}" role="status" tabindex="-1"
+        data-run-status data-phase="${run.active ? 'running' : 'done'}">${esc(text)}</div>
+      ${run.active ? '<p class="hint run-hint">You can leave this page. The run goes on, and the queue links back to it.</p>' : ''}
+      <ul class="run-rows" data-run-rows>${run.rows.map(runRowHtml).join('')}</ul>
+      ${!run.active && (failed || held) ? `<div class="row mt-16">
+        ${failed ? `<button type="button" class="btn btn-primary" data-run-action="retry" ${S.heldBusy ? 'disabled' : ''}>Retry ${failed} failed</button>` : ''}
+        ${held ? `<button type="button" class="btn ${failed ? '' : 'btn-primary'}" data-run-action="release" ${S.heldBusy ? 'disabled' : ''}>Release ${held} lock${held === 1 ? '' : 's'}</button>` : ''}
+      </div>` : ''}`;
+    if (refocus) $(refocus)?.focus({ preventScroll: true });
+  }
+
+  // The queue's way back to a run that is open or just ended.
+  function runBarHtml() {
+    if (!S.run) return '';
+    const { done, failed, held } = runCounts(S.run);
+    return `
+      <section class="selection-bar" data-run-bar aria-label="Run">
+        ${S.run.active ? '<strong>A run is open.</strong> <span class="muted">The list refreshes when it ends.</span>'
+          : `<strong>Last run:</strong> <span>${done} done${failed ? `, ${failed} failed` : ''}.${heldText(held)}</span>`}
+        <span class="spacer"></span>
+        <a class="btn btn-primary btn-sm" href="#run">View run</a>
+        ${S.run.active || held ? '' : '<button type="button" class="btn btn-sm" data-run-action="dismiss">Dismiss</button>'}
+      </section>`;
+  }
+
+  // The locks the account holds, from `held_locks` of the list answer and never from the rows of the list, which stop
+  // at 500 (B7). Nothing shows when there are none, and nothing while the page's own run is open: that run owns its
+  // locks and gives them back itself. While the action runs its button is off, and a failure shows as text (U5).
+  function heldBarHtml() {
+    const n = S.held.length;
+    if (!n || S.run?.active) return '';
+    const s = n === 1 ? '' : 's';
+    return `
+      <section class="notice notice-warning held-bar" data-held-locks aria-label="Locks you hold">
+        <div class="grow">
+          <strong>You hold ${n} lock${s}.</strong> A lock keeps your co-signers from taking their turn until you submit or release it.
+          <ul class="held-list">${S.held.map((h) => `
+            <li data-held-lock="${h.id}">
+              <a class="row-link" href="#tx/${h.id}">${esc(h.title)}</a>
+              <span class="small">#${h.id}${h.wallet?.name ? ` · ${esc(h.wallet.name)}` : ''}${h.lock?.since ? ` · taken ${esc(ago(h.lock.since))}` : ''}</span>
+            </li>`).join('')}</ul>
+        </div>
+        <button type="button" class="btn btn-sm" data-held-release="1" ${S.heldBusy ? 'disabled' : ''}>${S.heldBusy ? 'Releasing…' : `Release ${n} lock${s}`}</button>
+        ${S.heldNote ? `<p class="held-note" role="alert" data-held-note>${esc(S.heldNote)}</p>` : ''}
+      </section>`;
+  }
+
+  // One release for each lock the view shows, by count: `seq` is the entry's `lock_seq` less 1. The view can be one poll
+  // old, and a release by count clears only a lock the view showed, never one the signer took after that in another tab.
+  // A refusal that the account holds no lock means the lock is gone already. Then the list is read again.
+  // The action belongs to the session it started in (the CSRF token names it). A session that ended is a different
+  // account state: after every wait the action stops and changes nothing, for the sign-in screen and a new session own the page.
+  async function releaseListedLocks() {
+    if (S.heldBusy || S.run?.active || !S.held.length) return;
+    const live = viewGuard();
+    const shown = S.held;
+    const session = S.csrf;
+    const ended = () => S.csrf !== session;
+    setHeldBusy(true);
+    S.heldNote = '';
+    drawList(true);
+    let released = 0;
+    let failed = '';
+    for (const h of shown) {
+      if (ended()) return;
+      try {
+        await api('release_lock', { id: h.id, seq: h.lock_seq - 1 });
+        released++;
+      } catch (e) {
+        if (ended()) return; // the locks stay until the signer returns
+        if (e.message !== NOT_HELD) failed ||= e.message;
+      }
+    }
+    if (ended()) return;
+    S.heldNote = failed ? `Some locks were not released. ${failed}` : '';
+    let fresh = false;
+    try { fresh = await fetchList(); } catch (e) { /* the view draws what the page has */ }
+    if (ended()) return;
+    // Only now can a run start again: until the list is read, the action still writes to the page's state.
+    setHeldBusy(false);
+    if (!failed) {
+      // The message reports what the server confirmed. A refusal that the account holds no lock does not say that no newer
+      // lock is held: only a fresh `held_locks` answer says what is left. Without one, the page does not know.
+      const count = (n) => `${n} lock${n === 1 ? '' : 's'}`;
+      const left = S.held.length;
+      toast(!fresh ? `${count(released)} released. The locks that are left could not be checked.`
+        : left ? `${count(released)} released. ${count(left)} still held.`
+          : released ? `${count(released)} released.` : 'No lock was left to release.', 'success');
+    }
+    if (live()) drawList(true);
+  }
+
+  // The action that releases the listed locks and a run never overlap: a run adopts or takes locks, and the action's
+  // releases would clear them. The confirm, Retry and the run's Release wait until the action ends.
+  function setHeldBusy(busy) {
+    S.heldBusy = busy;
+    syncConfirm();
+    if (S.run) drawRun(S.run);
   }
 
   // ------------------------------------------------------------------------
@@ -1103,20 +2067,25 @@
   // Transaction detail
   // ------------------------------------------------------------------------
   async function renderDetail(id) {
+    const live = viewGuard();
     const view = shell('sign');
     view.innerHTML = '<div class="loading">Loading…</div>';
     try {
       const r = await api('get_transaction', { id });
+      if (!live()) return;
       S.detail = r.transaction;
     } catch (e) {
-      view.innerHTML = `<a class="back" href="#">← All transactions</a><div class="notice notice-error">${esc(e.message)}</div>`;
+      if (live()) view.innerHTML = `<a class="back" href="#">← All transactions</a>${loadError(e.message)}`;
       return;
     }
     drawDetail();
-    // Refresh while someone else holds the lock or it is idle; never while you are mid-turn.
+    // Refresh while someone else holds the lock or it is idle; never while you are mid-turn. An answer is
+    // dropped when the route has changed or when a newer answer (a lock, a submit) set the transaction meanwhile.
     poll(async () => {
       if (S.detail?.lock?.mine || dirtyDetail()) return;
+      const seen = S.detail;
       const r = await api('get_transaction', { id });
+      if (!live() || S.detail !== seen) return;
       S.detail = r.transaction;
       drawDetail();
     }, 12000);
@@ -1141,7 +2110,7 @@
           <div class="meta">
             <span>#${t.id}</span>
             ${t.batch ? `<span class="tag">Batch item ${t.batch.seq} of ${t.batch.count}</span>` : ''}
-            ${t.wallet_name ? `<span>${esc(t.wallet_name)}</span>` : ''}
+            <span>${t.wallet ? `<a class="row-link" href="#wallet/${esc(t.wallet.id)}">${esc(walletName(t.wallet))}</a>` : 'No wallet'}</span>
             <span><a href="${esc(releaseUrl(t.minotaur_version))}" target="_blank" rel="noopener">${esc(versionLabel(t.minotaur_version))}</a></span>
             <span>Started by ${esc(t.created_by)} · ${timeTag(t.created_at)}</span>
             ${t.ergo_tx_id ? `<span>TX <a href="${esc(explorer)}" target="_blank" rel="noopener" class="mono">${esc(shortId(t.ergo_tx_id))}</a>
@@ -1223,7 +2192,7 @@
             <summary>${changeTokens} token${changeTokens === 1 ? ' stays' : 's stay'} at the spending address</summary>
             ${change.map((o) => tokenLines(o.tokens)).join('')}
           </details>` : ''}
-        ${!change.length && sends.length ? `<div class="notice notice-warning small mt-8">No output goes back to the address
+        ${!r.inputs_unverified && !change.length && sends.length ? `<div class="notice notice-warning small mt-8">No output goes back to the address
           being spent from. If the wallet holds more than is being sent, check where the rest goes.</div>` : ''}
 ` : `<div class="notice notice-warning small mt-16">Sigma Sync could not work out where this transaction
         sends funds. Check every output in Minotaur.</div>`;
@@ -1232,6 +2201,9 @@
       <section class="panel mt-12 tx-details" aria-labelledby="details-title">
         <h2 id="details-title">Transaction details</h2>
         <p class="small muted">Decoded from the transaction itself.</p>
+        ${r.inputs_unverified ? `<div class="notice notice-warning small mt-8" data-review="unverified"><strong>Inputs unverified.</strong>
+          Sigma Sync could not match this request's input boxes to the inputs the transaction spends. It shows no
+          spending addresses and marks no output as change.</div>` : ''}
 
         ${outputsHtml}
 
@@ -1305,23 +2277,52 @@
     });
   }
 
-  // Every key of the multi-sig wallet, read from the transaction itself.
+  // Every key of the multi-sig wallet, round by round, and who the transaction waits on (SPEC Q3).
+  // A Minotaur 2.x request and a final CSTX mark no signature per key: the signing round is a count only.
   function signersHtml(t) {
     const list = t.signers || [];
     if (!list.length) return '';
-    const label = ['Waiting', 'Committed', 'Signed', 'Not taking part'];
+    const countOnly = t.review?.minotaur_format === '2' || t.review?.format === 'CSTX';
     const initials = (name) => (name || '?').replace(/[^\p{L}\p{N}]/gu, '').slice(0, 2).toUpperCase() || '?';
+    // A key's state is 0 empty, 1 committed, 2 signed, 3 not taking part (ErgoKit.pm:431).
+    const commitState = (k) => (k.state === 1 || k.state === 2 ? ['Committed', true]
+      : [k.state === 0 && t.status === 'commit' ? 'Not started' : 'Not taking part', false]);
+    const inPlay = (k) => (k.state === 1 ? isOpen(t) : k.state === 0 && t.status === 'commit');
+    const signState = (k) => (k.state === 2 ? ['Signed', true] : [inPlay(k) ? 'Not started' : 'Not taking part', false]);
+    const round = (key, label, [text, done]) => `<span class="round" data-round="${key}">
+      <span class="round-name">${label}</span><span class="${done ? 'tick' : 'muted'}" data-state>${text}</span></span>`;
+
+    const who = (k) => esc(k.mine ? 'you' : k.name || shortAddr(k.address));
+    const andList = (names) => (names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names[0]);
+    let waiting = '';
+    if (t.status === 'commit' || t.status === 'sign') {
+      const commit = t.status === 'commit';
+      const need = Math.max(0, t.signers_required - (commit ? t.commits : t.signatures));
+      const names = countOnly && !commit ? [] : list.filter((k) => k.state === (commit ? 0 : 1)).map(who);
+      const from = !names.length ? ''
+        : names.length > need ? ` from any ${need > 1 ? `${need} ` : ''}of ${names.join(', ')}`
+        : ` from ${andList(names)}`;
+      waiting = `Waiting for ${need} more ${commit ? 'commitment' : 'signature'}${need === 1 ? '' : 's'}${from}.`;
+    } else if (t.status === 'complete') {
+      waiting = 'All required signatures are in. Ready to broadcast.';
+    }
     return `
       <h3 class="mt-16">Signers <span class="faint small">${t.signers_required} of ${list.length} needed</span></h3>
-      <ul class="people">
-        ${list.map((k) => `<li>
+      ${waiting ? `<p class="small" data-waiting-on>${waiting}</p>` : ''}
+      ${countOnly ? `<p class="small muted" data-signers-note>This request does not say who signed, so the signing round
+        is a count only: ${t.signatures} of ${t.signers_required} signatures are in.</p>` : ''}
+      <ul class="people" data-signers>
+        ${list.map((k) => `<li data-signer="${esc(k.slot)}">
           <span class="slot slot-${k.state}" aria-hidden="true">${esc(k.name ? initials(k.name) : k.slot + 1)}</span>
           <span class="grow">
-            ${k.name ? `<strong>${esc(k.name)}</strong>${k.mine ? ' <span class="faint">(you)</span>' : ''}`
-              : '<span class="faint">Not on Sigma Sync yet</span>'}
+            ${k.name ? `<strong data-signer-name>${esc(k.name)}</strong>${k.mine ? ' <span class="faint">(you)</span>' : ''}`
+              : '<span class="faint" data-signer-name>Not on Sigma Sync yet</span>'}
             <div><code class="small faint" title="${esc(k.address)}">${esc(shortAddr(k.address))}</code></div>
           </span>
-          <span class="small ${k.state === 1 || k.state === 2 ? 'tick' : 'faint'}">${label[k.state] || ''}</span>
+          <span class="rounds small">
+            ${round('commit', 'Commitment', commitState(k))}
+            ${countOnly ? '' : round('sign', 'Signing', signState(k))}
+          </span>
         </li>`).join('')}
       </ul>`;
   }
@@ -1697,7 +2698,21 @@
           spellcheck="false" placeholder="9…" aria-label="Address to link">
         ${error ? `<div class="notice notice-error">${esc(error)}</div>` : ''}
         <button class="btn btn-block" type="submit">Continue</button>
-      </form>`;
+      </form>
+      <div data-nautilus-slot></div>`;
+    // The answer may come after the signer left this view: then the new view stays as it is.
+    const linked = async () => {
+      toast('Address linked', 'success');
+      S.txs = [];
+      const data = await api('get_account');
+      if (panel.isConnected) drawAccount(data);
+    };
+    offerNautilus($('[data-nautilus-slot]', panel), {
+      purpose: 'link',
+      label: 'Link with Nautilus',
+      hint: 'Choose an address in Nautilus and sign a one-time request. It is not a payment.',
+      onDone: linked,
+    });
     $('#link-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
       const address = $('#link-address').value.replace(/\s+/g, '');
@@ -1707,9 +2722,246 @@
         mountChallenge(panel, ch, {
           submitLabel: 'Link address',
           onRestart: () => drawLinkPanel(),
-          onDone: async () => { toast('Address linked', 'success'); S.txs = []; drawAccount(await api('get_account')); },
+          onDone: linked,
         });
       } catch (e) { drawLinkPanel(e.message); }
+    });
+  }
+
+  // ------------------------------------------------------------------------
+  // Wallets: the registry of multi-sig wallets (SPEC W3 to W7)
+  // ------------------------------------------------------------------------
+  const walletName = (w) => w.name || 'Unnamed wallet';
+
+  // An answer is drawn only while the route that asked for it is still on screen (Q8, Q9).
+  function viewGuard() {
+    const seq = S.view;
+    return () => seq === S.view && !!S.me;
+  }
+
+  const loadError = (message) => `
+    <div class="notice notice-error">${esc(message)}</div>
+    <div class="mt-12"><button type="button" class="btn" data-retry>Try again</button></div>`;
+
+  async function renderWallets() {
+    const live = viewGuard();
+    const view = shell('wallets');
+    view.innerHTML = `
+      <div class="detail">
+        <section class="panel" aria-labelledby="wallets-title">
+          <div class="panel-title"><h2 id="wallets-title">Your wallets</h2></div>
+          <div id="wallet-list"></div>
+        </section>
+        <form class="panel" id="wallet-form" novalidate>
+          <div class="panel-title"><h2>Register a wallet</h2></div>
+          <p class="muted small">Paste the address of a multi-sig wallet you sign for, not your own signing address.
+          One of the addresses on your account must be one of its signers. Its signers then see it here.</p>
+          <div class="field">
+            <label for="w-address">Wallet address</label>
+            <input type="text" id="w-address" required autocomplete="off" autocapitalize="off" autocorrect="off"
+              spellcheck="false" placeholder="The multi-sig wallet's address">
+          </div>
+          <div class="field">
+            <label for="w-name">Name <span class="faint">(optional)</span></label>
+            <input type="text" id="w-name" maxlength="80" autocomplete="off" placeholder="e.g. Sigmanauts Treasury 2.0">
+            <p class="hint">Shared by every signer of the wallet. Any of them can change it.</p>
+          </div>
+          <div id="w-error"></div>
+          <div class="row mt-12"><span class="spacer"></span>
+            <button class="btn btn-primary" type="submit">Register wallet</button></div>
+        </form>
+      </div>`;
+    loadWalletList(live);
+
+    $('#wallet-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const btn = $('button[type=submit]', ev.target);
+      const error = $('#w-error');
+      const address = $('#w-address').value.replace(/\s+/g, '');
+      error.innerHTML = '';
+      if (!address) { error.innerHTML = '<div class="notice notice-error mt-12">Paste the wallet address.</div>'; return; }
+      btn.disabled = true;
+      try {
+        const r = await api('register_wallet', { address, name: $('#w-name').value });
+        toast(r.created ? 'Wallet registered' : 'This wallet was already registered. Its name is unchanged.', 'success');
+        if (!live()) return;
+        ev.target.reset();
+        loadWalletList(live);
+      } catch (e) {
+        if (live()) error.innerHTML = `<div class="notice notice-error mt-12">${esc(e.message)}</div>`;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  async function loadWalletList(live) {
+    const box = $('#wallet-list');
+    // A second load of this list (after a registration) makes an older answer stale, even on the same route.
+    const seq = String((Number(box.dataset.seq) || 0) + 1);
+    box.dataset.seq = seq;
+    const newest = () => live() && box.dataset.seq === seq;
+    if (!box.firstChild) box.innerHTML = '<div class="loading">Loading wallets…</div>';
+    let list;
+    try {
+      list = (await api('list_wallets')).wallets;
+    } catch (e) {
+      if (newest()) box.innerHTML = loadError(e.message);
+      return;
+    }
+    if (!newest()) return;
+    box.innerHTML = list.length
+      ? `<div class="cards" data-wallets="list">${list.map((w) => `
+          <a class="card" href="#wallet/${esc(w.id)}" data-wallet-card>
+            <div class="card-head">
+              <div class="grow">
+                <div class="card-title">${esc(walletName(w))}</div>
+                <div class="card-sub">Wallet #${esc(w.id)}</div>
+              </div>
+              <span class="tag">${esc(w.signers_required)} of ${esc(w.signers_total)} signatures</span>
+            </div>
+          </a>`).join('')}</div>`
+      : `<div class="empty" data-wallets="empty">No wallets yet. Register the multi-sig wallet you sign for with
+          its address. A wallet also appears here when someone starts a transaction for it.</div>`;
+  }
+
+  async function renderWallet(id) {
+    const live = viewGuard();
+    const view = shell('wallets');
+    const back = '<a class="back" href="#wallets">← All wallets</a>';
+    view.innerHTML = `${back}<div class="loading">Loading wallet…</div>`;
+    let wallet;
+    try {
+      wallet = (await api('get_wallet', { id })).wallet;
+    } catch (e) {
+      if (live()) view.innerHTML = back + loadError(e.message);
+      return;
+    }
+    if (live()) drawWallet(wallet, live);
+  }
+
+  const closedRow = (t) => `
+    <tr>
+      <td><a class="row-link" href="#tx/${esc(t.id)}">${esc(t.title)}</a><div class="small faint">#${esc(t.id)}</div></td>
+      <td>${statusPill(t.status)}</td>
+      <td>${t.closed_at ? timeTag(t.closed_at) : ''}</td>
+    </tr>`;
+
+  function drawWallet(w, live) {
+    const view = $('#view');
+    view.innerHTML = `
+      <a class="back" href="#wallets">← All wallets</a>
+      <div class="detail-head">
+        <div class="grow">
+          <h1 id="wallet-title">${esc(walletName(w))}</h1>
+          <div class="meta">
+            <span>Wallet #${esc(w.id)}</span>
+            <span>${esc(w.signers_required)} of ${esc(w.signers_total)} signatures needed</span>
+          </div>
+        </div>
+      </div>
+      <div class="detail">
+        <div>
+          <section class="panel">
+            <div class="panel-title"><h2>Signers</h2></div>
+            <ul class="people" data-wallet="keys">${w.keys.map((k) => `
+              <li data-key="${esc(k.slot)}">
+                <span class="slot" aria-hidden="true">${esc(k.slot + 1)}</span>
+                <span class="grow">
+                  ${k.name ? `<strong>${esc(k.name)}</strong>${k.mine ? ' <span class="faint">(you)</span>' : ''}`
+                    : '<span class="faint">Not on Sigma Sync yet</span>'}
+                  <div><code class="small faint" title="${esc(k.address)}">${esc(shortAddr(k.address))}</code></div>
+                </span>
+              </li>`).join('')}
+            </ul>
+          </section>
+          <section class="panel" data-wallet="open">
+            <div class="panel-title"><h2>Open transactions</h2></div>
+            ${w.open.length ? `<div class="cards">${w.open.map((t) => card(t, false)).join('')}</div>`
+              : '<p class="faint">No open transactions.</p>'}
+          </section>
+          <section class="panel" data-wallet="closed">
+            <div class="panel-title"><h2>History</h2></div>
+            ${w.closed.length ? `<div class="table-wrap"><table class="list">
+                <thead><tr><th>Transaction</th><th>Result</th><th>Closed</th></tr></thead>
+                <tbody>${w.closed.map(closedRow).join('')}</tbody>
+              </table></div>` : '<p class="faint">No closed transactions yet.</p>'}
+            ${w.closed_more ? `<div class="mt-12" data-wallet="more">
+                <div data-wallet="older-error"></div>
+                <button type="button" class="btn" data-wallet="older">Show older</button>
+              </div>` : ''}
+          </section>
+        </div>
+        <aside class="detail-side">
+          <form class="panel" id="rename-form" novalidate>
+            <div class="panel-title"><h2>Name</h2></div>
+            <div class="field">
+              <label for="w-rename">Wallet name</label>
+              <input type="text" id="w-rename" maxlength="80" required autocomplete="off" value="${esc(w.name)}">
+              <p class="hint">Shared by every signer of the wallet. Any of them can change it.</p>
+            </div>
+            <div id="rename-error"></div>
+            <div class="row mt-12"><span class="spacer"></span>
+              <button class="btn btn-primary" type="submit">Save name</button></div>
+          </form>
+          <section class="panel">
+            <div class="panel-title"><h2>Address</h2></div>
+            <code class="wallet-address" data-wallet="address">${esc(w.address)}</code>
+            <button type="button" class="btn btn-sm" data-copy="${esc(w.address)}" data-wallet="address-copy"
+              aria-label="Copy wallet address">Copy</button>
+          </section>
+        </aside>
+      </div>`;
+    paintBars(view);
+
+    $('#rename-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const btn = $('button[type=submit]', ev.target);
+      const error = $('#rename-error');
+      error.innerHTML = '';
+      btn.disabled = true;
+      try {
+        const r = (await api('rename_wallet', { id: w.id, name: $('#w-rename').value })).wallet;
+        if (!live()) return;
+        $('#wallet-title').textContent = walletName(r);
+        $('#w-rename').value = r.name;
+        toast('Name saved', 'success');
+      } catch (e) {
+        if (live()) error.innerHTML = `<div class="notice notice-error mt-12">${esc(e.message)}</div>`;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    const more = $('[data-wallet=more]', view);
+    if (!more) return;
+    const older = $('[data-wallet=older]', more);
+    older.addEventListener('click', async () => {
+      const rows = $('[data-wallet=closed] tbody', view);
+      const problem = $('[data-wallet=older-error]', more);
+      older.disabled = true;
+      older.textContent = 'Loading…';
+      problem.innerHTML = '';
+      try {
+        const page = (await api('get_wallet', { id: w.id, before: w.closed[w.closed.length - 1].id })).wallet;
+        if (!live()) return;
+        const added = rows.children.length;
+        w.closed.push(...page.closed);
+        rows.insertAdjacentHTML('beforeend', page.closed.map(closedRow).join(''));
+        if (page.closed_more) {
+          older.disabled = false;
+          older.textContent = 'Show older';
+        } else {
+          more.remove();
+          // The button had the focus: put it on the first new row, not on the page.
+          rows.children[added]?.querySelector('a')?.focus();
+        }
+      } catch (e) {
+        if (!live()) return;
+        problem.innerHTML = `<div class="notice notice-error mb-16">${esc(e.message)}</div>`;
+        older.disabled = false;
+        older.textContent = 'Show older';
+      }
     });
   }
 
@@ -1803,6 +3055,23 @@
     }));
   }
 
+  // B7: a page that is closed gives back every lock its run holds and every lock it has asked for and has no answer to.
+  // `sendBeacon` is the one request a closing page can still make, as a POST with the CSRF token in the form body (I9).
+  // Each names its item's release count: it clears the lock this run took, and the server cancels a lock that has not
+  // arrived yet. A tab that is only hidden sends nothing: a wallet review can take minutes and the submit needs the lock.
+  window.addEventListener('pagehide', () => {
+    if (!S.run || !S.csrf) return;
+    for (const row of S.run.rows) {
+      if (!row.held) continue;
+      const form = new FormData();
+      form.append('action', 'release_lock');
+      form.append('csrf', S.csrf);
+      form.append('id', row.id);
+      form.append('seq', row.count);
+      navigator.sendBeacon('api.pl', form);
+    }
+  });
+
   // ------------------------------------------------------------------------
   // Global wiring
   // ------------------------------------------------------------------------
@@ -1819,12 +3088,35 @@
     if (copy) { copyText(copy.dataset.copy); return; }
     const filter = ev.target.closest('[data-filter]');
     if (filter) { S.filter = filter.dataset.filter; drawList(); return; }
+    if (ev.target.closest('[data-retry]')) { route(); return; }
+    const all = ev.target.closest('[data-select-all]');
+    if (all) { pickAll(all.dataset.selectAll); return; }
+    if (ev.target.closest('[data-clear-selection]')) { clearSelection(); S.selNotes = []; drawList(true); return; }
+    if (ev.target.closest('[data-held-release]')) { releaseListedLocks(); return; }
+    if (ev.target.closest('[data-run-confirm]')) { startRun(); return; }
+    const act = ev.target.closest('[data-run-action]');
+    if (act) { runAction(act.dataset.runAction); return; }
+    if (ev.target.closest('[data-connect-wallet]')) { connectRunWallet(); return; }
     if (ev.target.closest('#user-chip [data-action=logout]')) {
-      try { await api('logout'); } catch (e) { /* ignore */ }
+      // The session stays until the server says it ended: a failed request keeps the account, the token and the run.
+      try { await api('logout'); } catch (e) {
+        if (!e.data?.signed_out) { toast(e.message, 'error'); return; }
+      }
       S.me = null;
       S.csrf = '';
       S.txs = [];
       renderSignIn();
+    }
+  });
+
+  document.addEventListener('change', (ev) => {
+    const row = ev.target.closest('[data-select]');
+    if (row) pick(Number(row.dataset.select), row.checked);
+    const ack = ev.target.closest('[data-ack]');
+    if (ack) {
+      const id = Number(ack.dataset.ack);
+      if (ack.checked) S.acks.set(id, S.readings.get(id)); else S.acks.delete(id);
+      syncConfirm();
     }
   });
 
@@ -1834,7 +3126,7 @@
     try {
       const r = await api('session');
       if (r.signed_in) startSession(r);
-      else renderSignIn();
+      else { S.config = { nautilus: r.nautilus }; renderSignIn(); }
     } catch (e) {
       app().innerHTML = `<div class="notice notice-error">${esc(e.message)}</div>`;
     }

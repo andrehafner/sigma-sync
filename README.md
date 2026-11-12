@@ -20,14 +20,20 @@ Sigma Sync is a small web app that keeps one source of truth for each transactio
   force-unlock it.
 - **Every paste is checked.** It must be the same Ergo transaction, keep every earlier
   commitment and signature, and add yours. A stale or wrong paste is refused with an explanation.
-- **Clear progress.** Cards show commitments and signatures against the M-of-N threshold, who
-  holds the lock, and what is waiting on you. Each signer key shows whether its owner has
-  committed or signed. Each transaction has a description, comments,
-  and a full activity history.
+- **Clear progress.** The queue groups every open transaction by the step you owe: *Needs your
+  commitment*, *Needs your signature*, *Waiting for others* and *Ready to broadcast*, each with its
+  count. Closed transactions stay behind the filter. Cards show commitments and signatures against
+  the M-of-N threshold, who holds the lock, and how old the transaction is. The detail lists every
+  signer key with its state in each round (not started, committed, signed, not taking part) and says
+  whom the transaction waits on. A Minotaur 2.x request does not mark signatures per key, so its
+  signing round shows a count only. Each transaction has a description, comments, and a full
+  activity history.
 - **Review before you sign.** A *Transaction details* panel decodes the transaction itself: every
   payment with its ERG and tokens (names and decimals from the explorer) and destination, the
   fee, the change, and which wallet addresses it spends from, with a warning when it spends from
-  more than one. It ends with a reminder to verify everything again in Minotaur.
+  more than one. When the request's input boxes do not match the inputs it names, the panel says
+  "Inputs unverified" and shows no spending address and no change. It ends with a reminder to verify
+  everything again in Minotaur.
 - **Minotaur generation check.** Minotaur 3.0+ and 2.x write different request layouts and cannot
   read each other's. Sigma Sync detects the layout (it cannot tell 3.0 from 4.2.1 - those are
   identical) and refuses a paste from the wrong generation for the transaction's chosen version.
@@ -56,6 +62,30 @@ Sigma Sync is a small web app that keeps one source of truth for each transactio
    the Ergo Fiat-Shamir proof format; see [`ErgoKit.pm`](ErgoKit.pm)). The first sign-in creates
    an account; you then pick the name your co-signers see.
 
+#### Sign-in with Nautilus
+
+When the env file sets `SITE_HOST`, the server also accepts a sign-in from the Nautilus browser
+wallet, for a new account and for linking an address:
+
+1. `auth_start` with `method=nautilus` returns a one-time challenge (64 hex characters) and no
+   Minotaur request.
+2. Nautilus's `auth(address, challenge)` signs the text `challenge;host;seconds;random` and
+   returns the text and its proof.
+3. `auth_finish` checks that the stored challenge was issued for Nautilus and for this address,
+   that the host in the text is `SITE_HOST`, that the time is no more than 5 minutes outside the
+   challenge's life, and verifies the proof with the same Schnorr code. From there it continues
+   exactly as the Minotaur sign-in.
+
+Each challenge stores its method, so an answer made for one method is refused for the other.
+Without `SITE_HOST` the server refuses the Nautilus method.
+
+The page offers **Sign in with Nautilus** under the address form when the server has `SITE_HOST`
+set and the Nautilus connector is in the page, also when the connector arrives after the page
+loaded. It connects, lists the wallet's used and unused addresses, lets you choose one and runs
+the three steps above. The Account tab links another address the same way. If Nautilus refuses
+to connect or to sign, the page shows one fixed message and changes nothing. It never shows
+text that the wallet returned, except the addresses you choose from.
+
 ### Who sees what
 
 - When a transaction is started, Sigma Sync reads the signer public keys out of the transaction
@@ -73,6 +103,76 @@ Sigma Sync is a small web app that keeps one source of truth for each transactio
 
 Admins (from `ADMIN_ADDRESSES`, or promoted by another admin) can disable accounts and read the
 audit log. That is all.
+
+### Wallets
+
+The server keeps a registry of multi-sig wallets, and the page has a **Wallets** tab for it.
+
+- The Wallets tab lists the wallets your keys sign for and registers one from its address and an
+  optional name. A wallet's own page shows its name (any signer can change it), its address with
+  a copy button, M of N, every key with its owner's name or "Not on Sigma Sync yet", the open
+  transactions, and below them the closed ones, 200 at a time with a "Show older" button.
+  The transaction list and the detail view show the wallet's name, or "No wallet" for a
+  transaction whose inputs disagree. The list's search matches that name.
+- `register_wallet` takes the wallet's Minotaur address and a name. The server reads M and the
+  keys from the address and takes it only when it is a Minotaur M-of-N script on the server's
+  network, with 1 < M < N, valid keys in ascending order, at most 3,000 characters, and when one
+  of your proven addresses is one of its keys. A wallet is stored once: a second registration
+  returns the same wallet.
+- `list_wallets` and `get_wallet` show a wallet only to an account that holds one of its keys,
+  with every key and its owner's name. Anyone else gets "Wallet not found". `get_wallet` also
+  lists the wallet's open transactions and its closed ones, newest first, 200 at a time
+  (`before` takes the last id shown).
+- The name is shared by the wallet's signers and encrypted at rest. Any of them can change it
+  with `rename_wallet`. The audit log records the wallet id and the account, never the name.
+- Starting a transaction links it to its wallet when every input is a box of the same M-of-N
+  wallet, and registers the wallet if nobody has, named after the transaction's wallet name.
+  A start never renames a registered wallet. A transaction whose inputs disagree has no wallet.
+  Every transaction carries its wallet's id and name, or none.
+- An operator can add a wallet before any signer does:
+  `APP_ENV_FILE=... perl tools/add-wallet.pl '<address>' '<name>'` prints its id.
+
+### Select and run
+
+The queue offers run actions only while a connected wallet supports them: its context has `multisig`
+as its own property with `version` 1, and one of its addresses is one of yours. Without that the same
+queue leads into the paste flow, one transaction at a time. When Nautilus is in the page but the site
+is not allowed yet, the queue shows a **Connect Nautilus** button. The page never opens the connect
+window by itself.
+
+- A row where you owe a step has a checkbox, and each group has **Select all**. A selection holds
+  rows of one group and at most 20. A row you cannot select says why. A refresh of the list keeps
+  the selection.
+- **Review** lists every selected transaction with what it pays, to whom, the fee, the wallet, M of N
+  and the Ergo transaction ID. An item with unverified inputs, a partial or uncertain reading or a
+  payment to a contract has its own tick. **Confirm** is off until every such tick is given, and it
+  is the only confirm.
+- A run handles one item after another: the page reads it, takes its lock (an item whose lock you
+  already hold keeps it and uses the request the server gave for it), then makes one wallet call
+  with the requests as the server returned them. It submits each answer through `submit`, so the
+  server's checks decide what is stored. Each row shows waiting, lock taken, in the wallet,
+  submitted, done, or failed with the server's or the wallet's reason. One failure does not stop the
+  rest. A lock that did not lead to a stored step is released. A lock counts as released only when the
+  server says so. If a release fails any other way, the row and the summary say the lock may still be
+  held, and **Release** asks the server again without calling the wallet.
+- The page compares what the server decoded from each request with what you reviewed. An item that
+  changed since the review never goes to the wallet. Its row fails, its lock is released and you
+  review it again.
+- The summary offers **Retry** for the failed rows. A retry takes the lock again. It sends the
+  wallet's kept answer when the stored request is the one the wallet got, and asks the wallet again
+  when it is not.
+- The list does not refresh while a run is open, and the queue offers no new selection or review
+  until it ends. Leaving the run page does not stop the run, and the queue links back to it.
+- Everything the wallet returns shows as text. An answer that is not a signed request (`MSR`) is never
+  submitted. A wallet call that fails, or whose answer has the wrong length, order or ids, submits
+  nothing and releases the locks of the call. When your session ends the run stops and the sign-in
+  screen shows; the locks stay until you return.
+- Every lock of a run names the lock count the page read, and every release names its item's count. A page that is
+  closed during a run sends one release for each lock the run holds and each lock it asked for and has no answer
+  to, so no lock stays. A tab that is only hidden keeps its locks, because a wallet review can take minutes.
+- When the queue loads it shows every lock you hold, also one on a transaction beyond the 500 rows of the list, and
+  one **Release** action frees them. It releases by count, so it never clears a lock you took after the view was
+  drawn. It does not show while your own run is open.
 
 ### Rounds and statuses
 
@@ -163,7 +263,8 @@ plus MariaDB.
 ```bash
 mysql -u root < schema.sql            # then create a user as shown at the end of schema.sql
 cp sigmasync.env.example dev.env      # fill in DB_*, DATA_KEY, ADMIN_ADDRESSES;
-                                      # set COOKIE_SECURE=0 and COOKIE_PATH=/ for local HTTP
+                                      # set COOKIE_SECURE=0 and COOKIE_PATH=/ for local HTTP,
+                                      # and SITE_HOST=127.0.0.1:8080 for Nautilus sign-in
 APP_ENV_FILE=$PWD/dev.env python3 tools/dev-server.py 8080
 prove -I. t/                          # unit tests
 ```

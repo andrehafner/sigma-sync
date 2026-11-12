@@ -1,0 +1,13 @@
+{
+ "tool": "ergo-lib-wasm-browser 0.28.0 (sigma-rust 0.28.0)",
+ "call": "Wallet.from_secrets(SecretKey.random_dlog()).sign_message_using_p2pk(address, UTF-8 bytes of signed_message)",
+ "key": "throwaway, made by SecretKey.random_dlog() and never stored",
+ "address": "9hkbEXyVGxVK8nDJQaPu1C8hFKEtp4E3Z9jNRmapwbEJQRUc6SR",
+ "public_key": "03a9cf19ed23d791421622b41364ebf65327c68671c2e695e16f1d8b5ab9b9e641",
+ "challenge": "4db342163c8e55387c5e41d4fd2b324244c774d5ca0362ff38d9fa460974a171",
+ "host": "127.0.0.1:8471",
+ "signed_message": "4db342163c8e55387c5e41d4fd2b324244c774d5ca0362ff38d9fa460974a171;127.0.0.1:8471;1794379109;3b201526dae420f7f7222ea5387a2e2d2e1f3f4e74a59c9cb183e1af3f7ad79c",
+ "proof": "60f9260ef5d12da8bffa8b56cbad9246d29f69aac02db963896b8fc7ba61ae074cc786b65c6ec82d23bd9783d5650cec6de61fdb7fc0042f",
+ "relayed_signed_message": "4db342163c8e55387c5e41d4fd2b324244c774d5ca0362ff38d9fa460974a171;127.0.0.1:8471;1794379109;3b201526dae420f7f7222ea5387a2e2d2e1f3f4e74a59c9cb183e1af3f7ad79c;evil.example;1794379114;3b9874e06976054e3c2ce15f71d368ab1ebaa4b4ebade5c4f10f5d456c1b93cd",
+ "relayed_proof": "6eb2a9932746c5c34b23f47bc20f276d50154c1ee7a6e33b09c5e5c972ad11925c1f8e2509fde496e7f699221190354790e14da5cf0ae228"
+}

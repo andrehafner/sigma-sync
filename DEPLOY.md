@@ -57,7 +57,7 @@ Both host forms are needed: MariaDB may resolve a `127.0.0.1` connection to `loc
 sudo mkdir -p /data/AAP_Storage/secrets
 sudo cp /data/AAP_Storage/apps/sigmasync/sigmasync.env.example /data/AAP_Storage/secrets/sigmasync.env
 openssl rand -hex 32                        # paste the output as DATA_KEY
-sudo vi /data/AAP_Storage/secrets/sigmasync.env   # DB_PASSWORD, DATA_KEY, ADMIN_ADDRESSES
+sudo vi /data/AAP_Storage/secrets/sigmasync.env   # DB_PASSWORD, DATA_KEY, ADMIN_ADDRESSES, SITE_HOST
 sudo chown root:apache /data/AAP_Storage/secrets/sigmasync.env
 sudo chmod 640 /data/AAP_Storage/secrets/sigmasync.env
 ```
@@ -65,6 +65,8 @@ sudo chmod 640 /data/AAP_Storage/secrets/sigmasync.env
 - `ADMIN_ADDRESSES`: comma-separated **wallet addresses** (P2PK) of the people who may disable
   accounts and read the audit log. Anyone can sign in; admins get no access to other people's
   transactions.
+- `SITE_HOST`: `public.aap.cornell.edu`, the host the browser shows. The Nautilus wallet signs it
+  into every sign-in and the server accepts no other. Leave it empty to turn Nautilus sign-in off.
 - **Back up `DATA_KEY` separately** (password manager / sealed envelope). Without it, encrypted
   data in the database and in every backup is unreadable.
 
@@ -116,7 +118,7 @@ mysql -u sigmasync_app -p -h 127.0.0.1 sigmasync -e 'SELECT 1;'
 cd /data/AAP_Storage/apps/sigmasync
 printf 'action=session' | sudo -u apache env APP_ENV_FILE=/data/AAP_Storage/secrets/sigmasync.env \
   REQUEST_METHOD=POST CONTENT_TYPE=application/x-www-form-urlencoded CONTENT_LENGTH=14 perl api.pl
-# -> ...{"signed_in":0,"success":1}
+# -> ...{"nautilus":1,"signed_in":0,"success":1}   (nautilus is 0 while SITE_HOST is empty)
 
 # GATE 4 - over HTTPS
 curl -s -X POST -d action=session https://public.aap.cornell.edu/apps/sigmasync/api.pl
@@ -163,6 +165,49 @@ sudo mysql sigmasync < tools/migrate-002-batches.sql
 
 Adds the `batches` table and two columns on `transactions`. Safe to run twice. Fresh installs get
 it from `schema.sql`.
+
+### Migration 003 - sign-in method of a challenge
+
+```bash
+sudo mysqldump sigmasync > ~/sigmasync-before-003.sql     # backup
+cd /data/AAP_Storage/apps/sigmasync
+git pull && sudo ./redeploy.sh
+sudo mysql sigmasync < tools/migrate-003-auth-method.sql
+```
+
+Adds `auth_challenges.method`; every existing challenge stays a Minotaur challenge. Safe to run
+twice. Fresh installs get it from `schema.sql`. Then set `SITE_HOST` in the env file to offer
+Nautilus sign-in.
+
+### Migration 004 - wallet registry
+
+```bash
+sudo mysqldump sigmasync > ~/sigmasync-before-004.sql     # backup
+cd /data/AAP_Storage/apps/sigmasync
+git pull && sudo ./redeploy.sh
+sudo mysql sigmasync < tools/migrate-004-wallets.sql
+sudo APP_ENV_FILE=/data/AAP_Storage/secrets/sigmasync.env perl tools/migrate-004-wallets.pl --dry-run
+sudo APP_ENV_FILE=/data/AAP_Storage/secrets/sigmasync.env perl tools/migrate-004-wallets.pl
+```
+
+The `.sql` file adds the `wallets` and `wallet_keys` tables and `transactions.wallet_id`, with a
+foreign key to `wallets`. Safe to run twice. Fresh installs get it from `schema.sql`. Wallet
+names are sealed with `DATA_KEY` like the other encrypted columns.
+
+The `.pl` file connects with the app's own credentials and links every existing transaction
+whose inputs all name the same M-of-N wallet, registering that wallet when needed. A wallet
+without a name takes the newest non-empty wallet name among its transactions; a name is never
+written over. Transactions whose inputs disagree keep no wallet. It runs as one DB transaction;
+`--dry-run` shows what it would do and rolls it back. Re-running it changes nothing.
+
+To add a wallet before any signer registers it:
+
+```bash
+sudo APP_ENV_FILE=/data/AAP_Storage/secrets/sigmasync.env perl tools/add-wallet.pl '<address>' '<name>'
+```
+
+It applies the same checks as the app and prints the wallet id. A wallet that is already
+registered keeps its name.
 
 ## Backups
 

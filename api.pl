@@ -20,8 +20,9 @@ use CGI qw(-utf8);
 use Digest::SHA qw(sha256_hex);
 use JSON::PP ();
 
-use AppConfig qw(cfg dbh seal unseal random_hex client_ip);
+use AppConfig qw(cfg dbh seal unseal random_hex client_ip ensure_wallet);
 use ErgoKit qw(address_decode address_from_tree build_login_request verify_login_response
+               verify_nautilus_auth wallet_from_address wallet_from_request
                sanitize_payload analyze_payload compare_hints payload_input_ids);
 
 # Large enough for a full batch of big requests (MAX_BATCH entries of a few hundred KB).
@@ -31,6 +32,7 @@ my $JSON = JSON::PP->new->utf8->canonical;
 my $cgi  = CGI->new;
 my @cookies;
 my ($ME, $SESSION);
+my %WALLET_OF;    # wallet_of_tx's answers, for this request
 
 my %LIMIT = (title => 120, description => 10_000, comment => 4000, payload => 1_000_000,
              wallet => 80, name => 40);
@@ -39,6 +41,11 @@ my %LIMIT = (title => 120, description => 10_000, comment => 4000, payload => 1_
 # Used as "... FROM transactions t WHERE ... AND $VISIBLE" with $ME->{id} bound.
 my $VISIBLE = q{EXISTS (SELECT 1 FROM transaction_keys tk JOIN member_keys mk ON mk.pk = tk.pk
                          WHERE tk.transaction_id = t.id AND mk.member_id = ?)};
+
+# A wallet is visible to the current account when it holds one of its keys (SPEC W4).
+# Used as "... FROM wallets w WHERE ... AND $WALLET_VISIBLE" with $ME->{id} bound.
+my $WALLET_VISIBLE = q{EXISTS (SELECT 1 FROM wallet_keys wk JOIN member_keys mk ON mk.pk = wk.pk
+                                WHERE wk.wallet_id = w.id AND mk.member_id = ?)};
 
 # ---------------------------------------------------------------------------
 # Routing
@@ -66,6 +73,10 @@ my %MEMBER = (
     get_account        => \&act_get_account,
     update_account     => \&act_update_account,
     unlink_address     => \&act_unlink_address,
+    register_wallet    => \&act_register_wallet,
+    list_wallets       => \&act_list_wallets,
+    get_wallet         => \&act_get_wallet,
+    rename_wallet      => \&act_rename_wallet,
 );
 my %ADMIN = (
     admin_members  => \&act_admin_members,
@@ -211,7 +222,16 @@ sub client_config {
         explorer_api_url     => cfg('EXPLORER_API_URL', 'https://api.ergoplatform.com/api/v1/transactions/'),
         explorer_token_url   => cfg('EXPLORER_TOKEN_API_URL', 'https://api.ergoplatform.com/api/v1/tokens/'),
         explorer_address_url => cfg('EXPLORER_ADDRESS_URL', 'https://explorer.ergoplatform.com/en/addresses/'),
+        nautilus             => nautilus_on(),
     };
+}
+
+# SPEC L1, L4: the Nautilus method needs the site's host, the second field of the signed text.
+sub nautilus_on { return length cfg('SITE_HOST', '') ? 1 : 0 }
+
+sub site_host {
+    fail('Sign-in with Nautilus is not available on this site.') unless nautilus_on();
+    return cfg('SITE_HOST');
 }
 
 sub valid_address {
@@ -229,13 +249,18 @@ sub valid_address {
 # ---------------------------------------------------------------------------
 sub act_session {
     load_session();
-    return { signed_in => 0 } unless $ME;
+    return { signed_in => 0, nautilus => nautilus_on() } unless $ME;
     return { signed_in => 1, member => public_member($ME), csrf => $SESSION->{csrf_token},
              config => client_config() };
 }
 
 # purpose=login (default) starts a sign-in; purpose=link (signed in) proves an extra address.
+# method=nautilus asks for a token for Nautilus's auth(); without it the challenge is Minotaur's.
 sub act_auth_start {
+    my $method = param('method');
+    fail('Unknown sign-in method.') unless $method eq '' || $method eq 'nautilus';
+    my $nautilus = $method eq 'nautilus';
+    site_host() if $nautilus;
     my $address = param('address') =~ s/\s+//gr;
     my $link = param('purpose') eq 'link';
     if ($link) {
@@ -254,8 +279,14 @@ sub act_auth_start {
     fail('Too many sign-in attempts. Wait a few minutes and try again.') if $recent >= 20;
 
     my $token = random_hex(32);
-    my $req = build_login_request(address => $address, nonce => pack('H*', random_hex(32)));
     my $ttl = cfg('CHALLENGE_MINUTES', 15) + 0;
+    if ($nautilus) {
+        $db->do(q{INSERT INTO auth_challenges (token_hash, address, member_id, method, message_hex, ip, expires_at)
+                  VALUES (?,?,?,'nautilus','',?, UTC_TIMESTAMP() + INTERVAL ? MINUTE)},
+            undef, sha256_hex($token), $address, ($link ? $ME->{id} : undef), client_ip(), $ttl);
+        return { challenge => $token, method => 'nautilus', expires_minutes => $ttl };
+    }
+    my $req = build_login_request(address => $address, nonce => pack('H*', random_hex(32)));
     $db->do(q{INSERT INTO auth_challenges (token_hash, address, member_id, message_hex, ip, expires_at)
               VALUES (?,?,?,?,?, UTC_TIMESTAMP() + INTERVAL ? MINUTE)},
         undef, sha256_hex($token), $address, ($link ? $ME->{id} : undef), unpack('H*', $req->{message}),
@@ -269,27 +300,39 @@ sub act_auth_finish {
     fail('Sign-in request not found. Start again.') unless $token =~ /^[0-9a-f]{64}$/;
     my $db = dbh();
     my $ch = $db->selectrow_hashref(q{
-        SELECT id, address, member_id, message_hex FROM auth_challenges
+        SELECT id, address, member_id, method, message_hex,
+               UNIX_TIMESTAMP(created_at) AS issued, UNIX_TIMESTAMP(expires_at) AS expires
+          FROM auth_challenges
          WHERE token_hash = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()
     }, undef, sha256_hex($token));
     fail('This request has expired or was already used. Start again.') unless $ch;
 
-    my $response = param('response');
-    fail('Paste the signed result from Minotaur.') unless length $response;
-    fail('That is far too long to be a signed result.') if length $response > 200_000;
-
+    # The method is the stored challenge's, never the request's (SPEC L4, L10).
     my $info = address_decode($ch->{address});
-    my ($ok, $why, $signed_message) = verify_login_response(
-        response => $response, expected_message => pack('H*', $ch->{message_hex}), pk => $info->{pk});
-    if (!$ok && $signed_message) {
-        # Minotaur keeps the previous signed result on screen when a new request is scanned
-        # in the same session (it then shows no password prompt). Recognise that case.
-        my ($old) = $db->selectrow_array(
-            'SELECT id FROM auth_challenges WHERE address = ? AND message_hex = ? AND id <> ?',
-            undef, $ch->{address}, unpack('H*', $signed_message), $ch->{id});
-        $why = 'Minotaur gave you the result of an earlier sign-in instead of signing this new request '
-             . '(it did not ask for your password, right?). This is a Minotaur quirk: fully close and reopen '
-             . 'Minotaur, then scan or paste the request shown here again.' if $old;
+    my ($ok, $why);
+    if ($ch->{method} eq 'nautilus') {
+        ($ok, $why) = verify_nautilus_auth(
+            signed_message => param('signed_message'), proof => param('proof'), challenge => $token,
+            host => site_host(), pk => $info->{pk},
+            not_before => $ch->{issued} - 300, not_after => $ch->{expires} + 300);
+    } else {
+        my $response = param('response');
+        fail('Paste the signed result from Minotaur.') unless length $response;
+        fail('That is far too long to be a signed result.') if length $response > 200_000;
+
+        my $signed_message;
+        ($ok, $why, $signed_message) = verify_login_response(
+            response => $response, expected_message => pack('H*', $ch->{message_hex}), pk => $info->{pk});
+        if (!$ok && $signed_message) {
+            # Minotaur keeps the previous signed result on screen when a new request is scanned
+            # in the same session (it then shows no password prompt). Recognise that case.
+            my ($old) = $db->selectrow_array(
+                'SELECT id FROM auth_challenges WHERE address = ? AND message_hex = ? AND id <> ?',
+                undef, $ch->{address}, unpack('H*', $signed_message), $ch->{id});
+            $why = 'Minotaur gave you the result of an earlier sign-in instead of signing this new request '
+                 . '(it did not ask for your password, right?). This is a Minotaur quirk: fully close and reopen '
+                 . 'Minotaur, then scan or paste the request shown here again.' if $old;
+        }
     }
     unless ($ok) {
         # A wrong paste (e.g. the request itself) does not burn the challenge.
@@ -483,6 +526,7 @@ sub turn_refusal {
 
 sub tx_brief {
     my ($tx, $names, $states, $comment_count, $rounds) = @_;
+    my $wallet = wallet_of_tx($tx->{wallet_id});
     return {
         id               => $tx->{id} + 0,
         title            => unseal($tx->{title_enc}, 'transaction.title'),
@@ -502,36 +546,49 @@ sub tx_brief {
             ? { name => $names->{ $tx->{lock_member_id} }, since => $tx->{locked_at},
                 mine => $tx->{lock_member_id} == $ME->{id} ? 1 : 0 }
             : undef,
+        lock_seq => $tx->{lock_seq} + 0,
         comments => $comment_count // 0,
         me       => my_progress($tx, $states, $rounds),
         batch    => $tx->{batch_id} ? { id => $tx->{batch_id} + 0, seq => $tx->{batch_seq} + 0 } : undef,
+        wallet   => $wallet ? { id => $wallet->{id}, name => $wallet->{name} } : undef,
     };
 }
 
-sub act_list_transactions {
-    my $db = dbh();
-    my $txs = $db->selectall_arrayref(qq{
-        SELECT t.* FROM transactions t
-         WHERE $VISIBLE
-           AND (t.status IN ('commit','sign','complete') OR t.closed_at > UTC_TIMESTAMP() - INTERVAL 180 DAY)
-         ORDER BY FIELD(t.status,'commit','sign','complete','broadcast','cancelled'), t.updated_at DESC
-         LIMIT 500
-    }, { Slice => {} }, $ME->{id});
+# Briefs of transactions the caller already read under the visibility condition.
+sub briefs {
+    my ($txs) = @_;
     my @ids = map { $_->{id} } @$txs;
     my %comments;
     if (@ids) {
-        %comments = map { $_->[0] => $_->[1] } @{ $db->selectall_arrayref(
+        %comments = map { $_->[0] => $_->[1] } @{ dbh()->selectall_arrayref(
             'SELECT transaction_id, COUNT(*) FROM comments WHERE transaction_id IN (' . join(',', ('?') x @ids)
             . ') GROUP BY transaction_id', undef, @ids) };
     }
     my $states = my_key_states();
     my $rounds = my_rounds();
     my $names = member_names([ map { ($_->{created_by}, $_->{lock_member_id}) } @$txs ]);
+    return [ map { tx_brief($_, $names, $states->{ $_->{id} }, $comments{ $_->{id} }, $rounds->{ $_->{id} }) } @$txs ];
+}
+
+sub act_list_transactions {
+    my $txs = dbh()->selectall_arrayref(qq{
+        SELECT t.* FROM transactions t
+         WHERE $VISIBLE
+           AND (t.status IN ('commit','sign','complete') OR t.closed_at > UTC_TIMESTAMP() - INTERVAL 180 DAY)
+         ORDER BY FIELD(t.status,'commit','sign','complete','broadcast','cancelled'), t.updated_at DESC
+         LIMIT 500
+    }, { Slice => {} }, $ME->{id});
+    # Every lock the account holds, also on a transaction beyond the 500 rows above (SPEC B7).
+    my $held = dbh()->selectall_arrayref(qq{
+        SELECT t.* FROM transactions t WHERE t.lock_member_id = ? AND $VISIBLE ORDER BY t.id
+    }, { Slice => {} }, $ME->{id}, $ME->{id});
+    my $me = member_names([ $ME->{id} ]);
     my %wallets;
     my @wallets = grep { length && !$wallets{$_}++ } map { $_->{wallet_name} } @$txs;
     return {
-        transactions => [ map { tx_brief($_, $names, $states->{ $_->{id} }, $comments{ $_->{id} }, $rounds->{ $_->{id} }) } @$txs ],
+        transactions => briefs($txs),
         wallet_names => [ @wallets[0 .. ($#wallets < 19 ? $#wallets : 19)] ],
+        held_locks   => [ map { my $b = tx_brief($_, $me); +{ map { $_ => $b->{$_} } qw(id title wallet lock lock_seq) } } @$held ],
     };
 }
 
@@ -586,6 +643,7 @@ sub act_get_transaction {
 
     my $brief = tx_brief($tx, $names, my_key_states($id)->{$id}, scalar @$comments, my_rounds($id)->{$id});
     $brief->{description} = unseal($tx->{description_enc}, 'transaction.description');
+    $brief->{wallet}{address} = wallet_of_tx($tx->{wallet_id})->{address} if $brief->{wallet};
     $brief->{timeline}    = \@timeline;
     $brief->{signers}     = [ map { {
         slot    => $_->{slot} + 0,
@@ -621,6 +679,7 @@ sub act_get_transaction {
             outputs         => $d->{outputs},
             outputs_partial => $d->{outputs_partial} ? 1 : 0,
             outputs_uncertain => $d->{outputs_uncertain} ? 1 : 0,
+            inputs_unverified => ($d->{inputs_unverified} // 1) ? 1 : 0,
             inputs          => $d->{inputs},
             inputs_value    => $d->{inputs_value},
             inputs_tokens   => $d->{inputs_tokens},
@@ -744,7 +803,7 @@ sub update_key_states {
 sub act_analyze {
     my $payload = sanitize_payload(param('payload'));
     my $a = analyze_payload($payload);
-    my %out = map { $_ => $a->{$_} } qw(format valid error warning tx_id required signers committed signed outputs outputs_partial inputs_value minotaur_format);
+    my %out = map { $_ => $a->{$_} } qw(format valid error warning tx_id required signers committed signed outputs outputs_partial inputs_value inputs_unverified minotaur_format);
     if ($a->{input_keys}) {
         my %mine = map { $_ => 1 } @{ my_pks() };
         my @my_keys = grep { $mine{$_} } @{ tx_keys($a) };
@@ -801,15 +860,19 @@ sub daily_quota_left {
     return cfg('DAILY_TX_LIMIT', 200) - $recent;
 }
 
+# The open transaction of this Ergo transaction id, with whether the account can see it.
+# Only a visible one may be named (SPEC I10). Returns nothing when none is tracked.
 sub tracked_as {
     my ($ergo_tx_id) = @_;
-    my ($dupe) = dbh()->selectrow_array(
-        q{SELECT id FROM transactions WHERE ergo_tx_id = ? AND status <> 'cancelled'}, undef, $ergo_tx_id);
-    return $dupe;
+    my ($dupe, $visible) = dbh()->selectrow_array(
+        qq{SELECT t.id, $VISIBLE FROM transactions t WHERE t.ergo_tx_id = ? AND t.status <> 'cancelled'},
+        undef, $ME->{id}, $ergo_tx_id);
+    return $dupe ? ($dupe, $visible) : ();
 }
 
-# Inserts a checked transaction with its signer keys and first submission. Caller
-# holds the DB transaction.
+# Inserts a checked transaction with its signer keys and first submission, and links it to
+# the wallet its inputs name, which a start registers when nobody has (SPEC W3, W7). Caller
+# holds the DB transaction, so a refused start leaves no wallet behind.
 sub insert_transaction {
     my (%t) = @_;
     my ($a, $keys) = @t{qw(analysis keys)};
@@ -817,11 +880,17 @@ sub insert_transaction {
     my $commits  = $a->{committed} // 0;
     my $status   = $commits >= $required ? 'sign' : 'commit';
     my $db = dbh();
+    my ($wallet_id, $created);
+    if (my $w = wallet_from_request($a, cfg('NETWORK', 'mainnet'))) {
+        # A registered wallet keeps its name; a new one takes the start's (SPEC W3).
+        ($wallet_id, $created) = ensure_wallet($w, $t{wallet}, $ME->{id});
+        log_event('wallet_registered', $wallet_id) if $created;    # the id only (SPEC W5)
+    }
     $db->do(q{INSERT INTO transactions (title_enc, description_enc, wallet_name, minotaur_version,
-                signers_required, signers_total, ergo_tx_id, status, commits, created_by, batch_id, batch_seq)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)}, undef,
+                signers_required, signers_total, ergo_tx_id, status, commits, created_by, batch_id, batch_seq, wallet_id)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)}, undef,
         seal($t{title}, 'transaction.title'), seal($t{description}, 'transaction.description'), $t{wallet}, $t{version},
-        $required, scalar @$keys, $a->{tx_id}, $status, $commits, $ME->{id}, $t{batch_id}, $t{batch_seq});
+        $required, scalar @$keys, $a->{tx_id}, $status, $commits, $ME->{id}, $t{batch_id}, $t{batch_seq}, $wallet_id);
     my $tx_id = $db->last_insert_id(undef, undef, 'transactions', 'id');
     my $sth = $db->prepare('INSERT INTO transaction_keys (transaction_id, pk, slot, state) VALUES (?,?,?,?)');
     $sth->execute($tx_id, $keys->[$_], $_, $a->{key_states}{ $keys->[$_] } // 0) for 0 .. $#$keys;
@@ -852,7 +921,9 @@ sub act_create_transaction {
     if ($a->{required} && $a->{required} != $required) {
         fail("This multi-sig wallet needs $a->{required} of $a->{signers} signatures. Set \"Signatures required\" to $a->{required}.");
     }
-    if (my $dupe = tracked_as($a->{tx_id})) { fail("This Ergo transaction is already being tracked (#$dupe).") }
+    if (my ($dupe, $visible) = tracked_as($a->{tx_id})) {
+        fail('This Ergo transaction is already being tracked' . ($visible ? " (#$dupe)." : '.'));
+    }
 
     my $db = dbh();
     $db->begin_work;
@@ -917,9 +988,9 @@ sub check_batch {
                 $r{decoded} = @{ $a->{outputs} || [] } ? 1 : 0;
                 if (my $first = $seen{ $a->{tx_id} }) {
                     $r{error} = "Same transaction as entry $first.";
-                } elsif (my $dupe = tracked_as($a->{tx_id})) {
-                    $r{error} = "Already tracked as #$dupe.";
-                    $r{tracked} = $dupe + 0;
+                } elsif (my ($dupe, $visible) = tracked_as($a->{tx_id})) {
+                    $r{error} = $visible ? "Already tracked as #$dupe." : 'Already tracked.';
+                    $r{tracked} = $dupe + 0 if $visible;
                 }
                 $seen{ $a->{tx_id} } //= $i;
                 $r{ok} = $r{error} ? 0 : 1;
@@ -932,11 +1003,12 @@ sub check_batch {
         push @out, \%r;
     }
 
-    # Boxes already being spent by open transactions: a second spender can never confirm.
+    # Boxes already being spent by open transactions the account can see (SPEC I10): a second
+    # spender can never confirm. A spend of the same box is of the same wallet, so its signers see it.
     my %open_spends;
-    my $open = dbh()->selectall_arrayref(q{
+    my $open = dbh()->selectall_arrayref(qq{
         SELECT t.id, (SELECT s.payload_enc FROM submissions s WHERE s.transaction_id = t.id ORDER BY s.id LIMIT 1)
-          FROM transactions t WHERE t.status IN ('commit','sign','complete')});
+          FROM transactions t WHERE t.status IN ('commit','sign','complete') AND $VISIBLE}, undef, $ME->{id});
     for my $row (@$open) {
         my $ids = payload_input_ids(unseal($row->[1], 'submission.payload')) or next;
         $open_spends{$_} //= $row->[0] for @$ids;
@@ -1046,8 +1118,10 @@ sub insert_comment {
         undef, $tx_id, $ME->{id}, $sub_id, seal($body, 'comment.body'));
 }
 
+# With `seq`, the lock is taken only while the row's lock count is the one the caller read (SPEC B7).
 sub act_lock {
     my $id = int_param('id');
+    my $seq = length param('seq') ? int_param('seq') : undef;
     my $tx = load_tx($id);
     if (my $why = turn_refusal($tx, my_progress($tx, my_key_states($id)->{$id}, my_rounds($id)->{$id}))) {
         fail($why);
@@ -1055,20 +1129,34 @@ sub act_lock {
     my $n = dbh()->do(q{
         UPDATE transactions SET lock_member_id = ?, lock_seq = lock_seq + 1, locked_at = UTC_TIMESTAMP()
          WHERE id = ? AND lock_member_id IS NULL AND status IN ('commit','sign')
-    }, undef, $ME->{id}, $id);
+    } . (defined $seq ? ' AND lock_seq = ?' : ''), undef, $ME->{id}, $id, (defined $seq ? $seq : ()));
     unless ($n > 0) {
-        fail('This transaction is no longer open for signing.') unless is_open(load_tx($id));
+        my $now = load_tx($id);
+        fail('This transaction is no longer open for signing.') unless is_open($now);
+        fail('The lock on this transaction changed since you read it. Refresh and try again.')
+            if defined $seq && $now->{lock_seq} != $seq;
         fail('Someone else locked this transaction a moment ago. Refresh to see who.');
     }
     log_event('lock', '', $id);
     return act_get_transaction();
 }
 
+# With `seq`, first the cancel of a `lock` at that count that has not arrived yet, then the
+# release of the lock it took, whose count is `seq` + 1. Whichever the server handles first,
+# no lock of that request stays, and a newer lock of the account is never cleared (SPEC B7).
 sub act_release_lock {
     my $id = int_param('id');
-    load_tx($id);
-    my $n = dbh()->do('UPDATE transactions SET lock_member_id = NULL, locked_at = NULL WHERE id = ? AND lock_member_id = ?',
-        undef, $id, $ME->{id});
+    my $seq = length param('seq') ? int_param('seq') : undef;
+    my $tx = load_tx($id);
+    if (defined $seq && !turn_refusal($tx, my_progress($tx, my_key_states($id)->{$id}, my_rounds($id)->{$id}))
+        && dbh()->do(q{UPDATE transactions SET lock_seq = lock_seq + 1
+                        WHERE id = ? AND lock_member_id IS NULL AND lock_seq = ? AND status IN ('commit','sign')},
+                     undef, $id, $seq) > 0) {
+        log_event('lock_cancel', '', $id);
+        return act_get_transaction();
+    }
+    my $n = dbh()->do('UPDATE transactions SET lock_member_id = NULL, locked_at = NULL WHERE id = ? AND lock_member_id = ?'
+        . (defined $seq ? ' AND lock_seq = ?' : ''), undef, $id, $ME->{id}, (defined $seq ? $seq + 1 : ()));
     fail('You do not hold the lock on this transaction.') unless $n > 0;
     log_event('release', '', $id);
     return act_get_transaction();
@@ -1193,6 +1281,120 @@ sub act_mark_broadcast {
                 WHERE id = ? AND status = 'complete'}, undef, $id);
     log_event('broadcast', '', $id);
     return act_get_transaction();
+}
+
+# ---------------------------------------------------------------------------
+# Wallets: what each signer sees of a registered multi-sig wallet. Every refusal
+# comes before the first write.
+# ---------------------------------------------------------------------------
+sub load_wallet {
+    my ($id) = @_;
+    my $w = dbh()->selectrow_hashref("SELECT w.* FROM wallets w WHERE w.id = ? AND $WALLET_VISIBLE", undef, $id, $ME->{id});
+    fail('Wallet not found.') unless $w;    # same answer whether it exists or not (SPEC W4)
+    return $w;
+}
+
+# The wallet a brief names: id, name and address, read under the wallet visibility
+# condition. A transaction's keys are its wallet's keys (SPEC W7), so whoever sees the
+# transaction sees its wallet.
+sub wallet_of_tx {
+    my ($id) = @_;
+    return undef unless $id;
+    return $WALLET_OF{$id} //= do {
+        my $w = dbh()->selectrow_hashref("SELECT w.id, w.name_enc, w.address FROM wallets w WHERE w.id = ? AND $WALLET_VISIBLE",
+            undef, $id, $ME->{id});
+        $w && { id => $w->{id} + 0, name => unseal($w->{name_enc}, 'wallet.name'), address => $w->{address} };
+    };
+}
+
+use constant WALLET_PAGE => 200;
+
+# A wallet with its keys, its open transactions and its closed ones newest first, a page
+# at a time below the id $before (SPEC W6). Transactions are read under the visibility
+# condition (SPEC I2).
+sub wallet_reply {
+    my ($w, $before) = @_;
+    my $db = dbh();
+    my $keys = $db->selectall_arrayref(q{
+        SELECT wk.pk, wk.slot, mk.member_id, mk.address, m.display_name
+          FROM wallet_keys wk LEFT JOIN member_keys mk ON mk.pk = wk.pk LEFT JOIN members m ON m.id = mk.member_id
+         WHERE wk.wallet_id = ? ORDER BY wk.slot}, { Slice => {} }, $w->{id});
+    my $open = $db->selectall_arrayref(qq{
+        SELECT t.* FROM transactions t WHERE t.wallet_id = ? AND t.status IN ('commit','sign','complete') AND $VISIBLE
+         ORDER BY t.id DESC}, { Slice => {} }, $w->{id}, $ME->{id});
+    my $closed = $db->selectall_arrayref(qq{
+        SELECT t.* FROM transactions t WHERE t.wallet_id = ? AND t.status IN ('broadcast','cancelled') AND $VISIBLE}
+        . (defined $before ? ' AND t.id < ?' : '') . ' ORDER BY t.id DESC LIMIT ' . (WALLET_PAGE + 1),
+        { Slice => {} }, $w->{id}, $ME->{id}, (defined $before ? $before : ()));
+    my $more = @$closed > WALLET_PAGE ? 1 : 0;
+    splice @$closed, WALLET_PAGE if $more;
+    my @briefs = @{ briefs([ @$open, @$closed ]) };
+    return { wallet => {
+        id               => $w->{id} + 0,
+        name             => unseal($w->{name_enc}, 'wallet.name'),
+        address          => $w->{address},
+        network          => $w->{network},
+        signers_required => $w->{signers_required} + 0,
+        signers_total    => $w->{signers_total} + 0,
+        keys             => [ map { {
+            pk      => $_->{pk},
+            slot    => $_->{slot} + 0,
+            name    => $_->{display_name},
+            address => $_->{address} // address_from_tree("\x00\x08\xcd" . pack('H*', $_->{pk}), $w->{network}),
+            mine    => ($_->{member_id} // 0) == $ME->{id} ? 1 : 0,
+        } } @$keys ],
+        open             => [ splice @briefs, 0, scalar @$open ],
+        closed           => \@briefs,
+        closed_more      => $more,
+    } };
+}
+
+sub act_register_wallet {
+    my $name = clean_text(param('name'), $LIMIT{wallet}, 'Wallet name');
+    my ($w, $why) = wallet_from_address(param('address') =~ s/\s+//gr, cfg('NETWORK', 'mainnet'));
+    fail($why) unless $w;
+    # The keys come from the address, never from a stored wallet, so this answer is the same
+    # whether or not the wallet is registered (SPEC W3).
+    my %mine = map { $_ => 1 } @{ my_pks() };
+    fail('None of the addresses on your account is a signer of this wallet. If you sign with another wallet '
+        . 'or address, link it on the Account tab first.') unless grep { $mine{$_} } @{ $w->{keys} };
+    my $db = dbh();
+    $db->begin_work;
+    my ($id, $created) = ensure_wallet($w, $name, $ME->{id});
+    log_event('wallet_registered', $id) if $created;    # the id only, never the name (SPEC W5)
+    $db->commit;
+    my $reply = wallet_reply(load_wallet($id));
+    $reply->{created} = $created;
+    return $reply;
+}
+
+sub act_list_wallets {
+    my $rows = dbh()->selectall_arrayref("SELECT w.* FROM wallets w WHERE $WALLET_VISIBLE ORDER BY w.id",
+        { Slice => {} }, $ME->{id});
+    return { wallets => [ map { {
+        id               => $_->{id} + 0,
+        name             => unseal($_->{name_enc}, 'wallet.name'),
+        signers_required => $_->{signers_required} + 0,
+        signers_total    => $_->{signers_total} + 0,
+    } } @$rows ] };
+}
+
+sub act_get_wallet {
+    my $id = int_param('id');
+    return wallet_reply(load_wallet($id), length param('before') ? int_param('before') : undef);
+}
+
+sub act_rename_wallet {
+    my $id = int_param('id');
+    my $name = clean_text(param('name'), $LIMIT{wallet}, 'Wallet name');
+    fail('Give the wallet a name.') unless length $name;
+    load_wallet($id);
+    my $db = dbh();
+    $db->begin_work;
+    $db->do('UPDATE wallets SET name_enc = ? WHERE id = ?', undef, seal($name, 'wallet.name'), $id);
+    log_event('wallet_renamed', $id);    # the id only, never the name (SPEC W5)
+    $db->commit;
+    return wallet_reply(load_wallet($id));
 }
 
 # ---------------------------------------------------------------------------

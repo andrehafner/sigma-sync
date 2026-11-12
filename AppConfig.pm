@@ -11,10 +11,11 @@ use warnings;
 use Crypt::AuthEnc::GCM qw(gcm_encrypt_authenticate gcm_decrypt_verify);
 use Crypt::PRNG qw(random_bytes);
 use DBI;
+use Digest::SHA qw(sha256_hex);
 use MIME::Base64 qw(encode_base64 decode_base64);
 
 use Exporter 'import';
-our @EXPORT_OK = qw(cfg db_creds dbh seal unseal random_hex client_ip);
+our @EXPORT_OK = qw(cfg db_creds dbh seal unseal random_hex client_ip ensure_wallet);
 
 my %CONFIG;
 my $LOADED = 0;
@@ -95,6 +96,27 @@ sub unseal {
     die "Ciphertext failed authentication\n" unless defined $plain;
     utf8::decode($plain);
     return $plain;
+}
+
+# --- Wallets ----------------------------------------------------------------
+# The one writer of a wallet. $w is what ErgoKit::wallet_from_address returns. The unique
+# key on address_sha256 makes two registrations at once one row (SPEC W1): the loser's
+# INSERT IGNORE writes nothing, and the locking read sees the winner's row once it commits.
+# The caller holds the database transaction, so a wallet never exists without its keys.
+# Returns (id, created).
+sub ensure_wallet {
+    my ($w, $name, $created_by) = @_;
+    my $db = dbh();
+    my $hash = sha256_hex($w->{address});
+    my $created = $db->do(q{INSERT IGNORE INTO wallets (network, address, address_sha256, signers_required,
+                signers_total, name_enc, created_by) VALUES (?,?,?,?,?,?,?)}, undef,
+        $w->{network}, $w->{address}, $hash, $w->{m}, scalar @{ $w->{keys} }, seal($name, 'wallet.name'), $created_by) > 0;
+    my ($id) = $db->selectrow_array('SELECT id FROM wallets WHERE address_sha256 = ? LOCK IN SHARE MODE', undef, $hash);
+    if ($created) {
+        my $sth = $db->prepare('INSERT INTO wallet_keys (wallet_id, pk, slot) VALUES (?,?,?)');
+        $sth->execute($id, $w->{keys}[$_], $_) for 0 .. $#{ $w->{keys} };
+    }
+    return ($id, $created ? 1 : 0);
 }
 
 sub random_hex { return unpack 'H*', random_bytes($_[0] // 32) }
