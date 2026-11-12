@@ -1353,7 +1353,7 @@
       const out = [];
       for (const [i, row] of rows.entries()) {
         const { id, ok, request, code, message } = list[i];
-        if (id !== row.id) return null;
+        if (id !== String(row.id)) return null;
         out.push({ ok: ok === true, request, code, message });
       }
       return out;
@@ -1526,7 +1526,8 @@
     ask.forEach((r) => { r.state = 'wallet'; });
     draw();
     let list = null;
-    try { list = await run.ctx.multisig[run.kind](ask.map((r) => ({ id: r.id, request: r.text }))); } catch (e) { /* the call failed: every row of it fails below */ }
+    // The wallet contract's `id` is a string (B2): the wallet refuses a number before it opens its window.
+    try { list = await run.ctx.multisig[run.kind](ask.map((r) => ({ id: String(r.id), request: r.text }))); } catch (e) { /* the call failed: every row of it fails below */ }
     if (!alive()) return;
     const answers = readAnswers(list, ask);
     if (!answers) {
