@@ -86,6 +86,8 @@ my $response = eval {
     return $h->();
 };
 if (my $err = $@) {
+    # Undo any half-done database transaction before reporting the error.
+    eval { my $db = dbh(); $db->rollback unless $db->{AutoCommit}; 1 };
     if (ref $err eq 'HASH' && $err->{public}) {
         $response = { success => 0, error => $err->{public}, %{ $err->{extra} || {} } };
     } else {
@@ -206,7 +208,7 @@ sub public_member {
 sub client_config {
     return {
         unlock_votes         => cfg('UNLOCK_VOTES', 2) + 0,
-        unlock_grace_minutes => cfg('UNLOCK_GRACE_MINUTES', 10) + 0,
+        unlock_grace_minutes => cfg('UNLOCK_GRACE_MINUTES', 60) + 0,
         explorer_tx_url      => cfg('EXPLORER_TX_URL', 'https://explorer.ergoplatform.com/en/transactions/'),
         explorer_api_url     => cfg('EXPLORER_API_URL', 'https://api.ergoplatform.com/api/v1/transactions/'),
         explorer_token_url   => cfg('EXPLORER_TOKEN_API_URL', 'https://api.ergoplatform.com/api/v1/tokens/'),
@@ -1082,8 +1084,8 @@ sub act_vote_unlock {
     fail('This transaction is not locked.') unless $tx->{lock_member_id};
     fail('You hold this lock - use "Release lock" instead.') if $tx->{lock_member_id} == $ME->{id};
     my ($age) = $db->selectrow_array('SELECT TIMESTAMPDIFF(MINUTE, ?, UTC_TIMESTAMP())', undef, $tx->{locked_at});
-    my $grace = cfg('UNLOCK_GRACE_MINUTES', 10) + 0;
-    fail("Give the signer a chance: override votes open $grace minutes after the lock was taken.") if $age < $grace;
+    my $grace = cfg('UNLOCK_GRACE_MINUTES', 60) + 0;
+    fail('Give the signer a chance: override votes open ' . ($grace % 60 ? "$grace minutes" : $grace == 60 ? '1 hour' : ($grace / 60) . ' hours') . ' after the lock was taken.') if $age < $grace;
 
     $db->do('INSERT IGNORE INTO unlock_votes (transaction_id, lock_seq, member_id) VALUES (?,?,?)',
         undef, $id, $tx->{lock_seq}, $ME->{id});
