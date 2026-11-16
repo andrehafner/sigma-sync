@@ -136,7 +136,7 @@ press Commit. Everyone after that uses the multi-sig wallet's Multi-sig Communic
 
 Only the lock holder sees the latest request and can submit. Submitting or releasing frees
 the lock. If a lock is abandoned, `UNLOCK_VOTES` other signers (default 2) can vote to force it
-open, at different times, once it has been held for `UNLOCK_GRACE_MINUTES` (default 10).
+open, at different times, once it has been held for `UNLOCK_GRACE_MINUTES` (default 60).
 
 ## Stack
 

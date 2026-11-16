@@ -1413,7 +1413,7 @@
     if (!t.lock.mine) {
       const votes = t.lock.votes || [];
       const need = S.config.unlock_votes || 2;
-      const grace = S.config.unlock_grace_minutes ?? 10;
+      const grace = S.config.unlock_grace_minutes ?? 60;
       const iVoted = votes.some((v) => v.mine);
       const canVote = t.lock.age_minutes >= grace;
       return `${header}
@@ -1426,7 +1426,7 @@
             ? `: ${votes.map((v) => esc(v.name)).join(', ')}` : ''}</p>
           ${iVoted ? '<p class="small tick">You voted to unlock.</p>'
             : canVote ? '<button type="button" class="btn btn-danger btn-block" data-action="vote-unlock">Vote to unlock</button>'
-            : `<p class="small faint">Override voting opens ${grace} minutes after the lock was taken.</p>`}
+            : `<p class="small faint">Override voting opens ${grace % 60 ? `${grace} minutes` : grace === 60 ? '1 hour' : `${grace / 60} hours`} after the lock was taken.</p>`}
         </div>`;
     }
 
